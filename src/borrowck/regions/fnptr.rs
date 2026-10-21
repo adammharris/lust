@@ -1,10 +1,13 @@
 // Fn pointer regions (W-BORROW3, docs/ARCH.md 5.6).
 //
-// A fn pointer type is elided-only (each input lifetime its own binder,
-// an elided output the one input's), may write `&'static`, and may name
-// one lifetime of the enclosing item (`fn(&mut Parser<'a>) -> Node`):
-// `FnSig::free_slots` marks the signature slots that region fills, and a
-// value of such a type has one region slot, that free region.
+// A fn pointer type is elided (each input lifetime its own binder, an
+// elided output the one input's), may write `&'static`, may share one
+// `for<..>` binder lifetime among several slots (`FnSig::binders`:
+// `for<'s> fn(&mut Ctx<'s>, &'s [u8]) -> Cow<'s, [u8]>`, one binder at
+// all its slots), and may name one lifetime of the enclosing item
+// (`fn(&mut Parser<'a>) -> Node`): `FnSig::free_slots` marks the
+// signature slots that region fills, and a value of such a type has one
+// region slot, that free region.
 //
 // One check proves a signature against another wherever a fn item, a fn
 // pointer, a `dyn Fn*` type, or an `Fn*` bound meet (`sub_sigs`): the
@@ -159,32 +162,50 @@ impl Builder<'_, '_> {
         let s = self.body.tys.sig(s).value;
         let ins_t: Vec<Ty> = self.body.tys.tys_of(s.inputs).to_vec();
         let free_node = |this: &mut Self| Node::Var(free.unwrap_or_else(|| this.fresh()));
+        let in_rs: Vec<Vec<Region>> = ins_t.iter().map(|&it| self.sig_slot_regions(it)).collect();
+        let out_rs = self.sig_slot_regions(s.output);
+        // A shared binder lifetime (`FnSig::binders`) is one binder at all
+        // its slots: the node of its first slot.
+        let n_slots = in_rs.iter().map(Vec::len).sum::<usize>() + out_rs.len();
+        let groups = s.binder_groups(n_slots);
+        if s.binders != 0 && groups.is_none() {
+            return None;
+        }
+        let group_of = |j: u32| groups.as_ref().map_or(0, |g| g[j as usize]);
+        let mut group_nodes: FxMap<u8, Node> = FxMap::default();
         let mut j = 0u32;
         let mut ins = Vec::new();
-        for it in ins_t {
-            for r in self.sig_slot_regions(it) {
+        for rs in in_rs {
+            for r in rs {
+                let g = group_of(j);
                 ins.push(if s.free_slots >> j & 1 == 1 {
                     free_node(self)
                 } else if r == Region::Static {
                     Node::Var(0)
-                } else if target {
-                    Node::Ph(base + j)
+                } else if let Some(&n) = group_nodes.get(&g).filter(|_| g != 0) {
+                    n
                 } else {
-                    Node::Late(base + j)
+                    let n = if target { Node::Ph(base + j) } else { Node::Late(base + j) };
+                    if g != 0 {
+                        group_nodes.insert(g, n);
+                    }
+                    n
                 });
                 j += 1;
             }
         }
         let mut outs = Vec::new();
-        let out_rs = self.sig_slot_regions(s.output);
         // Where a substitution moved written own slots (`fn(&u8) -> (T,
         // &u8)`) their places are unknown: the one input's, as before.
         let substituted = s.out_substituted(out_rs.len()) && s.own_out == 0;
         for r in out_rs {
+            let g = group_of(j);
             outs.push(if s.free_slots >> j & 1 == 1 {
                 free_node(self)
             } else if r == Region::Static {
                 Node::Var(0)
+            } else if g != 0 {
+                *group_nodes.get(&g)?
             } else if substituted || ins.is_empty() {
                 // With no input slot an output slot is no binder's either
                 // (`fn() -> T` with `T = Vec<&'static str>`).

@@ -433,12 +433,31 @@ pub struct FnSig {
     /// unknown (a pointer type lust builds, a free region, several input
     /// regions): every elided output slot is the one input's then.
     pub out_slots: u8,
+    /// A `for<..>` binder lifetime written in several places
+    /// (`for<'s> fn(&mut Ctx<'s>, &'s [u8]) -> Cow<'s, [u8]>`): four bits
+    /// per region slot (borrowck's slot order over the inputs, then the
+    /// output), slot `k`'s binder group in bits `4k..4k + 4`. Group 0 is
+    /// none: the slot is its own late-bound region (an elided input), or
+    /// as `free_slots` and `'static` say. Each group `g > 0` is one binder
+    /// lifetime, the same region at all its slots. 0 for every signature
+    /// elision can write.
+    pub binders: u64,
+    /// The number of region slots `binders` covers (the written
+    /// signature's). A substitution that gives the signature another
+    /// count moved the slots, so `binders` no longer lines up.
+    pub binder_slots: u8,
 }
 
 impl FnSig {
     /// A signature with no free region (`free_slots` 0).
     pub fn plain(inputs: TysId, output: Ty) -> FnSig {
-        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased, own_out: 0, out_slots: u8::MAX }
+        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased, own_out: 0, out_slots: u8::MAX, binders: 0, binder_slots: 0 }
+    }
+
+    /// The binder group of each of `slots` region slots (`binders`), or
+    /// None when the signature has no shared binder, or its slots moved.
+    pub fn binder_groups(&self, slots: usize) -> Option<Vec<u8>> {
+        (self.binders != 0 && slots == self.binder_slots as usize).then(|| (0..slots).map(|k| (self.binders >> (4 * k) & 0xF) as u8).collect())
     }
 
     /// True when the output has `actual` region slots and the written one

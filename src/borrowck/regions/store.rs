@@ -266,7 +266,7 @@ fn ptr_binders_differ(tys: &impl TyIntern, a: Ty, b: Ty) -> bool {
         }
         (TyKind::FnPtr(x), TyKind::FnPtr(y)) => {
             let (kx, ky) = (sig_binders(tys, x), sig_binders(tys, y));
-            kx.len() == ky.len() && kx.iter().zip(&ky).any(|(p, q)| p != q)
+            kx.len() == ky.len() && (kx.iter().zip(&ky).any(|(p, q)| p != q) || tys.sig(x).value.binders != tys.sig(y).value.binders)
         }
         _ => false,
     }

@@ -4210,26 +4210,47 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// `'static`, and each elided output slot is the one input slot's
     /// (elision; L0202 otherwise). Slots in `free` (`.0`, W-BORROW3) are
     /// the pointer's free region, var `.1`, in the inputs and the output.
+    /// A shared binder lifetime (`FnSig::binders`) is one fresh region of
+    /// this call at all its slots, so the output borrows exactly from the
+    /// inputs that write it.
     /// False when the shapes do not pair or the output is not the one
     /// input's (the caller's rule then).
-    fn call_late_bound_free(&mut self, ins: &[Ty], out: Ty, free: Option<(u32, u32)>, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+    fn call_late_bound_free(&mut self, s: FnSig, free: Option<(u32, u32)>, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let ins: Vec<Ty> = self.body.tys.tys_of(s.inputs).to_vec();
+        let out = s.output;
         if ins.len() != avs.len() {
             return false;
         }
+        let n_slots: usize = ins.iter().chain(std::iter::once(&out)).map(|&t| self.sig_slot_regions(t).len()).sum();
+        let groups = s.binder_groups(n_slots);
+        if s.binders != 0 && groups.is_none() {
+            return false;
+        }
+        let mut group_vars: FxMap<u8, u32> = FxMap::default();
         let mut j = 0u32;
         let is_free = |j: &mut u32| {
             let f = free.filter(|&(m, _)| m >> *j & 1 == 1).map(|(_, v)| v);
             *j += 1;
             f
         };
+        let group_of = |j: u32| groups.as_ref().map_or(0, |g| g[j as usize]);
         let mut slots: Vec<u32> = Vec::new();
         for (i, &it) in ins.iter().enumerate() {
             let (at, av) = &avs[i];
             let mut pv: Vec<u32> = Vec::new();
             for r in self.sig_slot_regions(it) {
+                let g = group_of(j);
                 pv.push(match is_free(&mut j) {
                     Some(v) => v,
                     None if r == Region::Static => 0,
+                    None if g != 0 => match group_vars.get(&g) {
+                        Some(&v) => v,
+                        None => {
+                            let v = self.fresh();
+                            group_vars.insert(g, v);
+                            v
+                        }
+                    },
                     None => self.fresh(),
                 });
             }
@@ -4249,10 +4270,14 @@ impl<'b, 'p> Builder<'b, 'p> {
         let one = if let [one] = late[..] { Some(one) } else { None };
         let rv = outs
             .iter()
-            .map(|&r| match is_free(&mut j) {
-                Some(v) => Some(v),
-                None if r == Region::Static => Some(0),
-                None => one,
+            .map(|&r| {
+                let g = group_of(j);
+                match is_free(&mut j) {
+                    Some(v) => Some(v),
+                    None if r == Region::Static => Some(0),
+                    None if g != 0 => group_vars.get(&g).copied(),
+                    None => one,
+                }
             })
             .collect::<Option<Vec<u32>>>();
         let Some(rv) = rv else { return false };
@@ -4700,11 +4725,10 @@ impl<'b, 'p> Builder<'b, 'p> {
             && let TyKind::FnPtr(sig) = self.body.tys.kind(self.body.locals[l as usize].ty)
         {
             let s = self.body.tys.sig(sig).value;
-            let ins: Vec<Ty> = self.body.tys.tys_of(s.inputs).to_vec();
             let mut lv = Vec::new();
             self.local_vars(l, &mut lv);
             let free = if s.free_slots != 0 { lv.first().map(|&v| (s.free_slots, v)) } else { None };
-            if (s.free_slots == 0 || free.is_some()) && self.call_late_bound_free(&ins, s.output, free, &avs, dt, &dv) {
+            if (s.free_slots == 0 || free.is_some()) && self.call_late_bound_free(s, free, &avs, dt, &dv) {
                 return;
             }
         }
@@ -6589,7 +6613,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 if (s.free_slots != 0 && free.is_none()) || self.sc.slots(it) as usize != x.len() || self.sc.slots(out) as usize != item.len() {
                     return false;
                 }
-                self.call_late_bound_free(&ins, out, free, &[(it, x.to_vec())], out, item)
+                self.call_late_bound_free(s, free, &[(it, x.to_vec())], out, item)
             }
             TyKind::FnDef(def, fargs) if self.body.tys.args(fargs).is_empty() => {
                 let Some(l) = self.p.local_def(def.hash) else { return false };
@@ -10570,7 +10594,7 @@ impl Contract<'_> {
             }
             (TyKind::FnPtr(sa), TyKind::FnPtr(sb)) => {
                 let (sa, sb) = (tys.sig(sa).value, tys.sig(sb).value);
-                if sa.free_slots != sb.free_slots {
+                if sa.free_slots != sb.free_slots || sa.binders != sb.binders {
                     self.mismatch = true;
                 } else if sa.free_slots != 0 {
                     self.slot(sa.free_region, sb.free_region, Variance::Inv, a_trait);

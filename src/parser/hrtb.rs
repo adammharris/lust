@@ -5,7 +5,9 @@
 //! lifetimes say exactly that (each binder lifetime once in the inputs;
 //! in the output only when it is the one input lifetime) is rewritten
 //! here to the elided form: `for<'a> fn(&'a N) -> Option<L<'a>>` becomes
-//! `fn(&N) -> Option<L<'_>>`. Any other binder is L0203. The binder list
+//! `fn(&N) -> Option<L<'_>>`. Any other binder keeps its lifetimes
+//! written, and check reads each as one group of slots (`FnSig::binders`):
+//! `for<'s> fn(&mut Ctx<'s>, &'s [u8]) -> Cow<'s, [u8]>`. The binder list
 //! stays in the AST so check can reject a name that shadows a lifetime
 //! in scope (rustc E0496); a binder lifetime used where this rewrite does
 //! not look (a nested fn pointer or `dyn` type) stays written and
@@ -40,9 +42,9 @@ struct Scan {
 
 impl Parser<'_> {
     /// Rewrites the uses of `binder` in a signature (`inputs`, `output`)
-    /// to elided lifetimes, or fails when the binder means more than
-    /// elision does.
-    pub(super) fn canon_binder(&mut self, binder: &[Lifetime], inputs: &[TyId], output: Option<TyId>) -> PResult<()> {
+    /// to elided lifetimes. When the binder means more than elision does,
+    /// a fn pointer type (`fn_ptr`) keeps them written; `Fn` sugar fails.
+    pub(super) fn canon_binder(&mut self, binder: &[Lifetime], inputs: &[TyId], output: Option<TyId>, fn_ptr: bool) -> PResult<()> {
         if binder.is_empty() {
             return Ok(());
         }
@@ -66,18 +68,39 @@ impl Parser<'_> {
         if let Some(t) = output {
             self.scan_binder(t, &names, &mut outs);
         }
+        // A binder elision cannot write (a lifetime in two inputs, or an
+        // output lifetime that is not the one input lifetime) stays
+        // written: check gives each binder lifetime its own group of
+        // slots (`FnSig::binders`). An output lifetime no input writes is
+        // rustc's E0581; a nested type elision does not see into is not
+        // modelled.
         let mut seen = vec![false; names.len()];
+        let mut shared = None;
         for &(i, _) in &ins.uses {
             if seen[i] {
-                return Err(binder_cut(binder[i].span, "it is used in two places of the inputs"));
+                shared = shared.or(Some((i, "it is used in two places of the inputs")));
             }
             seen[i] = true;
         }
         for &(i, _) in &outs.uses {
+            if !seen[i] {
+                return Err(Diag::new(
+                    "L0203",
+                    binder[i].span,
+                    format!("the output uses `'{}`, but no input does", self.interner.get(names[i])),
+                    "Use the binder lifetime in an input too, or write `'static` in the output.",
+                ));
+            }
             let elided = !ins.opaque && ins.lts == 1 && ins.last_binder == Some(i);
             if !elided {
-                return Err(binder_cut(binder[i].span, "the output uses it, but it is not the one input lifetime"));
+                shared = shared.or(Some((i, "the output uses it, but it is not the one input lifetime")));
             }
+        }
+        if let Some((i, why)) = shared {
+            if !fn_ptr || ins.opaque || outs.opaque {
+                return Err(binder_cut(binder[i].span, why));
+            }
+            return Ok(());
         }
         let anon = self.interner.intern("_");
         for (_, site) in ins.uses.into_iter().chain(outs.uses) {
