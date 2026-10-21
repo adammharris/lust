@@ -2083,9 +2083,11 @@ where output can observe it:
   panic without `track_caller` (`step_by(0)`, `Ord::clamp`,
   `sum` overflow, capacity overflow) reports std's own
   `library/` line. A stack overflow prints Rust's guard-page
-  text and aborts. rustc wraps an `assert!` condition text
-  of more than 78 bytes over lines; lust rejects that form
-  (L0809).
+  text and aborts. An `assert!` condition text of more
+  than 78 bytes breaks over lines as rustc's pretty printer
+  breaks it (`src/expand/assert_msg.rs` ports pp.rs and the
+  boxes pprust opens); a form it does not model, such as an
+  item in a block, is L0809.
 - **Drop order.** Already a rule-zero requirement and
   tested today with printing `Drop` impls. Std source
   must not reorder drops: `Vec` drops elements front

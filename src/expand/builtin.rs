@@ -566,8 +566,8 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
 }
 
 /// The message `assert_message` gives an `assert!(cond)` whose panic text
-/// lust cannot print as rustc does (rustc breaks it over lines, or the
-/// condition holds an item). In a const context the text is never printed
+/// lust cannot print as rustc does (the condition holds an item, or a
+/// form `assert_msg` does not model). In a const context the text is never printed
 /// (a true condition passes, a false one is a compile error either way),
 /// so only lowering a runtime body rejects it (`lower`, L0809).
 pub const ASSERT_TEXT_UNKNOWN: &str = "\u{1}lust: an assert! text rustc prints over lines\u{1}";
@@ -576,9 +576,9 @@ pub const ASSERT_TEXT_UNKNOWN: &str = "\u{1}lust: an assert! text rustc prints o
 /// failed: <cond>"` to append to its expanded arguments, so the panic
 /// prints rustc's text (see `assert_msg`). The text goes in as an
 /// argument, never as the format string, so braces in it stay literal.
-/// Empty when the call has a message of its own. When rustc prints the
-/// condition over several lines (`assert_msg::cond_text`), the argument
-/// is `ASSERT_TEXT_UNKNOWN`.
+/// Empty when the call has a message of its own. When lust cannot print
+/// the condition as rustc does (`assert_msg::cond_text`), the argument is
+/// `ASSERT_TEXT_UNKNOWN`.
 pub fn assert_message(st: &mut Expander, inner: &[Tt], span: Span) -> Result<Vec<Tt>, Diag> {
     let args = split_args(inner);
     if args.len() != 1 {
@@ -592,13 +592,13 @@ pub fn assert_message(st: &mut Expander, inner: &[Tt], span: Span) -> Result<Vec
     Ok(vec![comma.clone(), st.str_tree("{}", span), comma, st.str_tree(&text, span)])
 }
 
-/// The reject for an `assert!(cond)` whose panic text rustc breaks over
-/// several lines (more than 78 bytes, or a block with an item).
+/// The reject for an `assert!(cond)` whose panic text lust cannot print
+/// as rustc does (a block with an item, or another unmodeled form).
 pub fn assert_text_too_long(span: Span) -> Diag {
     err(
         C_UNSUPPORTED,
         span,
-        "`assert!` with no message on a long or item-holding condition is not supported yet",
+        "`assert!` with no message is not supported yet on this condition: lust cannot print its text as rustc does",
         "Add a message: assert!(cond, \"...\"), or split the condition.",
     )
 }

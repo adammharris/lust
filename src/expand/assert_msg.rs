@@ -10,10 +10,12 @@
 // `Spacing::Alone`, and `space_between` drops the space in `f(`, `x,`,
 // `a.b`, `#[`, `m!`.
 //
-// `cond_text` gives None for a form this printer does not model, and for
-// a text rustc breaks over several lines (more than 78 bytes; lust has
-// no line breaker): the caller rejects those with L0809, so lust never
-// prints a text that differs from rustc's.
+// Each node writes the token stream pprust writes for it (words, breaks,
+// and the boxes `ibox`/`cbox` open), and `layout` runs pp.rs's line
+// breaker over it, so a text over the 78-byte margin breaks over lines
+// as rustc's does. `cond_text` gives None for a form this printer does
+// not model: the caller rejects those with L0809, so lust never prints a
+// text that differs from rustc's.
 use super::*;
 use crate::diag::CtxtId;
 use crate::lexer::Tok;
@@ -240,8 +242,341 @@ fn is_punct(t: Tok) -> bool {
 fn print(toks: Vec<T>) -> Option<String> {
     let mut p = P { t: toks, i: 0 };
     let e = p.expr(R::default())?;
-    (p.i == p.t.len() && e.s.len() <= MARGIN).then_some(e.s)
+    (p.i == p.t.len()).then(|| layout(&e.d))
 }
+
+// ---------- the line breaker (rustc_ast_pretty's pp.rs) ----------
+
+/// One token of pprust's stream (pp.rs `Token`).
+#[derive(Clone)]
+enum Pp {
+    Word(String),
+    /// A place the line may break: `blank` spaces when it does not, else
+    /// `pre` (a trailing comma), a newline, and the box's indent plus
+    /// `off`.
+    Brk { blank: isize, off: isize, pre: Option<char> },
+    /// A box. Its broken lines indent `off` past the enclosing box's
+    /// indent; a consistent box takes all of its breaks or none.
+    Begin { off: isize, consistent: bool },
+    End,
+}
+
+/// What pprust writes for one node: words, breaks, and boxes.
+#[derive(Clone, Default)]
+struct Doc(Vec<Pp>);
+
+impl Doc {
+    fn w(s: impl Into<String>) -> Doc {
+        Doc(vec![Pp::Word(s.into())])
+    }
+    fn word(&mut self, s: impl Into<String>) {
+        self.0.push(Pp::Word(s.into()));
+    }
+    fn brk(&mut self, blank: isize, off: isize) {
+        self.0.push(Pp::Brk { blank, off, pre: None });
+    }
+    fn space(&mut self) {
+        self.brk(1, 0);
+    }
+    fn nbsp(&mut self) {
+        self.word(" ");
+    }
+    fn word_space(&mut self, s: &str) {
+        self.word(s);
+        self.space();
+    }
+    fn word_nbsp(&mut self, s: &str) {
+        self.word(s);
+        self.nbsp();
+    }
+    fn trailing_comma_or_space(&mut self) {
+        self.0.push(Pp::Brk { blank: 1, off: 0, pre: Some(',') });
+    }
+    /// pp's `offset`: the last break's indent moves by `n`.
+    fn offset(&mut self, n: isize) {
+        if let Some(Pp::Brk { off, .. }) = self.0.last_mut() {
+            *off += n;
+        }
+    }
+    fn begin(&mut self, off: isize, consistent: bool) {
+        self.0.push(Pp::Begin { off, consistent });
+    }
+    fn end(&mut self) {
+        self.0.push(Pp::End);
+    }
+    fn add(&mut self, d: Doc) {
+        self.0.extend(d.0);
+    }
+    /// The text with no break taken.
+    fn flat(&self) -> String {
+        let mut s = String::new();
+        for t in &self.0 {
+            match t {
+                Pp::Word(w) => s.push_str(w),
+                Pp::Brk { blank, .. } => s.extend(std::iter::repeat_n(' ', *blank as usize)),
+                Pp::Begin { .. } | Pp::End => {}
+            }
+        }
+        s
+    }
+}
+
+/// pprust's `INDENT_UNIT`.
+const INDENT: isize = 4;
+
+fn boxed(off: isize, consistent: bool, d: Doc) -> Doc {
+    let mut o = Doc::default();
+    o.begin(off, consistent);
+    o.add(d);
+    o.end();
+    o
+}
+
+fn ibox(off: isize, d: Doc) -> Doc {
+    boxed(off, false, d)
+}
+
+/// pprust's `commasep` (and `commasep_exprs`): `a, b` in an inconsistent
+/// box, or a consistent one.
+fn commasep(items: Vec<Doc>, consistent: bool) -> Doc {
+    let mut d = Doc::default();
+    d.begin(0, consistent);
+    for (n, it) in items.into_iter().enumerate() {
+        if n > 0 {
+            d.word(",");
+            d.space();
+        }
+        d.add(it);
+    }
+    d.end();
+    d
+}
+
+/// `{`, the statements, and `}` of a block whose boxes the caller opened
+/// (`bopen` ends the inner one); pprust's `print_block_maybe_unclosed`.
+fn bopen_close(d: &mut Doc, stmts: Vec<Doc>) {
+    d.word("{");
+    d.end();
+    let empty = stmts.is_empty();
+    for s in stmts {
+        d.space();
+        d.add(s);
+    }
+    if !empty {
+        d.brk(1, -INDENT);
+    }
+    d.word("}");
+}
+
+const SIZE_INFINITY: isize = 0xffff;
+const MIN_SPACE: isize = 60;
+
+#[derive(Clone, Copy)]
+enum Frame {
+    Fits,
+    Broken { indent: usize, consistent: bool },
+}
+
+struct Entry {
+    tok: Pp,
+    size: isize,
+}
+
+/// Oppen's printer as pp.rs writes it, over a whole `Doc`.
+struct Layout {
+    out: String,
+    space: isize,
+    buf: std::collections::VecDeque<Entry>,
+    /// The ring index of `buf[0]`.
+    first: usize,
+    left_total: isize,
+    right_total: isize,
+    scan_stack: std::collections::VecDeque<usize>,
+    print_stack: Vec<Frame>,
+    indent: usize,
+    pending: isize,
+}
+
+fn layout(d: &Doc) -> String {
+    let mut l = Layout {
+        out: String::new(),
+        space: MARGIN as isize,
+        buf: Default::default(),
+        first: 0,
+        left_total: 0,
+        right_total: 0,
+        scan_stack: Default::default(),
+        print_stack: Vec::new(),
+        indent: 0,
+        pending: 0,
+    };
+    for t in &d.0 {
+        match t {
+            Pp::Word(s) => l.scan_string(s),
+            Pp::Brk { .. } => l.scan_break(t.clone()),
+            Pp::Begin { .. } => l.scan_begin(t.clone()),
+            Pp::End => l.scan_end(),
+        }
+    }
+    if !l.scan_stack.is_empty() {
+        l.check_stack(0);
+        l.advance_left();
+    }
+    l.out
+}
+
+impl Layout {
+    fn push(&mut self, e: Entry) -> usize {
+        self.buf.push_back(e);
+        self.first + self.buf.len() - 1
+    }
+    fn at(&mut self, i: usize) -> &mut Entry {
+        let j = i - self.first;
+        &mut self.buf[j]
+    }
+    fn scan_begin(&mut self, t: Pp) {
+        if self.scan_stack.is_empty() {
+            self.left_total = 1;
+            self.right_total = 1;
+            self.buf.clear();
+        }
+        let right = self.push(Entry { tok: t, size: -self.right_total });
+        self.scan_stack.push_back(right);
+    }
+    fn scan_end(&mut self) {
+        if self.scan_stack.is_empty() {
+            self.print_end();
+        } else {
+            let right = self.push(Entry { tok: Pp::End, size: -1 });
+            self.scan_stack.push_back(right);
+        }
+    }
+    fn scan_break(&mut self, t: Pp) {
+        if self.scan_stack.is_empty() {
+            self.left_total = 1;
+            self.right_total = 1;
+            self.buf.clear();
+        } else {
+            self.check_stack(0);
+        }
+        let Pp::Brk { blank, .. } = t else { unreachable!() };
+        let right = self.push(Entry { tok: t, size: -self.right_total });
+        self.scan_stack.push_back(right);
+        self.right_total += blank;
+    }
+    fn scan_string(&mut self, s: &str) {
+        if self.scan_stack.is_empty() {
+            self.print_string(s);
+        } else {
+            let len = s.len() as isize;
+            self.push(Entry { tok: Pp::Word(s.to_string()), size: len });
+            self.right_total += len;
+            self.check_stream();
+        }
+    }
+    fn check_stream(&mut self) {
+        while self.right_total - self.left_total > self.space {
+            if *self.scan_stack.front().unwrap() == self.first {
+                self.scan_stack.pop_front().unwrap();
+                self.buf.front_mut().unwrap().size = SIZE_INFINITY;
+            }
+            self.advance_left();
+            if self.buf.is_empty() {
+                break;
+            }
+        }
+    }
+    fn advance_left(&mut self) {
+        while self.buf.front().unwrap().size >= 0 {
+            let left = self.buf.pop_front().unwrap();
+            self.first += 1;
+            match &left.tok {
+                Pp::Word(s) => {
+                    self.left_total += s.len() as isize;
+                    self.print_string(s);
+                }
+                Pp::Brk { blank, off, pre } => {
+                    self.left_total += blank;
+                    self.print_break(*blank, *off, *pre, left.size);
+                }
+                Pp::Begin { off, consistent } => self.print_begin(*off, *consistent, left.size),
+                Pp::End => self.print_end(),
+            }
+            if self.buf.is_empty() {
+                break;
+            }
+        }
+    }
+    fn check_stack(&mut self, mut depth: usize) {
+        while let Some(&index) = self.scan_stack.back() {
+            let right_total = self.right_total;
+            let entry = self.at(index);
+            match entry.tok {
+                Pp::Begin { .. } => {
+                    if depth == 0 {
+                        break;
+                    }
+                    self.scan_stack.pop_back().unwrap();
+                    self.at(index).size += right_total;
+                    depth -= 1;
+                }
+                Pp::End => {
+                    self.scan_stack.pop_back().unwrap();
+                    self.at(index).size = 1;
+                    depth += 1;
+                }
+                _ => {
+                    self.scan_stack.pop_back().unwrap();
+                    self.at(index).size += right_total;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    fn print_begin(&mut self, off: isize, consistent: bool, size: isize) {
+        if size > self.space {
+            self.print_stack.push(Frame::Broken { indent: self.indent, consistent });
+            self.indent = (self.indent as isize + off) as usize;
+        } else {
+            self.print_stack.push(Frame::Fits);
+        }
+    }
+    fn print_end(&mut self) {
+        if let Some(Frame::Broken { indent, .. }) = self.print_stack.pop() {
+            self.indent = indent;
+        }
+    }
+    fn print_break(&mut self, blank: isize, off: isize, pre: Option<char>, size: isize) {
+        let top = self.print_stack.last().copied().unwrap_or(Frame::Broken { indent: 0, consistent: false });
+        let fits = match top {
+            Frame::Fits => true,
+            Frame::Broken { consistent: true, .. } => false,
+            Frame::Broken { consistent: false, .. } => size <= self.space,
+        };
+        if fits {
+            self.pending += blank;
+            self.space -= blank;
+        } else {
+            if let Some(c) = pre {
+                self.out.push(c);
+            }
+            self.out.push('\n');
+            let indent = self.indent as isize + off;
+            self.pending = indent;
+            self.space = (MARGIN as isize - indent).max(MIN_SPACE);
+        }
+    }
+    fn print_string(&mut self, s: &str) {
+        self.out.extend(std::iter::repeat_n(' ', self.pending.max(0) as usize));
+        self.pending = 0;
+        self.out.push_str(s);
+        self.space -= s.len() as isize;
+    }
+}
+
+// ---------- the parser ----------
 
 /// rustc's `ExprPrecedence`, lowest first.
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
@@ -303,18 +638,30 @@ enum EK {
     PrefixRange,
 }
 
+/// A block's parts before pprust lays it out: a match arm prints a block
+/// body in boxes of its own.
+#[derive(Clone)]
+struct Blk {
+    label: Option<String>,
+    unsafe_: bool,
+    stmts: Vec<Doc>,
+}
+
 struct Ex {
-    s: String,
+    d: Doc,
     prec: Prec,
     kind: EK,
     /// A `$x:expr` fragment: its parentheses depend on pprust's precedence
     /// fixups, which this printer follows only for plain operands.
     frag: bool,
+    /// The parts of a block expression.
+    blk: Option<Blk>,
 }
 
 impl Ex {
-    fn new(s: String, prec: Prec, kind: EK) -> Ex {
-        Ex { s, prec, kind, frag: false }
+    /// An expression node: pprust prints each in an `ibox(INDENT_UNIT)`.
+    fn new(d: Doc, prec: Prec, kind: EK) -> Ex {
+        Ex { d: ibox(INDENT, d), prec, kind, frag: false, blk: None }
     }
     fn block_like(&self) -> bool {
         matches!(self.kind, EK::Block | EK::BlockLike)
@@ -338,17 +685,34 @@ fn eff(e: &Ex) -> Prec {
 
 /// A condition (`if`, `while`, `match`, `for`): pprust parenthesizes a
 /// jump or closure there, which the source cannot have written bare.
-fn cond(e: Ex) -> Option<String> {
-    (e.prec != Prec::Jump).then_some(e.s)
+fn cond(e: Ex) -> Option<Doc> {
+    (e.prec != Prec::Jump).then_some(e.d)
 }
 
-/// `inner`, in parentheses when `paren` holds. A fragment that pprust
-/// would print through a statement or jump fixup is not modeled.
-fn wrap(e: Ex, paren: bool) -> Option<String> {
+/// `e`, in parentheses when `paren` holds (`print_expr_cond_paren`). A
+/// fragment that pprust would print through a statement or jump fixup is
+/// not modeled.
+fn wrap(e: Ex, paren: bool) -> Option<Doc> {
     if e.frag && (matches!(e.prec, Prec::Jump) || e.kind == EK::PrefixRange) {
         return None;
     }
-    Some(if paren { format!("({})", e.s) } else { e.s })
+    Some(if paren {
+        let mut d = Doc::w("(");
+        d.add(e.d);
+        d.word(")");
+        d
+    } else {
+        e.d
+    })
+}
+
+/// `a op b` as `print_expr_binary` (and assignments) write it.
+fn binary(l: Doc, op: &str, r: Doc) -> Doc {
+    let mut d = l;
+    d.space();
+    d.word_space(op);
+    d.add(r);
+    d
 }
 
 #[derive(Clone, Copy)]
@@ -505,29 +869,30 @@ impl P {
                     let ty = self.ty()?;
                     let lp = lhs.prec < Prec::Cast;
                     let l = wrap(lhs, lp)?;
-                    Ex::new(format!("{l} as {ty}"), Prec::Cast, EK::Cast)
+                    Ex::new(binary(l, "as", ty), Prec::Cast, EK::Cast)
                 }
                 Op::Assign(o) => {
                     let rhs = self.assoc(Prec::Assign, r2)?;
                     let lp = lhs.prec <= Prec::Range;
                     let rp = eff(&rhs) < Prec::Assign;
-                    Ex::new(format!("{} {o} {}", wrap(lhs, lp)?, wrap(rhs, rp)?), Prec::Assign, EK::Other)
+                    Ex::new(binary(wrap(lhs, lp)?, o, wrap(rhs, rp)?), Prec::Assign, EK::Other)
                 }
                 Op::Range(o) => {
                     if lhs.prec < Prec::LOr {
                         return None;
                     }
-                    let dot = if lhs.kind == EK::DotLit { " " } else { "" };
-                    let l = wrap(lhs, false)?;
-                    let rhs = if self.range_rhs(r2) { Some(self.assoc(Prec::LOr, r2)?) } else { None };
-                    let rs = match rhs {
-                        Some(e) => {
-                            let p = eff(&e) < Prec::LOr;
-                            wrap(e, p)?
-                        }
-                        None => String::new(),
-                    };
-                    Ex::new(format!("{l}{dot}{o}{rs}"), Prec::Range, EK::Other)
+                    let dot = lhs.kind == EK::DotLit;
+                    let mut d = wrap(lhs, false)?;
+                    if dot {
+                        d.word(" ");
+                    }
+                    d.word(o);
+                    if self.range_rhs(r2) {
+                        let e = self.assoc(Prec::LOr, r2)?;
+                        let p = eff(&e) < Prec::LOr;
+                        d.add(wrap(e, p)?);
+                    }
+                    Ex::new(d, Prec::Range, EK::Other)
                 }
                 Op::Bin(o, p) => {
                     let comparison = p == Prec::Compare;
@@ -537,7 +902,7 @@ impl P {
                     if lhs.kind == EK::Cast && (o == "<" || o == "<<") || lhs.kind == EK::Let && p > Prec::LAnd {
                         lp = true;
                     }
-                    Ex::new(format!("{} {o} {}", wrap(lhs, lp)?, wrap(rhs, rp)?), p, EK::Other)
+                    Ex::new(binary(wrap(lhs, lp)?, o, wrap(rhs, rp)?), p, EK::Other)
                 }
             };
         }
@@ -612,11 +977,13 @@ impl P {
             "..="
         };
         if !self.range_rhs(r) {
-            return Some(Ex::new(o.into(), Prec::Range, EK::PrefixRange));
+            return Some(Ex::new(Doc::w(o), Prec::Range, EK::PrefixRange));
         }
         let e = self.assoc(Prec::LOr, R { stmt: false, ..r })?;
         let p = eff(&e) < Prec::LOr;
-        Some(Ex::new(format!("{o}{}", wrap(e, p)?), Prec::Range, EK::PrefixRange))
+        let mut d = Doc::w(o);
+        d.add(wrap(e, p)?);
+        Some(Ex::new(d, Prec::Range, EK::PrefixRange))
     }
 
     fn unary(&mut self, r: R) -> Option<Ex> {
@@ -625,8 +992,8 @@ impl P {
             Some(Tok::Minus) => "-",
             Some(Tok::Bang) => "!",
             Some(Tok::Star) => "*",
-            Some(Tok::Amp) => return self.addr_of(r2, ""),
-            Some(Tok::AndAnd) => return self.addr_of(r2, "&"),
+            Some(Tok::Amp) => return self.addr_of(r2, false),
+            Some(Tok::AndAnd) => return self.addr_of(r2, true),
             _ => {
                 let base = self.primary(r)?;
                 return self.postfix(base, r);
@@ -635,101 +1002,127 @@ impl P {
         self.i += 1;
         let e = self.unary(r2)?;
         let p = eff(&e) < Prec::Prefix;
-        Some(Ex::new(format!("{op}{}", wrap(e, p)?), Prec::Prefix, EK::Other))
+        let mut d = Doc::w(op);
+        d.add(wrap(e, p)?);
+        Some(Ex::new(d, Prec::Prefix, EK::Other))
     }
 
-    /// `&x`, `&mut x`, `&raw const x`, `&raw mut x`; `outer` is the first
-    /// `&` of a `&&` token.
-    fn addr_of(&mut self, r: R, outer: &str) -> Option<Ex> {
+    /// `&x`, `&mut x`, `&raw const x`, `&raw mut x`; `double` for the
+    /// `&&` token, two borrows.
+    fn addr_of(&mut self, r: R, double: bool) -> Option<Ex> {
         self.i += 1;
         let raw = matches!(self.peek(), Some(K::Tok(Tok::Ident(_))))
             && self.t[self.i].text == "raw"
             && matches!(self.tok_at(self.i + 1), Some(Tok::Const | Tok::Mut));
-        let m = if raw {
+        let mut d = Doc::w("&");
+        if raw {
             self.i += 1;
+            d.word_nbsp("raw");
             if self.eat(Tok::Const) {
-                "raw const "
+                d.word_nbsp("const");
             } else {
                 self.bump();
-                "raw mut "
+                d.word_nbsp("mut");
             }
         } else if self.eat(Tok::Mut) {
-            "mut "
-        } else {
-            ""
-        };
+            d.word_nbsp("mut");
+        }
         let e = self.unary(r)?;
         let p = eff(&e) < Prec::Prefix;
-        Some(Ex::new(format!("{outer}&{m}{}", wrap(e, p)?), Prec::Prefix, EK::Other))
+        d.add(wrap(e, p)?);
+        let inner = Ex::new(d, Prec::Prefix, EK::Other);
+        if !double {
+            return Some(inner);
+        }
+        let mut d = Doc::w("&");
+        d.add(inner.d);
+        Some(Ex::new(d, Prec::Prefix, EK::Other))
     }
 
     fn postfix(&mut self, mut e: Ex, r: R) -> Option<Ex> {
         loop {
             if self.eat(Tok::Question) {
                 let p = e.prec < Prec::Unambiguous;
-                e = Ex::new(format!("{}?", wrap(e, p)?), Prec::Unambiguous, EK::Other);
+                let mut d = wrap(e, p)?;
+                d.word("?");
+                e = Ex::new(d, Prec::Unambiguous, EK::Other);
             } else if self.is(Tok::Dot) {
                 self.i += 1;
                 let p = e.prec < Prec::Unambiguous;
-                let dot = if !p && e.kind == EK::DotLit { " ." } else { "." };
-                let base = wrap(e, p)?;
+                let dot_lit = !p && e.kind == EK::DotLit;
+                let mut d = wrap(e, p)?;
+                if dot_lit {
+                    d.word(" ");
+                }
+                d.word(".");
                 match self.tok()? {
                     Tok::Ident(_) | Tok::Reserved(_) => {
                         if matches!(self.tok(), Some(Tok::Reserved(_))) {
                             return None;
                         }
-                        let name = self.bump();
+                        d.word(self.bump());
                         let generics = if self.is(Tok::PathSep) {
                             self.i += 1;
-                            format!("::{}", self.generic_args()?)
+                            let mut g = Doc::w("::");
+                            g.add(self.generic_args()?);
+                            Some(g)
                         } else {
-                            String::new()
+                            None
                         };
                         if self.open(Delim::Paren) {
-                            let args = self.call_args()?;
-                            e = Ex::new(format!("{base}{dot}{name}{generics}({args})"), Prec::Unambiguous, EK::Other);
-                        } else if generics.is_empty() {
-                            e = Ex::new(format!("{base}{dot}{name}"), Prec::Unambiguous, EK::Field);
+                            if let Some(g) = generics {
+                                d.add(g);
+                            }
+                            d.add(self.call_args()?);
+                            e = Ex::new(d, Prec::Unambiguous, EK::Other);
+                        } else if generics.is_none() {
+                            e = Ex::new(d, Prec::Unambiguous, EK::Field);
                         } else {
                             return None;
                         }
                     }
                     Tok::Int(..) | Tok::Float(_) => {
-                        let name = self.bump();
-                        e = Ex::new(format!("{base}{dot}{name}"), Prec::Unambiguous, EK::Other);
+                        d.word(self.bump());
+                        e = Ex::new(d, Prec::Unambiguous, EK::Other);
                     }
                     _ => return None,
                 }
             } else if self.open(Delim::Paren) && !(r.stmt && e.block_like()) {
                 let p = e.kind == EK::Field || e.prec < Prec::Unambiguous || e.block_like();
-                let f = wrap(e, p)?;
-                let args = self.call_args()?;
-                e = Ex::new(format!("{f}({args})"), Prec::Unambiguous, EK::Other);
+                let mut d = wrap(e, p)?;
+                d.add(self.call_args()?);
+                e = Ex::new(d, Prec::Unambiguous, EK::Other);
             } else if self.open(Delim::Bracket) && !(r.stmt && e.block_like()) {
                 let p = e.prec < Prec::Unambiguous || e.block_like();
-                let b = wrap(e, p)?;
+                let mut d = wrap(e, p)?;
                 self.i += 1;
                 let idx = self.expr(R::default())?;
                 self.expect_close(Delim::Bracket)?;
-                e = Ex::new(format!("{b}[{}]", idx.s), Prec::Unambiguous, EK::Other);
+                d.word("[");
+                d.add(idx.d);
+                d.word("]");
+                e = Ex::new(d, Prec::Unambiguous, EK::Other);
             } else {
                 return Some(e);
             }
         }
     }
 
-    /// `(a, b)` of a call: the text inside the parentheses.
-    fn call_args(&mut self) -> Option<String> {
+    /// `(a, b)` of a call (`print_call_post`).
+    fn call_args(&mut self) -> Option<Doc> {
         self.i += 1;
-        let (args, _) = self.list(Delim::Paren, |p| p.expr(R::default()).map(|e| e.s))?;
-        Some(args.join(", "))
+        let (args, _) = self.list(Delim::Paren, |p| p.expr(R::default()).map(|e| e.d))?;
+        let mut d = Doc::w("(");
+        d.add(commasep(args, false));
+        d.word(")");
+        Some(d)
     }
 
     fn primary(&mut self, r: R) -> Option<Ex> {
         use Tok::*;
         let lit = |s: String| {
             let kind = if s.ends_with('.') { EK::DotLit } else { EK::Other };
-            Some(Ex::new(s, Prec::Unambiguous, kind))
+            Some(Ex::new(Doc::w(s), Prec::Unambiguous, kind))
         };
         match self.peek()? {
             K::FragOpen(FragKind::Expr | FragKind::Expr2021 | FragKind::Literal) => {
@@ -742,59 +1135,76 @@ impl P {
             }
             K::FragOpen(FragKind::Block) => {
                 self.i += 1;
-                let b = self.block()?;
+                let b = self.block_expr(None, false)?;
                 (self.peek() == Some(K::FragClose)).then_some(())?;
                 self.i += 1;
-                Some(Ex::new(b, Prec::Unambiguous, EK::Block))
+                Some(b)
             }
             K::FragOpen(FragKind::Path) => self.path_like(r),
             K::FragOpen(_) | K::FragClose | K::Close(_) => None,
             K::Open(Delim::Paren) => {
                 self.i += 1;
-                let (items, trailing) = self.list(Delim::Paren, |p| p.expr(R::default()).map(|e| e.s))?;
+                let (mut items, trailing) = self.list(Delim::Paren, |p| p.expr(R::default()).map(|e| e.d))?;
+                let mut d = Doc::w("(");
                 if items.len() == 1 && !trailing {
-                    return Some(Ex::new(format!("({})", items[0]), Prec::Unambiguous, EK::Other));
+                    d.add(items.pop().unwrap());
+                } else {
+                    let one = items.len() == 1;
+                    d.add(commasep(items, false));
+                    if one {
+                        d.word(",");
+                    }
                 }
-                let one = if items.len() == 1 { "," } else { "" };
-                Some(Ex::new(format!("({}{one})", items.join(", ")), Prec::Unambiguous, EK::Other))
+                d.word(")");
+                Some(Ex::new(d, Prec::Unambiguous, EK::Other))
             }
             K::Open(Delim::Bracket) => {
                 self.i += 1;
+                let mut d = Doc::w("[");
                 if self.close(Delim::Bracket) {
                     self.i += 1;
-                    return Some(Ex::new("[]".into(), Prec::Unambiguous, EK::Other));
+                    d.add(commasep(Vec::new(), false));
+                    d.word("]");
+                    return Some(Ex::new(ibox(INDENT, d), Prec::Unambiguous, EK::Other));
                 }
                 let first = self.expr(R::default())?;
                 if self.eat(Semi) {
                     let n = self.expr(R::default())?;
                     self.expect_close(Delim::Bracket)?;
-                    return Some(Ex::new(format!("[{}; {}]", first.s, n.s), Prec::Unambiguous, EK::Other));
+                    d.add(first.d);
+                    d.word_space(";");
+                    d.add(n.d);
+                    d.word("]");
+                    return Some(Ex::new(ibox(INDENT, d), Prec::Unambiguous, EK::Other));
                 }
-                let mut items = vec![first.s];
+                let mut items = vec![first.d];
                 if self.eat(Comma) {
-                    let (rest, _) = self.list(Delim::Bracket, |p| p.expr(R::default()).map(|e| e.s))?;
+                    let (rest, _) = self.list(Delim::Bracket, |p| p.expr(R::default()).map(|e| e.d))?;
                     items.extend(rest);
                 } else {
                     self.expect_close(Delim::Bracket)?;
                 }
-                Some(Ex::new(format!("[{}]", items.join(", ")), Prec::Unambiguous, EK::Other))
+                d.add(commasep(items, false));
+                d.word("]");
+                Some(Ex::new(ibox(INDENT, d), Prec::Unambiguous, EK::Other))
             }
-            K::Open(Delim::Brace) => Some(Ex::new(self.block()?, Prec::Unambiguous, EK::Block)),
+            K::Open(Delim::Brace) => self.block_expr(None, false),
             K::Tok(t) => match t {
                 Int(..) | Float(_) | Str(..) | ByteStr(_) | ByteChar(_) | Char(..) | True | False => lit(self.bump()),
                 Unsafe if self.kind(self.i + 1) == Some(K::Open(Delim::Brace)) => {
                     self.i += 1;
-                    Some(Ex::new(format!("unsafe {}", self.block()?), Prec::Unambiguous, EK::BlockLike))
+                    self.block_expr(None, true)
                 }
                 Lifetime(_) if self.tok_at(self.i + 1) == Some(Colon) => {
                     let label = self.bump();
                     self.i += 1;
-                    let e = match self.peek()? {
-                        K::Open(Delim::Brace) => Ex::new(self.block()?, Prec::Unambiguous, EK::Block),
-                        K::Tok(Loop | While | For) => self.primary(r)?,
-                        _ => return None,
-                    };
-                    Some(Ex::new(format!("{label}: {}", e.s), Prec::Unambiguous, e.kind))
+                    match self.peek()? {
+                        K::Open(Delim::Brace) => self.block_expr(Some(label), false),
+                        K::Tok(Loop) => self.loop_expr(Some(label)),
+                        K::Tok(While) => self.while_expr(Some(label)),
+                        K::Tok(For) => self.for_expr(Some(label)),
+                        _ => None,
+                    }
                 }
                 If => self.if_expr(),
                 Match => {
@@ -804,67 +1214,75 @@ impl P {
                         return None;
                     }
                     self.i += 1;
-                    let mut arms = String::new();
+                    let mut arms = Vec::new();
                     while !self.close(Delim::Brace) {
-                        arms.push(' ');
-                        arms.push_str(&self.arm()?);
+                        arms.push(self.arm()?);
                     }
                     self.i += 1;
-                    let close = if arms.is_empty() { "}" } else { " }" };
-                    Some(Ex::new(format!("match {scrut} {{{arms}{close}"), Prec::Unambiguous, EK::BlockLike))
+                    let mut d = Doc::default();
+                    d.begin(0, true);
+                    d.begin(0, false);
+                    d.word_nbsp("match");
+                    d.add(scrut);
+                    d.space();
+                    d.word("{");
+                    d.end();
+                    let empty = arms.is_empty();
+                    for a in arms {
+                        d.space();
+                        d.add(a);
+                    }
+                    if !empty {
+                        d.brk(1, -INDENT);
+                    }
+                    d.word("}");
+                    d.end();
+                    Some(Ex::new(d, Prec::Unambiguous, EK::BlockLike))
                 }
-                Loop => {
-                    self.i += 1;
-                    Some(Ex::new(format!("loop {}", self.block()?), Prec::Unambiguous, EK::BlockLike))
-                }
-                While => {
-                    self.i += 1;
-                    let c = cond(self.expr(R { no_struct: true, stmt: false })?)?;
-                    Some(Ex::new(format!("while {c} {}", self.block()?), Prec::Unambiguous, EK::BlockLike))
-                }
-                For => {
-                    self.i += 1;
-                    let pat = self.pat(true)?;
-                    self.expect(In)?;
-                    let iter = cond(self.expr(R { no_struct: true, stmt: false })?)?;
-                    Some(Ex::new(format!("for {pat} in {iter} {}", self.block()?), Prec::Unambiguous, EK::BlockLike))
-                }
+                Loop => self.loop_expr(None),
+                While => self.while_expr(None),
+                For => self.for_expr(None),
                 Pipe | OrOr | Move => self.closure(r),
                 Break => {
                     self.i += 1;
-                    let mut s = "break".to_string();
+                    let mut d = Doc::w("break");
+                    let mut label = false;
                     if matches!(self.tok(), Some(Lifetime(_))) {
-                        s.push(' ');
-                        s.push_str(&self.bump());
+                        d.space();
+                        d.word(self.bump());
+                        label = true;
                     }
                     if self.range_rhs(r) {
                         // `break 'a: loop {}` needs parens rustc would add.
-                        if !s.contains('\'') && matches!(self.tok(), Some(Lifetime(_))) {
+                        if !label && matches!(self.tok(), Some(Lifetime(_))) {
                             return None;
                         }
                         let v = self.expr(R { stmt: false, ..r })?;
-                        s.push(' ');
-                        s.push_str(&wrap(v, false)?);
-                        return Some(Ex::new(s, Prec::Jump, EK::Other));
+                        d.space();
+                        d.add(wrap(v, false)?);
+                        return Some(Ex::new(d, Prec::Jump, EK::Other));
                     }
-                    Some(Ex::new(s, Prec::Unambiguous, EK::Other))
+                    Some(Ex::new(d, Prec::Unambiguous, EK::Other))
                 }
                 Continue => {
                     self.i += 1;
-                    let mut s = "continue".to_string();
+                    let mut d = Doc::w("continue");
                     if matches!(self.tok(), Some(Lifetime(_))) {
-                        s.push(' ');
-                        s.push_str(&self.bump());
+                        d.space();
+                        d.word(self.bump());
                     }
-                    Some(Ex::new(s, Prec::Unambiguous, EK::Other))
+                    Some(Ex::new(d, Prec::Unambiguous, EK::Other))
                 }
                 Return => {
                     self.i += 1;
                     if self.range_rhs(r) {
                         let v = self.expr(R { stmt: false, ..r })?;
-                        return Some(Ex::new(format!("return {}", wrap(v, false)?), Prec::Jump, EK::Other));
+                        let mut d = Doc::w("return");
+                        d.word(" ");
+                        d.add(wrap(v, false)?);
+                        return Some(Ex::new(d, Prec::Jump, EK::Other));
                     }
-                    Some(Ex::new("return".into(), Prec::Unambiguous, EK::Other))
+                    Some(Ex::new(Doc::w("return"), Prec::Unambiguous, EK::Other))
                 }
                 Let => {
                     self.i += 1;
@@ -872,16 +1290,101 @@ impl P {
                     self.expect(Eq)?;
                     let e = self.assoc(Prec::Compare, R { stmt: false, ..r })?;
                     let p = eff(&e) <= Prec::LAnd;
-                    Some(Ex::new(format!("let {pat} = {}", wrap(e, p)?), Prec::Prefix, EK::Let))
+                    let mut d = Doc::w("let ");
+                    d.add(pat);
+                    d.space();
+                    d.word_space("=");
+                    d.add(wrap(e, p)?);
+                    Some(Ex::new(d, Prec::Prefix, EK::Let))
                 }
                 Underscore => {
                     self.i += 1;
-                    Some(Ex::new("_".into(), Prec::Unambiguous, EK::Other))
+                    Some(Ex::new(Doc::w("_"), Prec::Unambiguous, EK::Other))
                 }
                 Ident(_) | SelfLower | SelfUpper | Super | Crate | PathSep | Lt | Shl => self.path_like(r),
                 _ => None,
             },
         }
+    }
+
+    /// A block expression at the cursor (`{`), with its label or `unsafe`.
+    fn block_expr(&mut self, label: Option<String>, unsafe_: bool) -> Option<Ex> {
+        let stmts = self.block()?;
+        let blk = Blk { label, unsafe_, stmts };
+        let mut d = Doc::default();
+        if let Some(l) = &blk.label {
+            d.word(l.clone());
+            d.word_space(":");
+        }
+        d.begin(0, true);
+        d.begin(0, false);
+        if unsafe_ {
+            d.word_space("unsafe");
+        }
+        bopen_close(&mut d, blk.stmts.clone());
+        d.end();
+        let mut e = Ex::new(d, Prec::Unambiguous, if unsafe_ { EK::BlockLike } else { EK::Block });
+        e.blk = Some(blk);
+        Some(e)
+    }
+
+    fn loop_expr(&mut self, label: Option<String>) -> Option<Ex> {
+        self.expect(Tok::Loop)?;
+        let stmts = self.block()?;
+        let mut d = Doc::default();
+        d.begin(0, true);
+        d.begin(0, false);
+        if let Some(l) = label {
+            d.word(l);
+            d.word_space(":");
+        }
+        d.word_nbsp("loop");
+        bopen_close(&mut d, stmts);
+        d.end();
+        Some(Ex::new(d, Prec::Unambiguous, EK::BlockLike))
+    }
+
+    fn while_expr(&mut self, label: Option<String>) -> Option<Ex> {
+        self.expect(Tok::While)?;
+        let c = cond(self.expr(R { no_struct: true, stmt: false })?)?;
+        let stmts = self.block()?;
+        let mut d = Doc::default();
+        if let Some(l) = label {
+            d.word(l);
+            d.word_space(":");
+        }
+        d.begin(0, true);
+        d.begin(0, false);
+        d.word_nbsp("while");
+        d.add(c);
+        d.space();
+        bopen_close(&mut d, stmts);
+        d.end();
+        Some(Ex::new(d, Prec::Unambiguous, EK::BlockLike))
+    }
+
+    fn for_expr(&mut self, label: Option<String>) -> Option<Ex> {
+        self.expect(Tok::For)?;
+        let pat = self.pat(true)?;
+        self.expect(Tok::In)?;
+        let iter = cond(self.expr(R { no_struct: true, stmt: false })?)?;
+        let stmts = self.block()?;
+        let mut d = Doc::default();
+        if let Some(l) = label {
+            d.word(l);
+            d.word_space(":");
+        }
+        d.begin(0, true);
+        d.begin(0, false);
+        d.word_nbsp("for");
+        d.add(pat);
+        d.space();
+        d.word_space("in");
+        d.add(iter);
+        d.space();
+        bopen_close(&mut d, stmts);
+        d.end();
+        Some(Ex::new(d, Prec::Unambiguous, EK::BlockLike))
     }
 
     /// A path expression, a struct literal, or a macro call.
@@ -890,7 +1393,7 @@ impl P {
         let (path, generics) = self.path(true)?;
         if self.is(Tok::Bang) && !generics && matches!(self.kind(self.i + 1), Some(K::Open(_))) {
             self.i += 1;
-            return Some(Ex::new(format!("{path}!{}", self.mac_group()?), Prec::Unambiguous, EK::Other));
+            return Some(Ex::new(self.mac(path)?, Prec::Unambiguous, EK::Other));
         }
         if self.open(Delim::Brace) && !r.no_struct && self.kind(start) != Some(K::Tok(Tok::Lt)) {
             return Some(Ex::new(self.struct_lit(path)?, Prec::Unambiguous, EK::Other));
@@ -898,100 +1401,196 @@ impl P {
         Some(Ex::new(path, Prec::Unambiguous, EK::Other))
     }
 
-    /// `Path { a: 1, b, ..base }` after the path.
-    fn struct_lit(&mut self, path: String) -> Option<String> {
+    /// `Path { a: 1, b, ..base }` after the path (`print_expr_struct`).
+    fn struct_lit(&mut self, path: Doc) -> Option<Doc> {
         self.i += 1;
         let mut fields = Vec::new();
         let mut rest = None;
         while !self.close(Delim::Brace) {
             if self.eat(Tok::DotDot) {
-                rest = Some(if self.close(Delim::Brace) { return None } else { self.expr(R::default())?.s });
+                rest = Some(if self.close(Delim::Brace) { return None } else { self.expr(R::default())?.d });
                 break;
             }
             let name = match self.tok()? {
                 Tok::Ident(_) | Tok::Int(..) => self.bump(),
                 _ => return None,
             };
+            let mut f = Doc::default();
             if self.eat(Tok::Colon) {
-                fields.push(format!("{name}: {}", self.expr(R::default())?.s));
+                f.word(name);
+                f.word_nbsp(":");
+                f.add(self.expr(R::default())?.d);
             } else {
-                fields.push(name);
+                // A shorthand field prints its expression, a path.
+                f.add(Ex::new(Doc::w(name), Prec::Unambiguous, EK::Other).d);
             }
+            fields.push(f);
             if !self.eat(Tok::Comma) && !self.close(Delim::Brace) {
                 return None;
             }
         }
         self.expect_close(Delim::Brace)?;
-        Some(match (fields.is_empty(), rest) {
-            (true, None) => format!("{path} {{}}"),
-            (true, Some(b)) => format!("{path} {{ ..{b} }}"),
-            (false, None) => format!("{path} {{ {} }}", fields.join(", ")),
-            (false, Some(b)) => format!("{path} {{ {}, ..{b} }}", fields.join(", ")),
-        })
+        let mut d = path;
+        d.nbsp();
+        d.word("{");
+        let has_rest = rest.is_some();
+        if fields.is_empty() && !has_rest {
+            d.word("}");
+            return Some(d);
+        }
+        d.begin(0, true);
+        let n = fields.len();
+        let empty = fields.is_empty();
+        for (i, f) in fields.into_iter().enumerate() {
+            if i == 0 {
+                d.space();
+            }
+            d.add(f);
+            if i + 1 < n || has_rest {
+                d.word_space(",");
+            } else {
+                d.trailing_comma_or_space();
+            }
+        }
+        if let Some(b) = rest {
+            if empty {
+                d.space();
+            }
+            d.word("..");
+            d.add(b);
+            d.space();
+        }
+        d.offset(-INDENT);
+        d.end();
+        d.word("}");
+        Some(d)
     }
 
     fn if_expr(&mut self) -> Option<Ex> {
         self.expect(Tok::If)?;
         let c = cond(self.expr(R { no_struct: true, stmt: false })?)?;
-        let mut s = format!("if {c} {}", self.block()?);
+        let stmts = self.block()?;
+        let mut d = Doc::default();
+        d.begin(0, true);
+        d.begin(0, false);
+        d.word_nbsp("if");
+        d.add(c);
+        d.space();
+        bopen_close(&mut d, stmts);
+        d.end();
         while self.eat(Tok::Else) {
-            if self.is(Tok::If) {
+            d.begin(0, true);
+            d.begin(0, false);
+            let last = !self.is(Tok::If);
+            if last {
+                d.word(" else ");
+            } else {
                 self.i += 1;
                 let c = cond(self.expr(R { no_struct: true, stmt: false })?)?;
-                s.push_str(&format!(" else if {c} {}", self.block()?));
-            } else {
-                s.push_str(&format!(" else {}", self.block()?));
+                d.word(" else if ");
+                d.add(c);
+                d.space();
+            }
+            bopen_close(&mut d, self.block()?);
+            d.end();
+            if last {
                 break;
             }
         }
-        Some(Ex::new(s, Prec::Unambiguous, EK::BlockLike))
+        Some(Ex::new(d, Prec::Unambiguous, EK::BlockLike))
     }
 
-    /// One match arm with pprust's comma.
-    fn arm(&mut self) -> Option<String> {
+    /// One match arm with pprust's comma (`print_arm`).
+    fn arm(&mut self) -> Option<Doc> {
         let pat = self.pat(true)?;
-        let guard = if self.eat(Tok::If) { format!(" if {}", self.expr(R::default())?.s) } else { String::new() };
+        let guard = if self.eat(Tok::If) { Some(self.expr(R::default())?.d) } else { None };
         self.expect(Tok::FatArrow)?;
         let body = self.expr(R { no_struct: false, stmt: true })?;
         if !self.eat(Tok::Comma) && !body.block_like() && !self.close(Delim::Brace) {
             return None;
         }
-        let unsafe_block = body.kind == EK::BlockLike && body.s.starts_with("unsafe {");
-        let comma = if body.kind != EK::Block || unsafe_block { "," } else { "" };
-        Some(format!("{pat}{guard} => {}{comma}", body.s))
+        let mut d = Doc::default();
+        d.begin(INDENT, true);
+        d.begin(0, false);
+        d.add(pat);
+        d.space();
+        if let Some(g) = guard {
+            d.word_space("if");
+            d.add(g);
+            d.space();
+        }
+        d.word_space("=>");
+        match body.blk {
+            Some(blk) => {
+                if let Some(l) = blk.label {
+                    d.word(l);
+                    d.word_space(":");
+                }
+                if blk.unsafe_ {
+                    d.word_space("unsafe");
+                }
+                bopen_close(&mut d, blk.stmts);
+                if blk.unsafe_ {
+                    d.word(",");
+                }
+            }
+            None => {
+                d.end();
+                d.add(body.d);
+                d.word(",");
+            }
+        }
+        d.end();
+        Some(d)
     }
 
     fn closure(&mut self, r: R) -> Option<Ex> {
-        let mv = if self.eat(Tok::Move) { "move " } else { "" };
+        let mut d = Doc::default();
+        if self.eat(Tok::Move) {
+            d.word_space("move");
+        }
         let params = if self.eat(Tok::OrOr) {
-            String::new()
+            Vec::new()
         } else {
             self.expect(Tok::Pipe)?;
             let mut ps = Vec::new();
             while !self.is(Tok::Pipe) {
-                let pat = self.pat(false)?;
-                ps.push(if self.eat(Tok::Colon) { format!("{pat}: {}", self.ty()?) } else { pat });
+                let mut pd = self.pat(false)?;
+                if self.eat(Tok::Colon) {
+                    pd.word(":");
+                    pd.space();
+                    pd.add(self.ty()?);
+                }
+                ps.push(ibox(INDENT, pd));
                 if !self.eat(Tok::Comma) && !self.is(Tok::Pipe) {
                     return None;
                 }
             }
             self.i += 1;
-            ps.join(", ")
+            ps
         };
+        d.word("|");
+        d.add(commasep(params, false));
+        d.word("|");
         if self.eat(Tok::Arrow) {
             let ty = self.ty()?;
             if !self.open(Delim::Brace) {
                 return None;
             }
-            let b = self.block()?;
-            return Some(Ex::new(format!("{mv}|{params}| -> {ty} {b}"), Prec::Unambiguous, EK::Other));
+            d.add(ret_ty(ty));
+            let b = self.block_expr(None, false)?;
+            d.space();
+            d.add(b.d);
+            return Some(Ex::new(d, Prec::Unambiguous, EK::Other));
         }
         let body = self.expr(R { stmt: false, ..r })?;
-        Some(Ex::new(format!("{mv}|{params}| {}", body.s), Prec::Jump, EK::Other))
+        d.space();
+        d.add(body.d);
+        Some(Ex::new(d, Prec::Jump, EK::Other))
     }
 
-    /// `{ stmts }` as pprust prints a block.
-    fn block(&mut self) -> Option<String> {
+    /// The statements of `{ stmts }` at the cursor.
+    fn block(&mut self) -> Option<Vec<Doc>> {
         if !self.open(Delim::Brace) {
             return None;
         }
@@ -1001,51 +1600,68 @@ impl P {
             stmts.push(self.stmt()?);
         }
         self.i += 1;
-        Some(if stmts.is_empty() { "{}".into() } else { format!("{{ {} }}", stmts.join(" ")) })
+        Some(stmts)
     }
 
-    fn stmt(&mut self) -> Option<String> {
+    /// One statement as `print_stmt` writes it, after its leading break.
+    fn stmt(&mut self) -> Option<Doc> {
         use Tok::*;
         match self.peek()? {
             K::Tok(Semi) => {
                 self.i += 1;
-                return Some(";".into());
+                return Some(Doc::w(";"));
             }
             K::Tok(Let) => {
                 self.i += 1;
-                let mut s = format!("let {}", self.pat(true)?);
+                let mut d = Doc::default();
+                d.begin(INDENT, false);
+                d.word_nbsp("let");
+                d.begin(INDENT, false);
+                d.add(self.pat(true)?);
                 if self.eat(Colon) {
-                    s.push_str(&format!(": {}", self.ty()?));
+                    d.word_space(":");
+                    d.add(self.ty()?);
                 }
+                d.end();
                 if self.eat(Eq) {
                     let init = self.expr(R::default())?;
-                    s.push_str(&format!(" = {}", init.s));
+                    let brace = init.d.flat().ends_with('}');
+                    d.nbsp();
+                    d.word_space("=");
+                    d.add(init.d);
                     if self.eat(Else) {
-                        if init.s.ends_with('}') {
+                        if brace {
                             return None;
                         }
-                        s.push_str(&format!(" else {}", self.block()?));
+                        d.begin(INDENT, true);
+                        d.begin(INDENT, false);
+                        d.word(" else ");
+                        bopen_close(&mut d, self.block()?);
+                        d.end();
                     }
                 }
                 self.expect(Semi)?;
-                s.push(';');
-                return Some(s);
+                d.word(";");
+                d.end();
+                return Some(d);
             }
             // Items break the line in rustc's printer; attributes are not modeled.
             K::Tok(Fn | Struct | Enum | Impl | Trait | Use | Static | Mod | Type | Extern | Pub | Pound) => return None,
             K::Tok(Const) if self.kind(self.i + 1) != Some(K::Open(Delim::Brace)) => return None,
             _ => {}
         }
-        // A macro call statement: `m! { .. }` and `m!(..);` stay statements.
+        // A macro call statement: `m! { .. }` and `m!(..);` stay statements,
+        // which pprust prints with no expression box.
         let start = self.i;
         if matches!(self.tok(), Some(Ident(_) | SelfLower | Super | Crate | PathSep)) {
             let (path, generics) = self.path(true)?;
             if !generics && self.is(Bang) && matches!(self.kind(self.i + 1), Some(K::Open(_))) {
                 let brace = self.kind(self.i + 1) == Some(K::Open(Delim::Brace));
                 self.i += 1;
-                let mac = format!("{path}!{}", self.mac_group()?);
+                let mut mac = self.mac(path)?;
                 if self.eat(Semi) {
-                    return Some(format!("{mac};"));
+                    mac.word(";");
+                    return Some(mac);
                 }
                 if brace && !self.is(Dot) && !self.is(Question) {
                     return Some(mac);
@@ -1055,70 +1671,76 @@ impl P {
         }
         let e = self.expr(R { no_struct: false, stmt: true })?;
         if self.eat(Semi) {
-            return Some(format!("{};", e.s));
+            let mut d = e.d;
+            d.word(";");
+            return Some(d);
         }
-        (self.close(Delim::Brace) || e.block_like()).then_some(e.s)
+        (self.close(Delim::Brace) || e.block_like()).then_some(e.d)
     }
 
     // ---------- paths ----------
 
     /// A path in expression or pattern position (`colons` true: generic
     /// args print as `::<..>`), or in a type (false). Also `<T as Tr>::x`.
-    /// Returns the text and whether it holds generic args.
-    fn path(&mut self, colons: bool) -> Option<(String, bool)> {
-        let mut s = String::new();
+    /// Returns the path and whether it holds generic args.
+    fn path(&mut self, colons: bool) -> Option<(Doc, bool)> {
+        let mut d = Doc::default();
         let mut generics = false;
         if self.peek() == Some(K::FragOpen(FragKind::Path)) {
             self.i += 1;
             let (p, g) = self.path(colons)?;
             (self.peek() == Some(K::FragClose)).then_some(())?;
             self.i += 1;
-            s = p;
+            d = p;
             generics = g;
         } else if self.eat(Tok::Lt) {
             let ty = self.ty()?;
-            s.push('<');
-            s.push_str(&ty);
+            d.word("<");
+            d.add(ty);
             if self.eat(Tok::As) {
                 let (tr, _) = self.path(false)?;
-                s.push_str(" as ");
-                s.push_str(&tr);
+                d.space();
+                d.word_space("as");
+                d.add(tr);
             }
             self.gt()?;
-            s.push('>');
+            d.word(">");
             self.expect(Tok::PathSep)?;
-            s.push_str("::");
-            generics |= self.segment(colons, &mut s)?;
+            d.word("::");
+            generics |= self.segment(colons, &mut d)?;
         } else {
             if self.eat(Tok::PathSep) {
-                s.push_str("::");
+                d.word("::");
             }
-            generics |= self.segment(colons, &mut s)?;
+            generics |= self.segment(colons, &mut d)?;
         }
         while self.is(Tok::PathSep) && !matches!(self.kind(self.i + 1), Some(K::Tok(Tok::Lt))) {
             self.i += 1;
-            s.push_str("::");
-            generics |= self.segment(colons, &mut s)?;
+            d.word("::");
+            generics |= self.segment(colons, &mut d)?;
         }
-        Some((s, generics))
+        Some((d, generics))
     }
 
     /// One path segment and its generic args: `x::<T>` (expressions) or
     /// `X<T>` / `Fn(A) -> B` (types).
-    fn segment(&mut self, colons: bool, s: &mut String) -> Option<bool> {
+    fn segment(&mut self, colons: bool, d: &mut Doc) -> Option<bool> {
         match self.tok()? {
-            Tok::Ident(_) | Tok::SelfLower | Tok::SelfUpper | Tok::Super | Tok::Crate => s.push_str(&self.bump()),
+            Tok::Ident(_) | Tok::SelfLower | Tok::SelfUpper | Tok::Super | Tok::Crate => {
+                let name = self.bump();
+                if name.ends_with("$crate") {
+                    return None;
+                }
+                d.word(name);
+            }
             _ => return None,
-        }
-        if s.ends_with("$crate") {
-            return None;
         }
         let turbofish = self.is(Tok::PathSep) && self.tok_at(self.i + 1) == Some(Tok::Lt);
         if colons {
             if turbofish {
                 self.i += 1;
-                s.push_str("::");
-                s.push_str(&self.generic_args()?);
+                d.word("::");
+                d.add(self.generic_args()?);
                 return Some(true);
             }
             return Some(false);
@@ -1127,16 +1749,18 @@ impl P {
             self.i += 1;
         }
         if self.is(Tok::Lt) {
-            s.push_str(&self.generic_args()?);
+            d.add(self.generic_args()?);
             return Some(true);
         }
         if self.open(Delim::Paren) {
             // `Fn(A, B) -> C`.
             self.i += 1;
-            let (args, _) = self.list(Delim::Paren, |p| p.ty())?;
-            s.push_str(&format!("({})", args.join(", ")));
+            let (args, _) = self.list(Delim::Paren, |p| p.ty().map(|t| ibox(INDENT, t)))?;
+            d.word("(");
+            d.add(commasep(args, false));
+            d.word(")");
             if self.eat(Tok::Arrow) {
-                s.push_str(&format!(" -> {}", self.ty()?));
+                d.add(ret_ty(self.ty()?));
             }
             return Some(true);
         }
@@ -1149,20 +1773,23 @@ impl P {
     }
 
     /// `<A, B, Item = C>` at the cursor.
-    fn generic_args(&mut self) -> Option<String> {
+    fn generic_args(&mut self) -> Option<Doc> {
         self.expect(Tok::Lt)?;
         let mut args = Vec::new();
         while !self.is(Tok::Gt) {
             let arg = match self.tok() {
-                Some(Tok::Lifetime(_)) => self.bump(),
+                Some(Tok::Lifetime(_)) => Doc::w(self.bump()),
                 Some(Tok::Ident(_)) if self.tok_at(self.i + 1) == Some(Tok::Eq) => {
-                    let name = self.bump();
+                    let mut a = Doc::w(self.bump());
                     self.i += 1;
-                    format!("{name} = {}", self.ty()?)
+                    a.space();
+                    a.word_space("=");
+                    a.add(self.ty()?);
+                    a
                 }
                 Some(Tok::Ident(_)) if self.tok_at(self.i + 1) == Some(Tok::Colon) => return None,
-                Some(Tok::Int(..) | Tok::Minus | Tok::True | Tok::False | Tok::Char(..) | Tok::Str(..)) => self.unary(R::default())?.s,
-                _ if self.open(Delim::Brace) => self.block()?,
+                Some(Tok::Int(..) | Tok::Minus | Tok::True | Tok::False | Tok::Char(..) | Tok::Str(..)) => self.unary(R::default())?.d,
+                _ if self.open(Delim::Brace) => self.block_expr(None, false)?.d,
                 _ => self.ty()?,
             };
             args.push(arg);
@@ -1171,63 +1798,92 @@ impl P {
             }
         }
         self.gt()?;
-        Some(format!("<{}>", args.join(", ")))
+        let mut d = Doc::w("<");
+        d.add(commasep(args, false));
+        d.word(">");
+        Some(d)
     }
 
     // ---------- types ----------
 
-    fn ty(&mut self) -> Option<String> {
+    /// A type as `print_type` writes it, in its `ibox(0)`.
+    fn ty(&mut self) -> Option<Doc> {
         use Tok::*;
-        match self.peek()? {
+        let d = match self.peek()? {
             K::FragOpen(FragKind::Ty) => {
                 self.i += 1;
                 let t = self.ty()?;
                 (self.peek() == Some(K::FragClose)).then_some(())?;
                 self.i += 1;
-                Some(t)
+                return Some(t);
             }
             K::Open(Delim::Paren) => {
                 self.i += 1;
-                let (items, trailing) = self.list(Delim::Paren, |p| p.ty())?;
-                Some(if items.len() == 1 && !trailing {
-                    format!("({})", items[0])
-                } else if items.len() == 1 {
-                    format!("({},)", items[0])
+                let (mut items, trailing) = self.list(Delim::Paren, |p| p.ty())?;
+                let mut d = Doc::w("(");
+                if items.len() == 1 && !trailing {
+                    d.add(items.pop().unwrap());
                 } else {
-                    format!("({})", items.join(", "))
-                })
+                    let one = items.len() == 1;
+                    d.add(commasep(items, false));
+                    if one {
+                        d.word(",");
+                    }
+                }
+                d.word(")");
+                d
             }
             K::Open(Delim::Bracket) => {
                 self.i += 1;
-                let t = self.ty()?;
-                let s = if self.eat(Semi) { format!("[{t}; {}]", self.expr(R::default())?.s) } else { format!("[{t}]") };
+                let mut d = Doc::w("[");
+                d.add(self.ty()?);
+                if self.eat(Semi) {
+                    d.word("; ");
+                    d.add(self.expr(R::default())?.d);
+                }
                 self.expect_close(Delim::Bracket)?;
-                Some(s)
+                d.word("]");
+                d
             }
             K::Tok(Amp | AndAnd) => {
-                let outer = if self.is(AndAnd) { "&" } else { "" };
+                let double = self.is(AndAnd);
                 self.i += 1;
-                let lt = if matches!(self.tok(), Some(Lifetime(_))) { format!("{} ", self.bump()) } else { String::new() };
-                let m = if self.eat(Mut) { "mut " } else { "" };
-                Some(format!("{outer}&{lt}{m}{}", self.ty()?))
+                let mut d = Doc::w("&");
+                if matches!(self.tok(), Some(Lifetime(_))) {
+                    d.word(self.bump());
+                    d.nbsp();
+                }
+                if self.eat(Mut) {
+                    d.word_nbsp("mut");
+                }
+                d.add(self.ty()?);
+                if double {
+                    let mut o = Doc::w("&");
+                    o.add(ibox(0, d));
+                    o
+                } else {
+                    d
+                }
             }
             K::Tok(Star) => {
                 self.i += 1;
-                let m = if self.eat(Const) {
-                    "const"
+                let mut d = Doc::w("*");
+                if self.eat(Const) {
+                    d.word_nbsp("const");
                 } else {
                     self.expect(Mut)?;
-                    "mut"
-                };
-                Some(format!("*{m} {}", self.ty()?))
+                    d.word_nbsp("mut");
+                }
+                d.add(self.ty()?);
+                d
             }
             K::Tok(Underscore) => {
                 self.i += 1;
-                Some("_".into())
+                Doc::w("_")
             }
             K::Tok(Bang) => {
                 self.i += 1;
-                Some("!".into())
+                Doc::w("!")
             }
             K::Tok(Fn) => {
                 self.i += 1;
@@ -1237,52 +1893,74 @@ impl P {
                 self.i += 1;
                 let (params, _) = self.list(Delim::Paren, |p| {
                     let named = matches!(p.tok(), Some(Ident(_) | Underscore)) && p.tok_at(p.i + 1) == Some(Colon);
+                    let mut d = Doc::default();
                     if named {
-                        let name = p.bump();
+                        d.word(p.bump());
                         p.i += 1;
-                        Some(format!("{name}: {}", p.ty()?))
-                    } else {
-                        p.ty()
+                        d.word(":");
+                        d.space();
                     }
+                    d.add(p.ty()?);
+                    Some(ibox(INDENT, d))
                 })?;
-                let ret = if self.eat(Arrow) { format!(" -> {}", self.ty()?) } else { String::new() };
-                Some(format!("fn({}){ret}", params.join(", ")))
+                let mut d = Doc::w("fn");
+                d.word("(");
+                d.add(commasep(params, false));
+                d.word(")");
+                if self.eat(Arrow) {
+                    d.add(ret_ty(self.ty()?));
+                }
+                ibox(INDENT, d)
             }
             K::Tok(Dyn) => {
                 self.i += 1;
-                Some(format!("dyn {}", self.bounds()?))
+                let mut d = Doc::default();
+                d.word_nbsp("dyn");
+                d.add(self.bounds()?);
+                d
             }
             K::Tok(Impl) => {
                 self.i += 1;
-                Some(format!("impl {}", self.bounds()?))
+                let mut d = Doc::default();
+                d.word_nbsp("impl");
+                d.add(self.bounds()?);
+                d
             }
             K::Tok(Ident(_) | SelfUpper | SelfLower | Super | Crate | PathSep | Lt) => {
                 let (p, generics) = self.path(false)?;
                 if self.is(Bang) && !generics && matches!(self.kind(self.i + 1), Some(K::Open(_))) {
                     self.i += 1;
-                    return Some(format!("{p}!{}", self.mac_group()?));
+                    self.mac(p)?
+                } else {
+                    p
                 }
-                Some(p)
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some(ibox(0, d))
     }
 
-    /// `A + B + 'a` after `dyn` or `impl`.
-    fn bounds(&mut self) -> Option<String> {
-        let mut out = Vec::new();
+    /// `A + B + 'a` after `dyn` or `impl` (`print_type_bounds`).
+    fn bounds(&mut self) -> Option<Doc> {
+        let mut d = Doc::default();
+        let mut first = true;
         loop {
-            let b = match self.tok()? {
-                Tok::Lifetime(_) => self.bump(),
+            if !first {
+                d.nbsp();
+                d.word_space("+");
+            }
+            first = false;
+            match self.tok()? {
+                Tok::Lifetime(_) => d.word(self.bump()),
                 Tok::Question => {
                     self.i += 1;
-                    format!("?{}", self.path(false)?.0)
+                    d.word("?");
+                    d.add(self.path(false)?.0);
                 }
-                _ => self.path(false)?.0,
-            };
-            out.push(b);
+                _ => d.add(self.path(false)?.0),
+            }
             if !self.eat(Tok::Plus) {
-                return Some(out.join(" + "));
+                return Some(d);
             }
         }
     }
@@ -1290,19 +1968,35 @@ impl P {
     // ---------- patterns ----------
 
     /// A pattern; `alt` allows a top-level `a | b` (and a leading `|`).
-    fn pat(&mut self, alt: bool) -> Option<String> {
+    fn pat(&mut self, alt: bool) -> Option<Doc> {
         if !alt {
             return self.pat1();
         }
         self.eat(Tok::Pipe);
-        let mut out = vec![self.pat1()?];
-        while self.eat(Tok::Pipe) {
-            out.push(self.pat1()?);
+        let first = self.pat1()?;
+        if !self.is(Tok::Pipe) {
+            return Some(first);
         }
-        Some(out.join(" | "))
+        // `strsep("|", true, ..)`.
+        let mut d = Doc::default();
+        d.begin(0, false);
+        d.add(first);
+        while self.eat(Tok::Pipe) {
+            d.space();
+            d.word_space("|");
+            d.add(self.pat1()?);
+        }
+        d.end();
+        Some(d)
     }
 
-    fn pat1(&mut self) -> Option<String> {
+    /// A literal or path the pattern holds as an expression (a range end,
+    /// a literal): `print_expr`'s box around it.
+    fn pat_expr(d: Doc) -> Doc {
+        ibox(INDENT, d)
+    }
+
+    fn pat1(&mut self) -> Option<Doc> {
         use Tok::*;
         let k = self.peek()?;
         let s = match k {
@@ -1315,55 +2009,75 @@ impl P {
             }
             K::Open(Delim::Paren) => {
                 self.i += 1;
-                let (items, trailing) = self.list(Delim::Paren, |p| p.pat(true))?;
-                return Some(if items.len() == 1 && !trailing && items[0] != ".." {
-                    format!("({})", items[0])
-                } else if items.len() == 1 {
-                    format!("({},)", items[0])
+                let (mut items, trailing) = self.list(Delim::Paren, |p| p.pat(true))?;
+                let mut d = Doc::w("(");
+                if items.len() == 1 && !trailing && items[0].flat() != ".." {
+                    d.add(items.pop().unwrap());
                 } else {
-                    format!("({})", items.join(", "))
-                });
+                    let one = items.len() == 1;
+                    d.add(commasep(items, false));
+                    if one {
+                        d.word(",");
+                    }
+                }
+                d.word(")");
+                return Some(d);
             }
             K::Open(Delim::Bracket) => {
                 self.i += 1;
                 let (items, _) = self.list(Delim::Bracket, |p| p.pat(true))?;
-                return Some(format!("[{}]", items.join(", ")));
+                let mut d = Doc::w("[");
+                d.add(commasep(items, false));
+                d.word("]");
+                return Some(d);
             }
             K::Tok(Underscore) => {
                 self.i += 1;
-                return Some("_".into());
+                return Some(Doc::w("_"));
             }
             K::Tok(DotDot) if matches!(self.kind(self.i + 1), Some(K::Tok(Comma) | K::Close(_) | K::Tok(Pipe) | K::Tok(FatArrow))) => {
                 self.i += 1;
-                return Some("..".into());
+                return Some(Doc::w(".."));
             }
             K::Tok(DotDotEq | DotDot) => {
-                let o = self.bump();
-                return Some(format!("{o}{}", self.range_end()?));
+                let mut d = Doc::w(self.bump());
+                d.add(self.range_end()?);
+                return Some(d);
             }
             K::Tok(Amp | AndAnd) => {
-                let outer = if self.is(AndAnd) { "&" } else { "" };
+                let double = self.is(AndAnd);
                 self.i += 1;
-                let m = if self.eat(Mut) { "mut " } else { "" };
-                let inner = self.pat1()?;
-                return Some(format!("{outer}&{m}{inner}"));
+                let mut d = Doc::w("&");
+                if self.eat(Mut) {
+                    d.word("mut ");
+                }
+                d.add(self.pat1()?);
+                if double {
+                    let mut o = Doc::w("&");
+                    o.add(d);
+                    return Some(o);
+                }
+                return Some(d);
             }
             K::Tok(Ref | Mut) => {
-                let mut s = String::new();
-                if self.eat(Ref) {
-                    s.push_str("ref ");
-                }
-                if self.eat(Mut) {
-                    s.push_str("mut ");
-                }
-                if s == "mut " && self.is(Ref) {
+                let mut d = Doc::default();
+                let r = self.eat(Ref);
+                let m = self.eat(Mut);
+                if !r && m && self.is(Ref) {
                     return None;
                 }
+                // `print_pat`: `mut` of the binding first, then `ref`/`ref mut`.
+                if r {
+                    d.word_nbsp("ref");
+                }
+                if m {
+                    d.word_nbsp("mut");
+                }
                 match self.tok()? {
-                    Ident(_) => s.push_str(&self.bump()),
+                    Ident(_) => d.word(self.bump()),
                     _ => return None,
                 }
-                return self.binding_tail(s);
+                return self.binding_tail(d);
             }
             K::Tok(Ident(_))
                 if !matches!(
@@ -1371,24 +2085,30 @@ impl P {
                     Some(K::Tok(PathSep | Bang | DotDot | DotDotEq | Ellipsis)) | Some(K::Open(Delim::Paren | Delim::Brace))
                 ) =>
             {
-                let name = self.bump();
+                let name = Doc::w(self.bump());
                 return self.binding_tail(name);
             }
-            K::Tok(Int(..) | Float(_) | Str(..) | ByteStr(_) | ByteChar(_) | Char(..) | True | False) => self.bump(),
+            K::Tok(Int(..) | Float(_) | Str(..) | ByteStr(_) | ByteChar(_) | Char(..) | True | False) => Self::pat_expr(Doc::w(self.bump())),
             K::Tok(Minus) if matches!(self.tok_at(self.i + 1), Some(Int(..) | Float(_))) => {
                 self.i += 1;
-                format!("-{}", self.bump())
+                let mut d = Doc::w("-");
+                d.add(Self::pat_expr(Doc::w(self.bump())));
+                Self::pat_expr(d)
             }
             K::Tok(Ident(_) | SelfLower | SelfUpper | Super | Crate | PathSep | Lt) => {
                 let (path, generics) = self.path(true)?;
                 if self.is(Bang) && !generics && matches!(self.kind(self.i + 1), Some(K::Open(_))) {
                     self.i += 1;
-                    return Some(format!("{path}!{}", self.mac_group()?));
+                    return self.mac(path);
                 }
                 if self.open(Delim::Paren) {
                     self.i += 1;
                     let (items, _) = self.list(Delim::Paren, |p| p.pat(true))?;
-                    return Some(format!("{path}({})", items.join(", ")));
+                    let mut d = path;
+                    d.word("(");
+                    d.add(commasep(items, false));
+                    d.word(")");
+                    return Some(d);
                 }
                 if self.open(Delim::Brace) {
                     return self.struct_pat(path);
@@ -1399,47 +2119,57 @@ impl P {
         };
         // A literal or path may start a range pattern.
         if self.is(DotDotEq) || self.is(Ellipsis) {
-            let o = self.bump();
-            return Some(format!("{s}{o}{}", self.range_end()?));
+            let mut d = s;
+            d.word(self.bump());
+            d.add(self.range_end()?);
+            return Some(d);
         }
         if self.is(DotDot) {
             self.i += 1;
-            let end = if matches!(self.peek(), Some(K::Tok(Comma | Pipe | FatArrow | If | Eq | Colon)) | Some(K::Close(_)) | None) {
-                String::new()
-            } else {
-                self.range_end()?
-            };
-            return Some(format!("{s}..{end}"));
+            let mut d = s;
+            d.word("..");
+            if !matches!(self.peek(), Some(K::Tok(Comma | Pipe | FatArrow | If | Eq | Colon)) | Some(K::Close(_)) | None) {
+                d.add(self.range_end()?);
+            }
+            return Some(d);
         }
         Some(s)
     }
 
-    fn range_end(&mut self) -> Option<String> {
+    fn range_end(&mut self) -> Option<Doc> {
         use Tok::*;
         match self.tok()? {
-            Int(..) | Float(_) | Char(..) | ByteChar(_) => Some(self.bump()),
+            Int(..) | Float(_) | Char(..) | ByteChar(_) => Some(Self::pat_expr(Doc::w(self.bump()))),
             Minus => {
                 self.i += 1;
                 match self.tok()? {
-                    Int(..) | Float(_) => Some(format!("-{}", self.bump())),
+                    Int(..) | Float(_) => {
+                        let mut d = Doc::w("-");
+                        d.add(Self::pat_expr(Doc::w(self.bump())));
+                        Some(Self::pat_expr(d))
+                    }
                     _ => None,
                 }
             }
-            Ident(_) | SelfUpper | PathSep | Lt | Crate | Super | SelfLower => Some(self.path(true)?.0),
+            Ident(_) | SelfUpper | PathSep | Lt | Crate | Super | SelfLower => Some(Self::pat_expr(self.path(true)?.0)),
             _ => None,
         }
     }
 
     /// `name @ sub` after a binding name.
-    fn binding_tail(&mut self, name: String) -> Option<String> {
+    fn binding_tail(&mut self, name: Doc) -> Option<Doc> {
         if !self.eat(Tok::At) {
             return Some(name);
         }
         let sub = self.pat1()?;
-        Some(format!("{name} @ {sub}"))
+        let mut d = name;
+        d.space();
+        d.word_space("@");
+        d.add(sub);
+        Some(d)
     }
 
-    fn struct_pat(&mut self, path: String) -> Option<String> {
+    fn struct_pat(&mut self, path: Doc) -> Option<Doc> {
         self.i += 1;
         let mut fields = Vec::new();
         let mut rest = false;
@@ -1448,45 +2178,81 @@ impl P {
                 rest = true;
                 break;
             }
-            let field = match self.tok()? {
+            let mut f = Doc::default();
+            match self.tok()? {
                 Tok::Ident(_) | Tok::Int(..) if self.tok_at(self.i + 1) == Some(Tok::Colon) => {
-                    let name = self.bump();
+                    f.word(self.bump());
                     self.i += 1;
-                    format!("{name}: {}", self.pat(true)?)
+                    f.word_nbsp(":");
+                    f.add(self.pat(true)?);
                 }
-                Tok::Ref | Tok::Mut | Tok::Ident(_) => self.pat1()?,
+                Tok::Ref | Tok::Mut | Tok::Ident(_) => f.add(self.pat1()?),
                 _ => return None,
-            };
-            fields.push(field);
+            }
+            fields.push(boxed(INDENT, true, f));
             if !self.eat(Tok::Comma) && !self.close(Delim::Brace) {
                 return None;
             }
         }
         self.expect_close(Delim::Brace)?;
-        Some(match (fields.is_empty(), rest) {
-            (true, false) => format!("{path} {{}}"),
-            (true, true) => format!("{path} {{ .. }}"),
-            (false, false) => format!("{path} {{ {} }}", fields.join(", ")),
-            (false, true) => format!("{path} {{ {}, .. }}", fields.join(", ")),
-        })
+        let empty = fields.is_empty() && !rest;
+        let has_fields = !fields.is_empty();
+        let mut d = path;
+        d.nbsp();
+        d.word("{");
+        if !empty {
+            d.space();
+        }
+        d.add(commasep(fields, true));
+        if rest {
+            if has_fields {
+                d.word_space(",");
+            }
+            d.word("..");
+        }
+        if !empty {
+            d.space();
+        }
+        d.word("}");
+        Some(d)
     }
 
     // ---------- macro calls ----------
 
-    /// The delimited arguments of a macro call at the cursor, as pprust's
-    /// `print_mac` writes them after the `!`.
-    fn mac_group(&mut self) -> Option<String> {
+    /// `path!(..)` with the delimited group at the cursor, as `print_mac`
+    /// writes it.
+    fn mac(&mut self, path: Doc) -> Option<Doc> {
         let open = self.i;
         let close = self.group_end(open)?;
         self.i = close + 1;
-        let K::Open(d) = self.t[open].k else { return None };
+        let K::Open(delim) = self.t[open].k else { return None };
         let inner = self.tts(open + 1, close)?;
-        Some(match d {
-            Delim::Brace if inner.is_empty() => " {}".into(),
-            Delim::Brace => format!(" {{ {inner} }}"),
-            Delim::Paren => format!("({inner})"),
-            Delim::Bracket => format!("[{inner}]"),
-        })
+        let mut d = Doc::default();
+        if delim == Delim::Brace {
+            d.begin(INDENT, true);
+            d.add(path);
+            d.word("!");
+            d.nbsp();
+            d.word("{");
+            let open_space = !inner.0.is_empty();
+            if open_space {
+                d.space();
+            }
+            d.add(ibox(0, inner));
+            if open_space {
+                d.brk(1, -INDENT);
+            }
+            d.word("}");
+            d.end();
+        } else {
+            let (o, c) = if delim == Delim::Paren { ("(", ")") } else { ("[", "]") };
+            d.add(path);
+            d.word("!");
+            d.word(o);
+            d.add(ibox(0, inner));
+            d.word(c);
+        }
+        Some(d)
     }
 
     /// The index of the token that closes the group opened at `open`.
@@ -1508,7 +2274,7 @@ impl P {
     }
 
     /// rustc's `print_tts` over the token trees in `lo..hi`.
-    fn tts(&self, lo: usize, hi: usize) -> Option<String> {
+    fn tts(&self, lo: usize, hi: usize) -> Option<Doc> {
         // Each tree: its first and last token index.
         let mut trees = Vec::new();
         let mut j = lo;
@@ -1522,37 +2288,49 @@ impl P {
             trees.push((j, end));
             j = end + 1;
         }
-        let mut s = String::new();
+        let mut d = Doc::default();
         for (n, &(a, b)) in trees.iter().enumerate() {
-            s.push_str(&self.tree_text(a, b)?);
+            d.add(self.tree(a, b)?);
             if let Some(&(c, _)) = trees.get(n + 1)
                 && self.space_after(a, b, c)?
             {
-                s.push(' ');
+                d.space();
             }
         }
-        Some(s)
+        Some(d)
     }
 
-    fn tree_text(&self, a: usize, b: usize) -> Option<String> {
+    /// One token tree (`print_tt`); a group as `print_mac_common` writes
+    /// it with no header.
+    fn tree(&self, a: usize, b: usize) -> Option<Doc> {
         let t = &self.t[a];
         Some(match t.k {
             K::Tok(_) if t.text.starts_with("$crate") => return None,
-            K::Tok(_) => t.text.clone(),
-            K::FragOpen(_) => self.tts(a + 1, b)?,
+            K::Tok(_) => Doc::w(t.text.clone()),
+            K::FragOpen(_) => ibox(0, self.tts(a + 1, b)?),
             K::Open(Delim::Brace) => {
                 let inner = self.tts(a + 1, b)?;
-                if inner.is_empty() {
-                    "{}".into()
-                } else if t.alone? {
-                    format!("{{ {inner} }}")
-                } else {
-                    format!("{{{inner}}}")
+                let open_space = !inner.0.is_empty() && t.alone?;
+                let mut d = Doc::default();
+                d.begin(INDENT, true);
+                d.word("{");
+                if open_space {
+                    d.space();
                 }
+                d.add(ibox(0, inner));
+                if open_space {
+                    d.brk(1, -INDENT);
+                }
+                d.word("}");
+                d.end();
+                d
             }
-            K::Open(d) => {
-                let (o, c) = if d == Delim::Paren { ("(", ")") } else { ("[", "]") };
-                format!("{o}{}{c}", self.tts(a + 1, b)?)
+            K::Open(dl) => {
+                let (o, c) = if dl == Delim::Paren { ("(", ")") } else { ("[", "]") };
+                let mut d = Doc::w(o);
+                d.add(ibox(0, self.tts(a + 1, b)?));
+                d.word(c);
+                d
             }
             K::Close(_) | K::FragClose => return None,
         })
@@ -1608,4 +2386,15 @@ impl P {
             _ => true,
         }
     }
+}
+
+/// ` -> T` (`print_fn_ret_ty`).
+fn ret_ty(ty: Doc) -> Doc {
+    let mut d = Doc::default();
+    d.space();
+    let mut a = Doc::default();
+    a.word_space("->");
+    a.add(ty);
+    d.add(ibox(INDENT, a));
+    d
 }
