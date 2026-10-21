@@ -6792,7 +6792,7 @@ impl<'p> Ctx<'p> {
                     }
                     Coerce::Unsize(expected)
                 } else {
-                    match self.unsize_coercion(x, y, found, expected, span, e) {
+                    match self.unsize_coercion(x, y, found, expected, span) {
                         Some(c) => c,
                         None => return false,
                     }
@@ -7056,7 +7056,7 @@ impl<'p> Ctx<'p> {
             (TyKind::Ref(_, fm, x), TyKind::Ref(_, em, y))
                 if dyn_target && (!em.is_mut() || fm.is_mut()) && !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float()) =>
             {
-                match self.unsize_coercion(x, y, found, expected, span, e) {
+                match self.unsize_coercion(x, y, found, expected, span) {
                     Some(c) => c,
                     None => return false,
                 }
@@ -7076,7 +7076,7 @@ impl<'p> Ctx<'p> {
                     }
                     return true;
                 }
-                match self.unsize_coercion(x, y, found, expected, span, e) {
+                match self.unsize_coercion(x, y, found, expected, span) {
                     Some(c) => c,
                     None => return false,
                 }
@@ -7534,21 +7534,10 @@ impl<'p> Ctx<'p> {
     /// each written auto trait (queued as obligations), `'static` when
     /// the object lifetime is, and a vtable request for the method-less
     /// vtable (`object::vtable_key`).
-    fn auto_only_unsize(&mut self, mut x: Ty, y: Ty, found: Ty, expected: Ty, span: Span, e: Option<ExprId>) -> Option<Coerce> {
+    fn auto_only_unsize(&mut self, mut x: Ty, y: Ty, found: Ty, expected: Ty, span: Span) -> Option<Coerce> {
         let p = self.p;
-        if matches!(self.kind(expected), TyKind::Ref(Region::Static, ..))
-            && !matches!(self.kind(found), TyKind::Ref(Region::Static, ..))
-            && !e.is_some_and(|e| self.static_borrow(e))
-        {
-            let tn = self.tn(expected);
-            self.err(
-                "L0705",
-                span,
-                format!("lust cannot prove that this reference lives for `'static`, which `{tn}` requires"),
-                "Borrow a `static` item here, or use a shorter reference.",
-            );
-            return None;
-        }
+        // A `&'static dyn Send` target reference: the borrow checker
+        // proves the source reference `'static` (E0597, E0515).
         // A dyn source drops its principal or some auto traits (`dyn Tr +
         // Send` or `dyn Send + Sync` to `dyn Send`): it must have every
         // target auto trait. Every vtable starts with drop, size, and
@@ -7684,29 +7673,16 @@ impl<'p> Ctx<'p> {
     /// written auto trait, which are queued as obligations, and becomes
     /// a vtable request. Reports the error and returns None when the
     /// coercion cannot apply.
-    fn unsize_coercion(&mut self, x: Ty, y: Ty, found: Ty, expected: Ty, span: Span, e: Option<ExprId>) -> Option<Coerce> {
+    fn unsize_coercion(&mut self, x: Ty, y: Ty, found: Ty, expected: Ty, span: Span) -> Option<Coerce> {
         let p = self.p;
         let (mut x, y) = (self.deep(x), self.deep(y));
         if matches!(self.tys.kind(y), TyKind::Dyn(b, _) if self.tys.dyn_bounds(b).principal.is_none()) {
-            return self.auto_only_unsize(x, y, found, expected, span, e);
+            return self.auto_only_unsize(x, y, found, expected, span);
         }
         let to = object::principal_of(&self.tys, y)?;
-        // A written `&'static dyn Tr` target: lust tracks no reference
-        // lifetimes, so only a borrow of a static item (or a reference
-        // already typed `&'static`) proves it.
-        if matches!(self.kind(expected), TyKind::Ref(Region::Static, ..))
-            && !matches!(self.kind(found), TyKind::Ref(Region::Static, ..))
-            && !e.is_some_and(|e| self.static_borrow(e))
-        {
-            let tn = self.tn(expected);
-            self.err(
-                "L0705",
-                span,
-                format!("lust cannot prove that this reference lives for `'static`, which `{tn}` requires"),
-                "Borrow a `static` item here, or use `&(dyn Tr + 'static)` (a shorter reference to a `'static` object).",
-            );
-            return None;
-        }
+        // A written `&'static dyn Tr` target reference: the borrow
+        // checker proves the source reference `'static` (E0597, E0515),
+        // a `Box::leak` or a `&'static` local's reborrow included.
         // A numeric literal behind the coercion (`&3 as &dyn Tr`): as in
         // rustc, the one impl of the trait for a type of that kind
         // decides it, and otherwise the literal falls back to i32 (f64).
@@ -8245,15 +8221,6 @@ impl<'p> Ctx<'p> {
         let known = !matches!(self.kind(x), TyKind::Infer(v) if !v.is_int() && !v.is_float());
         let to_slice = matches!((self.kind(x), self.kind(y)), (TyKind::Array(..), TyKind::Slice(_)));
         (known && (to_slice || matches!(self.kind(y), TyKind::Dyn(..)))).then_some((x, y))
-    }
-
-    /// True when `e` borrows a static item (`&S0`): the one reference
-    /// lust knows lives for `'static`.
-    fn static_borrow(&self, e: ExprId) -> bool {
-        match self.p.ast.expr(e) {
-            Expr::Ref { raw: false, expr, .. } => matches!(self.out.expr_res[self.ei(*expr)], Res::Static(_)),
-            _ => false,
-        }
     }
 
     fn expect_expr(&mut self, e: ExprId, expected: Ty) -> Ty {
