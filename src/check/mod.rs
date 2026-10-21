@@ -2078,6 +2078,9 @@ struct Ctx<'p> {
     /// type with a written `Clone` (which std's `repeat_n` calls) is
     /// rejected at body end.
     deferred_repeat_n: Vec<(Ty, Span)>,
+    /// `[x; n]` element types still open at the repeat (`[None; N]`,
+    /// whose `Option<?T>` a later use fixes): tested for Copy at body end.
+    deferred_array_repeat: Vec<(Ty, Span)>,
     /// `Range<{integer}>::len` and kin: the element must end as one of
     /// core's exact-size range integers (check/iter.rs `exact_size`).
     deferred_exact_range: Vec<(Ty, bool, Span)>,
@@ -2643,6 +2646,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_sum: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_repeat_n: Vec::new(),
+        deferred_array_repeat: Vec::new(),
         deferred_exact_range: Vec::new(),
         deferred_io_copy: Vec::new(),
         stmt_expr: None,
@@ -3241,6 +3245,25 @@ impl<'p> Ctx<'p> {
     }
     fn ei(&self, e: ExprId) -> usize {
         (e.0 - self.out.expr_base) as usize
+    }
+    /// An array repeat of length above 1 needs a Copy element. An element
+    /// type still open here (`[None; N]`) is tested at body end, once a
+    /// later use has fixed it.
+    fn require_repeat_copy(&mut self, elem: Ty, span: Span) {
+        let elem = self.deep(elem);
+        if self.tys.flags(elem).contains_infer() {
+            self.deferred_array_repeat.push((elem, span));
+        } else if !is_copy(self.p, &self.tys, elem) {
+            self.repeat_copy_err(span);
+        }
+    }
+    fn repeat_copy_err(&mut self, span: Span) {
+        self.err(
+            "L0110",
+            span,
+            "the trait `Copy` is not implemented for this type",
+            "Array repeat with a length above 1 needs a Copy element, or write the elements out.",
+        );
     }
     /// True when an array repeat operand may repeat a non-`Copy`
     /// value: rustc re-evaluates a const item or inline const per
@@ -10309,15 +10332,8 @@ impl<'p> Ctx<'p> {
                         Some(ConstKind::Int(n)) => n,
                         _ => 2,
                     };
-                    let const_val = self.repeat_const_operand(*value);
-                    let elem_d = self.deep(elem);
-                    if n > 1 && !const_val && !is_copy(p, &self.tys, elem_d) {
-                        self.err(
-                            "L0110",
-                            span,
-                            "the trait `Copy` is not implemented for this type",
-                            "Array repeat with a length above 1 needs a Copy element, or write the elements out.",
-                        );
+                    if n > 1 && !self.repeat_const_operand(*value) {
+                        self.require_repeat_copy(elem, span);
                     }
                     return self.tys.intern(TyKind::Array(elem, c));
                 }
@@ -10352,15 +10368,8 @@ impl<'p> Ctx<'p> {
                 });
                 match n {
                     Some(n) => {
-                        let const_val = self.repeat_const_operand(*value);
-                        let elem_d = self.deep(elem);
-                        if n > 1 && !const_val && !is_copy(p, &self.tys, elem_d) {
-                            self.err(
-                                "L0110",
-                                span,
-                                "the trait `Copy` is not implemented for this type",
-                                "Array repeat with a length above 1 needs a Copy element, or write the elements out.",
-                            );
+                        if n > 1 && !self.repeat_const_operand(*value) {
+                            self.require_repeat_copy(elem, span);
                         }
                         let c = self.tys.intern_const(ConstKind::Int(n));
                         self.tys.intern(TyKind::Array(elem, c))
@@ -24832,6 +24841,12 @@ impl<'p> Ctx<'p> {
             if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_array_repeat) {
+            let t = self.deep(t);
+            if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
+                self.repeat_copy_err(span);
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_repeat_n) {
