@@ -10020,6 +10020,8 @@ impl<'p> Ctx<'p> {
                             true
                         }
                         (TyKind::Bool, TyKind::Bool) => true,
+                        // A fn pointer casts to an integer: its address.
+                        (TyKind::FnPtr(_), TyKind::Int(_)) => true,
                         (TyKind::Error, _) | (_, TyKind::Error) => true,
                         _ => false,
                     };
@@ -10029,7 +10031,7 @@ impl<'p> Ctx<'p> {
                         "L0116",
                         span,
                         format!("cannot cast `{a}` as `{b}`"),
-                        "Lust allows `as` between integers, from bool and char to integers, from u8 to char, and between raw pointers and integers.",
+                        "Lust allows `as` between integers, from bool and char to integers, from u8 to char, between raw pointers and integers, and from fn pointers to integers.",
                     );
                 }
                 target

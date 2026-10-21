@@ -5020,6 +5020,9 @@ impl FnGen<'_, '_> {
                             }
                         }
                     }
+                    // A fn pointer's address (`f as usize`).
+                    (CTy::FnPtr(..), CTy::Int(ti)) if is128(*ti) => format!("(({}){{(uint64_t)(uintptr_t)({a}), 0}})", int_c(*ti)),
+                    (CTy::FnPtr(..), CTy::Int(_)) => format!("(({})(uintptr_t)({a}))", ctype(&to)),
                     (_, CTy::Int(ti)) if is128(*ti) => {
                         let signed = matches!(&from, CTy::Int(si) if si.signed());
                         if signed {
