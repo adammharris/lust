@@ -270,6 +270,17 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             info.violation.get_or_insert((format!("a supertrait of `{tname}` uses `Self` as a type parameter"), rec.span));
             continue;
         }
+        match crate::check::unwind::unwind_trait(p, sup) {
+            Some(false) => {
+                info.auto.unwind_safe = true;
+                continue;
+            }
+            Some(true) => {
+                info.auto.ref_unwind_safe = true;
+                continue;
+            }
+            None => {}
+        }
         if lang.is_auto(sup) {
             if sup == lang.send {
                 info.auto.send = true;
@@ -318,9 +329,7 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             if let Some((_, a)) = si.assoc_types.first() {
                 info.unsupported.get_or_insert(format!("`dyn {tname}` whose supertrait `{}` has the associated type `{}`", p.name(srec.name), p.name(*a)));
             }
-            info.auto.send |= si.auto.send;
-            info.auto.sync |= si.auto.sync;
-            info.auto.unpin |= si.auto.unpin;
+            info.auto = info.auto.union(si.auto);
             info.fmt_debug |= si.fmt_debug;
             info.fmt_display |= si.fmt_display;
         }
@@ -510,12 +519,41 @@ pub fn dyn_auto(p: &Program, tys: &impl TyIntern, t: Ty) -> AutoTraits {
             None => {
                 let l = &p.gx.lang;
                 let has = |want| principal_has_supertrait(p, d, want);
-                AutoTraits { send: has(l.send), sync: has(l.sync), unpin: has(l.unpin) }
+                let mut a = AutoTraits { send: has(l.send), sync: has(l.sync), unpin: has(l.unpin), ..AutoTraits::default() };
+                let (u, r) = unwind_supertraits(p, d, &mut Vec::new());
+                a.unwind_safe = u;
+                a.ref_unwind_safe = r;
+                a
             }
         },
         None => AutoTraits::default(),
     };
-    AutoTraits { send: b.auto.send || implied.send, sync: b.auto.sync || implied.sync, unpin: b.auto.unpin || implied.unpin }
+    b.auto.union(implied)
+}
+
+/// Whether a trait has std's `UnwindSafe` and `RefUnwindSafe` among its
+/// supertraits, walked directly (as `principal_has_supertrait`).
+fn unwind_supertraits(p: &Program, d: DefId, stack: &mut Vec<DefId>) -> (bool, bool) {
+    if stack.contains(&d) {
+        return (false, false);
+    }
+    let Some(rec) = p.gx.index.trait_record(d) else { return (false, false) };
+    stack.push(d);
+    let mut out = (false, false);
+    for pred in &rec.generics.predicates {
+        let Predicate::Trait(b) = pred else { continue };
+        let sup = b.value.def;
+        match crate::check::unwind::unwind_trait(p, sup) {
+            Some(false) => out.0 = true,
+            Some(true) => out.1 = true,
+            None => {
+                let (u, r) = unwind_supertraits(p, sup, stack);
+                out = (out.0 || u, out.1 || r);
+            }
+        }
+    }
+    stack.pop();
+    out
 }
 
 /// The problem with the first dyn type inside `t`, as a diagnostic at

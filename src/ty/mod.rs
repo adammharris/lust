@@ -540,6 +540,37 @@ pub struct AutoTraits {
     pub send: bool,
     pub sync: bool,
     pub unpin: bool,
+    /// std's `UnwindSafe` and `RefUnwindSafe`: auto traits in rustc, std
+    /// source traits answered by a table in lust (check/unwind.rs).
+    pub unwind_safe: bool,
+    pub ref_unwind_safe: bool,
+}
+
+impl AutoTraits {
+    /// True when every auto trait `want` has is here too.
+    pub fn covers(self, want: AutoTraits) -> bool {
+        (!want.send || self.send)
+            && (!want.sync || self.sync)
+            && (!want.unpin || self.unpin)
+            && (!want.unwind_safe || self.unwind_safe)
+            && (!want.ref_unwind_safe || self.ref_unwind_safe)
+    }
+
+    /// The auto traits either set has.
+    pub fn union(self, o: AutoTraits) -> AutoTraits {
+        AutoTraits {
+            send: self.send || o.send,
+            sync: self.sync || o.sync,
+            unpin: self.unpin || o.unpin,
+            unwind_safe: self.unwind_safe || o.unwind_safe,
+            ref_unwind_safe: self.ref_unwind_safe || o.ref_unwind_safe,
+        }
+    }
+
+    /// True when an unwind-safety bit is set.
+    pub fn has_unwind(self) -> bool {
+        self.unwind_safe || self.ref_unwind_safe
+    }
 }
 
 /// A `dyn` bound list: one principal trait ref under its binder (a `dyn for<'a>`

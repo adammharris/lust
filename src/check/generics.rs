@@ -3896,6 +3896,16 @@ fn resolve_dyn(
                     ));
                 }
                 let trait_def = trait_def_of_path(cx, interner, known, &trait_ref.path, span)?;
+                // std's `UnwindSafe` and `RefUnwindSafe`, auto traits in
+                // rustc (std source traits here, check/unwind.rs).
+                if let Some(refs) = unwind_trait_of(cx, interner, &trait_ref.path, trait_def) {
+                    if refs {
+                        auto.ref_unwind_safe = true;
+                    } else {
+                        auto.unwind_safe = true;
+                    }
+                    continue;
+                }
                 if cx.lang.is_auto(trait_def) {
                     if trait_def == cx.lang.send {
                         auto.send = true;
@@ -6066,6 +6076,20 @@ pub fn ty_uses_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
             tys.args(pr.value.args).iter().skip(1).chain(tys.bindings(pr.value.bindings).iter().map(|(_, g)| g)).any(|g| g.as_ty().is_some_and(|e| ty_uses_param(tys, e, idx)))
         }),
         _ => false,
+    }
+}
+
+/// `Some(refs)` when a dyn bound's trait is std's `UnwindSafe` (false) or
+/// `RefUnwindSafe` (true), the traits of the std panic module in source
+/// (src/stdmods.rs); a crate trait of the same name is a principal.
+fn unwind_trait_of(cx: &ResolveCx, interner: &Interner, path: &[ast::PathSeg], def: DefId) -> Option<bool> {
+    if !interner.get(path.last()?.name).ends_with("UnwindSafe") {
+        return None;
+    }
+    match interner.get(cx.index.trait_record(def)?.name) {
+        "__lust_std_panic$UnwindSafe" => Some(false),
+        "__lust_std_panic$RefUnwindSafe" => Some(true),
+        _ => None,
     }
 }
 
@@ -13395,6 +13419,15 @@ fn prove_trait_ref(
     // supertrait of `P` (the fmt traits included), with no impl record.
     if index.dyn_object_impl_holds(&mut cx.tys, tr) {
         return true;
+    }
+    // std's `UnwindSafe` and `RefUnwindSafe` by their table
+    // (check/unwind.rs); an open answer is not a proof.
+    if let Some(refs) = crate::check::unwind::unwind_trait(p, tr.def) {
+        let Some(t) = self_resolved else { return false };
+        if cx.tys.flags(t).contains_infer() {
+            return false;
+        }
+        return crate::check::unwind::unwind_safe(p, &mut cx.tys, env, refs, t, &mut Vec::new()) == Some(true);
     }
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {

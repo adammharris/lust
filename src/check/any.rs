@@ -170,7 +170,7 @@ fn encode_ty(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<u8>) {
                     }
                 }
             }
-            out.extend([b.auto.send as u8, b.auto.sync as u8, b.auto.unpin as u8]);
+            out.extend([b.auto.send as u8, b.auto.sync as u8, b.auto.unpin as u8, b.auto.unwind_safe as u8, b.auto.ref_unwind_safe as u8]);
         }
         // Never in a checked concrete type (`any_type_ok` rejects them);
         // a template's placeholder answer is never generated.
@@ -195,7 +195,7 @@ pub fn dyn_reaches_any(p: &Program, tys: &mut impl TyIntern, t: Ty) -> bool {
 fn is_downcast_dyn(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     let TyKind::Dyn(b, _) = tys.kind(t) else { return false };
     let b = tys.dyn_bounds(b);
-    b.principal.is_some_and(|pr| pr.value.def == p.gx.lang.any) && !b.auto.unpin && (b.auto.send || !b.auto.sync)
+    b.principal.is_some_and(|pr| pr.value.def == p.gx.lang.any) && !b.auto.unpin && !b.auto.has_unwind() && (b.auto.send || !b.auto.sync)
 }
 
 impl<'p> Ctx<'p> {
@@ -250,7 +250,7 @@ impl<'p> Ctx<'p> {
             // std has `Rc<dyn Any>::downcast` and, for `Arc`, only
             // `Arc<dyn Any + Send + Sync>::downcast`.
             let arc = crate::ty::sync::sync_kind(&self.tys, t0) == Some(crate::ty::sync::SyncTy::Arc);
-            let autos = if arc { AutoTraits { send: true, sync: true, unpin: false } } else { AutoTraits::default() };
+            let autos = if arc { AutoTraits { send: true, sync: true, ..AutoTraits::default() } } else { AutoTraits::default() };
             let ok = if boxed {
                 is_downcast_dyn(p, &self.tys, elem)
             } else {
@@ -1280,7 +1280,13 @@ fn tn_dyn(p: &Program, tys: &mut impl TyIntern, b: DynBounds, open: bool) -> Opt
             parts.push(tn_apply(&name, shown));
         }
     }
-    for (on, name) in [(b.auto.send, "core::marker::Send"), (b.auto.sync, "core::marker::Sync"), (b.auto.unpin, "core::marker::Unpin")] {
+    for (on, name) in [
+        (b.auto.send, "core::marker::Send"),
+        (b.auto.sync, "core::marker::Sync"),
+        (b.auto.unpin, "core::marker::Unpin"),
+        (b.auto.unwind_safe, "core::panic::unwind_safe::UnwindSafe"),
+        (b.auto.ref_unwind_safe, "core::panic::unwind_safe::RefUnwindSafe"),
+    ] {
         if on {
             parts.push(name.to_string());
         }

@@ -913,7 +913,13 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
                     None => format!("{name}<{}>", args.join(", ")),
                 });
             }
-            for (on, name) in [(b.auto.send, "Send"), (b.auto.sync, "Sync"), (b.auto.unpin, "Unpin")] {
+            for (on, name) in [
+                (b.auto.send, "Send"),
+                (b.auto.sync, "Sync"),
+                (b.auto.unpin, "Unpin"),
+                (b.auto.unwind_safe, "UnwindSafe"),
+                (b.auto.ref_unwind_safe, "RefUnwindSafe"),
+            ] {
                 if on {
                     parts.push(name.to_string());
                 }
@@ -10264,7 +10270,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
         TyKind::Dyn(b, _) => {
             let b = tys.dyn_bounds(b);
             let Some(pr) = b.principal.map(|pr| pr.value.def) else { return false };
-            (pr == p.gx.lang.any && !b.auto.unpin && (b.auto.send || !b.auto.sync))
+            (pr == p.gx.lang.any && !b.auto.unpin && !b.auto.has_unwind() && (b.auto.send || !b.auto.sync))
                 || crate::check::object::principal_has_supertrait(p, pr, p.gx.lang.debug)
         }
         _ => {

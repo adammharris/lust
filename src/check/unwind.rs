@@ -26,6 +26,9 @@ use crate::ty::sync::SyncTy as S;
 pub(super) enum UnwindCheck {
     Catch(Ty, Span),
     PanicAny(Ty, Span),
+    /// The source of a coercion to `dyn Tr + UnwindSafe` (false) or
+    /// `+ RefUnwindSafe` (true).
+    Dyn(Ty, bool, Span),
 }
 
 impl<'p> Ctx<'p> {
@@ -83,6 +86,17 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The unwind-safety bits of a `dyn` coercion target: the source
+    /// must have each, by the table at body end.
+    pub(super) fn require_unwind_auto(&mut self, x: Ty, want: crate::ty::AutoTraits, span: Span) {
+        if want.unwind_safe {
+            self.unwind_checks.push(UnwindCheck::Dyn(x, false, span));
+        }
+        if want.ref_unwind_safe {
+            self.unwind_checks.push(UnwindCheck::Dyn(x, true, span));
+        }
+    }
+
     /// Body end: each `catch_unwind` closure must be `UnwindSafe` (rustc
     /// E0277), and each `panic_any` payload an `Any` type, whose vtable
     /// the call needs (lowering boxes it as `Box<dyn Any + Send>`).
@@ -117,6 +131,30 @@ impl<'p> Ctx<'p> {
                         }
                     }
                 }
+                UnwindCheck::Dyn(x, refs, span) => {
+                    let x = self.deep(x);
+                    if matches!(self.kind(x), TyKind::Error) {
+                        continue;
+                    }
+                    let env = self.solve_env();
+                    let name = if refs { "RefUnwindSafe" } else { "UnwindSafe" };
+                    match unwind_safe(self.p, &mut self.tys, &env, refs, x, &mut Vec::new()) {
+                        Some(true) => {}
+                        Some(false) => {
+                            let tn = self.tn(x);
+                            self.err(
+                                "L0612",
+                                span,
+                                format!("no impl of `std::panic::{name}` for `{tn}`: this `dyn` type needs it"),
+                                format!("Drop `{name}` from the `dyn` type, or wrap the value in `std::panic::AssertUnwindSafe(..)`."),
+                            )
+                        }
+                        None => {
+                            let tn = self.tn(x);
+                            self.err("L0820", span, format!("lust cannot decide whether `{tn}` is `{name}` yet"), format!("Drop `{name}` from the `dyn` type."))
+                        }
+                    }
+                }
                 UnwindCheck::PanicAny(m, span) => {
                     let m = self.deep(m);
                     if matches!(self.kind(m), TyKind::Error) || !self.any_type_ok(m, None, false, false, span) {
@@ -134,7 +172,7 @@ impl<'p> Ctx<'p> {
 pub fn dyn_any_send(tys: &mut impl TyIntern, any: DefId) -> Ty {
     let args = tys.intern_args(&[GenericArg::Ty(DYN_SELF)]);
     let tr = TraitRef { def: any, args, bindings: EMPTY_BINDINGS };
-    let auto = crate::ty::AutoTraits { send: true, sync: false, unpin: false };
+    let auto = crate::ty::AutoTraits { send: true, ..Default::default() };
     let b = tys.intern_dyn_bounds(crate::ty::DynBounds { principal: Some(Binder::plain(tr)), supertraits: Box::new([]), auto });
     tys.intern(TyKind::Dyn(b, Region::Static))
 }
@@ -189,7 +227,10 @@ pub fn unwind_safe(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], refs
         | TyKind::Never
         | TyKind::FnDef(..)
         | TyKind::FnPtr(_) => Some(true),
-        TyKind::Dyn(..) => Some(false),
+        TyKind::Dyn(..) => {
+            let a = crate::check::object::dyn_auto(p, &*tys, t);
+            Some(if refs { a.ref_unwind_safe } else { a.unwind_safe })
+        }
         TyKind::Ref(_, m, _) if m.is_mut() && !refs => Some(false),
         TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) => all(tys, vec![(true, e)], seen),
         TyKind::Slice(e) | TyKind::Array(e, _) => all(tys, vec![(refs, e)], seen),

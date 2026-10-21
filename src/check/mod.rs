@@ -7559,7 +7559,7 @@ impl<'p> Ctx<'p> {
                 TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).auto,
                 _ => AutoTraits::default(),
             };
-            if (want.send && !have.send) || (want.sync && !have.sync) || (want.unpin && !have.unpin) {
+            if !have.covers(want) {
                 self.mismatch(span, expected, found);
                 return None;
             }
@@ -7605,6 +7605,7 @@ impl<'p> Ctx<'p> {
                 self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
             }
         }
+        self.require_unwind_auto(x, want, span);
         let y = object::erase_dyn_region(&mut self.tys, y);
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
@@ -7726,7 +7727,7 @@ impl<'p> Ctx<'p> {
         let to_static = object::dyn_is_static(p, &self.tys, y);
         if let Some(from) = object::principal_of(&self.tys, x) {
             let have = object::dyn_auto(p, &self.tys, x);
-            let auto_ok = (!want.send || have.send) && (!want.sync || have.sync) && (!want.unpin || have.unpin);
+            let auto_ok = have.covers(want);
             let path_ok = if from.def == to.def {
                 self.unify_args(from.args, to.args) && self.unify_bindings(from.bindings, to.bindings)
             } else {
@@ -7817,6 +7818,7 @@ impl<'p> Ctx<'p> {
                 self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
             }
         }
+        self.require_unwind_auto(x, want, span);
         let y = object::erase_dyn_region(&mut self.tys, y);
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))

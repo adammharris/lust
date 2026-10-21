@@ -466,7 +466,7 @@ enum TyTree {
     FnPtr { count: u32, is_unsafe: bool, extern_c: bool, free_slots: u32, free_region: Region, own_out: u32, out_slots: u8, binders: u64, binder_slots: u8, inputs: Vec<u32>, output: u32 },
     FnDef(DefId, Vec<ArgTree>),
     Closure(DefId, Vec<ArgTree>),
-    Dyn { region: Region, principal: Option<(u32, TraitRefTree)>, supertraits: Vec<(u32, TraitRefTree)>, auto: (bool, bool, bool) },
+    Dyn { region: Region, principal: Option<(u32, TraitRefTree)>, supertraits: Vec<(u32, TraitRefTree)>, auto: AutoTraits },
     Opaque(DefId, Vec<ArgTree>),
     Param(ParamId),
     Projection(AssocId, Vec<ArgTree>),
@@ -702,7 +702,7 @@ impl TreeBuilder<'_> {
                 let b = self.tys.dyn_bounds(bounds);
                 let principal = b.principal.as_ref().map(|pr| (pr.count, self.trait_ref(&pr.value)));
                 let supertraits = b.supertraits.iter().map(|st| (st.count, self.trait_ref(&st.value))).collect();
-                TyTree::Dyn { region: r, principal, supertraits, auto: (b.auto.send, b.auto.sync, b.auto.unpin) }
+                TyTree::Dyn { region: r, principal, supertraits, auto: b.auto }
             }
             TyKind::Opaque(def, a) => TyTree::Opaque(def, self.args(a)),
             TyKind::Param(i) => TyTree::Param(i),
@@ -820,7 +820,7 @@ impl TreeIntern<'_> {
                 let bounds = tys.intern_dyn_bounds(DynBounds {
                     principal,
                     supertraits: supers.into_boxed_slice(),
-                    auto: AutoTraits { send: auto.0, sync: auto.1, unpin: auto.2 },
+                    auto: *auto,
                 });
                 tys.intern(TyKind::Dyn(bounds, *region))
             }
