@@ -1780,8 +1780,11 @@ impl<'a> Parser<'a> {
                 }
             }
             if path.len() > 1 {
-                // Tool attributes under a known tool namespace are ignored.
-                if name_text == "rustfmt" || name_text == "clippy" {
+                // Tool attributes under a known tool namespace are ignored,
+                // and so is the `diagnostic` namespace
+                // (`#[diagnostic::on_unimplemented(..)]`), whose attributes
+                // only shape rustc's error messages.
+                if name_text == "rustfmt" || name_text == "clippy" || name_text == "diagnostic" {
                     out.attrs.push(attr);
                     continue;
                 }
