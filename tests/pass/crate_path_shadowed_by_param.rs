@@ -1,8 +1,6 @@
-// expect: L0505
-// Valid Rust (prints 307 18): `self::N` and `crate::N` name the module
-// const, and `crate::T` the struct, under generic params of the same
-// name. lust reads a crate-root item by its plain name, which the param
-// takes, so it rejects the path instead of reading the param.
+// `self::N` and `crate::N` name the module const, and `crate::T` the
+// struct, under generic params of the same name: the paths read the
+// crate-root items through their `crate$` alias, never the params.
 const N: usize = 7;
 struct T;
 impl T {

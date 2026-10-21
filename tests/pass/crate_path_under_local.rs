@@ -1,5 +1,4 @@
-// expect: L0505
-// `crate::f` under a local `f`: lust rejects it for now.
+// `crate::f` under a local `f` names the crate-root fn.
 fn f() -> i32 { 1 }
 fn main() {
     let f = || 5;

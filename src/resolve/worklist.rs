@@ -5147,7 +5147,7 @@ fn register_items(
                 let def = DefId { krate: input.crate_ids.local, hash: def::free_fn_hash(input.crate_ids.stable, &[], interner.get(flat)) };
                 bind(tables, Namespace::Value, f.name, Target::Def(def), vis());
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Fn, flat, module, vis: vis() });
-                tables.flat[ns_index(Namespace::Value)].insert(flat, def);
+                insert_flat(tables, Namespace::Value, flat, def, interner);
                 f.name = flat;
             }
             ItemKind::Struct(s) => {
@@ -5185,7 +5185,7 @@ fn register_items(
                 bind(tables, Namespace::Type, e.name, Target::Def(def), vis());
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Adt, flat, module, vis: vis() });
                 tables.variants.insert(def, e.variants.iter().map(|v| v.name).collect());
-                tables.flat[ns_index(Namespace::Type)].insert(flat, def);
+                insert_flat(tables, Namespace::Type, flat, def, interner);
                 // Enum variant fields have no visibility of their own
                 // in Rust: they take the enum's visibility.
                 for v in &e.variants {
@@ -5210,7 +5210,7 @@ fn register_items(
                     };
                     bind(tables, Namespace::Value, name, Target::Def(def), vis());
                     tables.def_info.insert(def, DefInfo { kind: ResKind::Const, flat, module, vis: vis() });
-                    tables.flat[ns_index(Namespace::Value)].insert(flat, def);
+                    insert_flat(tables, Namespace::Value, flat, def, interner);
                     c.name = Some(flat);
                 }
             }
@@ -5225,7 +5225,7 @@ fn register_items(
                 };
                 bind(tables, Namespace::Value, s.name, Target::Def(def), vis());
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Static, flat, module, vis: vis() });
-                tables.flat[ns_index(Namespace::Value)].insert(flat, def);
+                insert_flat(tables, Namespace::Value, flat, def, interner);
                 s.name = flat;
             }
             ItemKind::Type(a) => {
@@ -5238,7 +5238,7 @@ fn register_items(
                 };
                 bind(tables, Namespace::Type, a.name, Target::Def(def), vis());
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Alias, flat, module, vis: vis() });
-                tables.flat[ns_index(Namespace::Type)].insert(flat, def);
+                insert_flat(tables, Namespace::Type, flat, def, interner);
                 a.name = flat;
             }
             ItemKind::Trait(t) => {
@@ -5257,7 +5257,7 @@ fn register_items(
                 };
                 bind(tables, Namespace::Type, t.name, Target::Def(def), vis());
                 tables.def_info.insert(def, DefInfo { kind: ResKind::Trait, flat, module, vis: vis() });
-                tables.flat[ns_index(Namespace::Type)].insert(flat, def);
+                insert_flat(tables, Namespace::Type, flat, def, interner);
                 t.name = flat;
             }
             ItemKind::Impl(imp) => {
@@ -5336,6 +5336,24 @@ fn extern_crate_not_found(name: &str, span: Span) -> Diag {
     )
 }
 
+/// Indexes one item's flat name. A crate-root item of the selected crate
+/// keeps its plain name as its flat name (`flat_name`), which a nearer
+/// binding of the same name can shadow at a use site (`crate::f` in a
+/// module with its own `f`): it is indexed under its `crate$` alias
+/// too, a name source text cannot write, which the rewrite writes at
+/// such a site (`Rewrite::flat_at`).
+fn insert_flat(tables: &mut ResolvedTables, ns: Namespace, flat: Sym, def: DefId, interner: &Interner) {
+    tables.flat[ns_index(ns)].insert(flat, def);
+    if !interner.get(flat).contains('$') {
+        tables.flat[ns_index(ns)].insert(root_alias(flat, interner), def);
+    }
+}
+
+/// The `crate$` alias of a crate-root item's plain flat name.
+fn root_alias(flat: Sym, interner: &Interner) -> Sym {
+    interner.intern(&format!("crate${}", interner.get(flat)))
+}
+
 /// Records one struct's def info and field visibility.
 fn record_adt(
     tables: &mut ResolvedTables,
@@ -5347,10 +5365,10 @@ fn record_adt(
     interner: &Interner,
 ) {
     tables.def_info.insert(def, DefInfo { kind: ResKind::Adt, flat, module, vis });
-    tables.flat[ns_index(Namespace::Type)].insert(flat, def);
+    insert_flat(tables, Namespace::Type, flat, def, interner);
     // Only a unit or tuple struct names a constructor value.
     if !matches!(fields, VariantFields::Struct(_)) {
-        tables.flat[ns_index(Namespace::Value)].insert(flat, def);
+        insert_flat(tables, Namespace::Value, flat, def, interner);
     }
     if let VariantFields::Struct(fs) = fields {
         let mut map = FxMap::default();
@@ -6305,13 +6323,26 @@ impl Rewrite<'_> {
         }
     }
 
-    /// The L0505 reject for a path `misread` flags (a false reject).
-    fn push_misread(&mut self, span: Span) {
+    /// The flat name to write for `def` at this site: its own, or,
+    /// where the checker would read that as a nearer binding
+    /// (`misread`), a crate-root item's `crate$` alias (`insert_flat`).
+    /// Any other misread is the L0505 reject (a false reject).
+    #[allow(clippy::too_many_arguments)]
+    fn flat_at(&mut self, flat: Sym, def: DefId, ns: Namespace, single: bool, module: ModuleId, scopes: &[Frame], span: Span) -> Sym {
+        if !self.misread(flat, def, ns, single, module, scopes) {
+            return flat;
+        }
+        let alias = root_alias(flat, self.interner);
+        let ns = if single { ns } else { Namespace::Type };
+        if self.tables.flat[ns_index(ns)].get(&alias) == Some(&def) {
+            return alias;
+        }
         self.diags.push(crate::diag::not_yet(
             "L0505",
             span,
             "a path to a crate-root item whose name a nearer item, import, or local also binds",
         ));
+        flat
     }
 
     /// Applies a resolution to a written path in place. `span` is the
@@ -6321,24 +6352,20 @@ impl Rewrite<'_> {
         match res {
             PathRes::Done(Target::Def(def)) => {
                 if let Some(info) = self.tables.def_info.get(&def) {
-                    if self.misread(info.flat, def, ns, true, module, scopes) {
-                        self.push_misread(span);
-                    }
+                    let flat = self.flat_at(info.flat, def, ns, true, module, scopes, span);
                     let args = segs.last().map(|s| s.args.clone()).unwrap_or_default();
-                    *segs = vec![PathSeg { name: info.flat, args }];
+                    *segs = vec![PathSeg { name: flat, args }];
                 }
             }
             PathRes::Done(Target::Variant(def, variant)) => {
                 if let Some(info) = self.tables.def_info.get(&def) {
-                    if self.misread(info.flat, def, ns, false, module, scopes) {
-                        self.push_misread(span);
-                    }
+                    let flat = self.flat_at(info.flat, def, ns, false, module, scopes, span);
                     // Written generic args stay on their segment
                     // (`E::<u8>::V`, `V::<u8>`): the checker reads them.
                     let n = segs.len();
                     let variant_args = segs.last().map(|s| s.args.clone()).unwrap_or_default();
                     let enum_args = if n >= 2 { segs[n - 2].args.clone() } else { Default::default() };
-                    *segs = vec![PathSeg { name: info.flat, args: enum_args }, PathSeg { name: variant, args: variant_args }];
+                    *segs = vec![PathSeg { name: flat, args: enum_args }, PathSeg { name: variant, args: variant_args }];
                 }
             }
             PathRes::Done(Target::Module(_)) => {
@@ -6356,9 +6383,7 @@ impl Rewrite<'_> {
             PathRes::Partial(Target::Def(def), rest) => {
                 if rest + 1 == segs.len() {
                     if let Some(info) = self.tables.def_info.get(&def) {
-                        if self.misread(info.flat, def, ns, false, module, scopes) {
-                            self.push_misread(span);
-                        }
+                        let flat = self.flat_at(info.flat, def, ns, false, module, scopes, span);
                         let item_seg = segs[rest].clone();
                         // Associated fn visibility (variants take the
                         // enum's vis, already checked by resolution).
@@ -6372,7 +6397,7 @@ impl Rewrite<'_> {
                         // arguments (`W::<u8>::item`): the checker
                         // reads them as the Self type's arguments.
                         let mut head = segs[rest.saturating_sub(1)].clone();
-                        head.name = info.flat;
+                        head.name = flat;
                         *segs = vec![head, item_seg];
                     }
                 }
