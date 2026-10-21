@@ -82,11 +82,35 @@ fn cfg_preds(attrs: &[Attr], src: &str, interner: &Interner) -> Vec<String> {
         .collect()
 }
 
+/// The env rustc sees for the test crate (`CARGO_MANIFEST_DIR`, `CARGO_PKG_*`),
+/// from the Cargo graph as the driver reads it, so an `env!` in a test file
+/// expands for test discovery too. Empty when the graph cannot load (the
+/// build then reports why).
+fn unit_cargo_env(key: &crate::protocol::SessionKey) -> Vec<(String, String)> {
+    use crate::resolve::cargo;
+    let Some(manifest) = &key.krate.manifest_path else { return Vec::new() };
+    let greq = cargo::GraphRequest {
+        manifest_path: manifest.clone(),
+        package: None,
+        features: key.features.clone(),
+        default_features: key.default_features,
+        all_features: key.all_features,
+        target_triple: key.target_triple.clone(),
+        cargo_net: key.cargo_net,
+        env: None,
+    };
+    let Ok(graph) = cargo::load_graph(&greq) else { return Vec::new() };
+    let interner = Interner::default();
+    let env = crate::resolve::cfg::CfgEnv::new(&key.target_triple, &key.features, true, key.profile);
+    cargo::select_unit(&graph, &greq, &key.krate.target_kind, &key.krate.target_name, &env, &interner, true).map(|u| u.cargo_env).unwrap_or_default()
+}
+
 /// Parses one crate file to find its tests: expanded when that works on
 /// the file alone (a module file's macros may live elsewhere), else as written.
-fn parse_file(path: &Path, src: &str, interner: &Interner, known: &Known) -> Result<Ast, Diag> {
+fn parse_file(path: &Path, src: &str, interner: &Interner, known: &Known, cargo_env: &[(String, String)]) -> Result<Ast, Diag> {
     let lexed = lexer::lex(src, FileId(0), 0, interner)?;
-    let ctx = crate::expand::ExpandCtx::for_file(interner, known, path, src, true);
+    let mut ctx = crate::expand::ExpandCtx::for_file(interner, known, path, src, true);
+    ctx.cargo_env = cargo_env.to_vec();
     match crate::expand::expand_lexed(lexed.clone(), &ctx) {
         Ok(l) => parser::parse(&l, interner, known).or_else(|_| parser::parse(&lexed, interner, known)),
         Err(_) => parser::parse(&lexed, interner, known),
@@ -97,6 +121,7 @@ fn parse_file(path: &Path, src: &str, interner: &Interner, known: &Known) -> Res
 struct Discovery<'a> {
     interner: &'a Interner,
     known: &'a Known,
+    cargo_env: Vec<(String, String)>,
     tests: Vec<CrateTest>,
     sites: Vec<ShimSite>,
     texts: Vec<(PathBuf, String)>,
@@ -118,7 +143,7 @@ impl Discovery<'_> {
                 return;
             }
         };
-        let ast = match parse_file(path, &src, self.interner, self.known) {
+        let ast = match parse_file(path, &src, self.interner, self.known, &self.cargo_env) {
             Ok(a) => a,
             Err(d) => {
                 self.bad.push((path.to_path_buf(), src, d));
@@ -354,7 +379,8 @@ pub(super) fn run(o: &Opts, crate_args: &[String]) -> i32 {
     };
     let interner = Interner::default();
     let known = Known::new(&interner);
-    let mut d = Discovery { interner: &interner, known: &known, tests: Vec::new(), sites: Vec::new(), texts: Vec::new(), bad: Vec::new() };
+    let cargo_env = unit_cargo_env(&req.session);
+    let mut d = Discovery { interner: &interner, known: &known, cargo_env, tests: Vec::new(), sites: Vec::new(), texts: Vec::new(), bad: Vec::new() };
     d.file(&root, true, &[], &[]);
     if !d.bad.is_empty() {
         let mut text = String::new();
