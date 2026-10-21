@@ -19236,9 +19236,20 @@ impl<'p> Ctx<'p> {
     /// `assert_eq!`/`assert_ne!` operand types `a` and `b`: one type with
     /// PartialEq and Debug, or a String against a `&str`.
     fn assert_eq_types(&mut self, e: ExprId, a: Ty, b: Ty, span: Span, s: Span) {
+        let ((ld, lb), (rd, rb)) = (self.autoderef(a), self.autoderef(b));
         if let Some((ld, rd)) = self.mixed_string_eq(a, b) {
             // String against &str: compared as strings, as Rust's PartialEq impls do.
             self.set_res(e, Res::Bin { ld, rd });
+        } else if self.seq_cmp(e, BinOp::Eq, a, b, ld, lb, rd, rb, span).is_some() {
+            // Across sequence forms (`Vec<u8>` against `&[u8; N]`): core's
+            // asymmetric PartialEq impls, compared as slices (check/slice.rs).
+            for t in [a, b] {
+                let t = self.deep(t);
+                if !has_debug(self.p, &self.tys, t) {
+                    let tn = self.tn(t);
+                    self.err("L0112", span, format!("assert_eq! needs Debug, but `{tn}` lacks it"), "Derive Debug on the element type.");
+                }
+            }
         } else if self.unify(a, b) {
             let a = self.deep(a);
             if !has_eq(self.p, &self.tys, a) || !has_debug(self.p, &self.tys, a) {

@@ -7627,6 +7627,28 @@ impl<'p> Lower<'p> {
                 let (b, tb) = self.borrow_of(args[1], 0);
                 let c = self.temp(BOOL);
                 let cmp = match self.ck.res(e) {
+                    Res::Bin { ld, rd } if self.ck.is_seq_cmp(e) => {
+                        // Across sequence forms (check/slice.rs): both
+                        // borrowed sides as fat slices, compared as `[T]`.
+                        let base = self.peel(t, ld);
+                        let elem = match self.kind(base) {
+                            TyKind::Slice(el) | TyKind::Array(el, _) => el,
+                            _ => self.body.tys.vec_elem(base).unwrap_or(ERROR),
+                        };
+                        let sty = self.body.tys.intern(TyKind::Slice(elem));
+                        let rt = self.ref_ty(false, sty);
+                        let mut fat = |o: &Operand, d: u8| -> Operand {
+                            let pl = match o {
+                                Operand::Copy(p) | Operand::Move(p) => Self::derefs(p.clone().deref(), d),
+                                _ => unreachable!("borrow_of gives a place operand"),
+                            };
+                            let tmp = self.temp(rt);
+                            self.assign(Place::local(tmp), Rvalue::SliceOf(pl), span);
+                            Operand::Move(Place::local(tmp))
+                        };
+                        let (x, y) = (fat(&a, ld), fat(&b, rd));
+                        Rvalue::Eq { a: x, b: y, ty: sty, ne }
+                    }
                     Res::Bin { ld, rd } => {
                         // The operands are already borrowed (`a`, `b`): view
                         // them in place, so each is evaluated once.
