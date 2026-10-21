@@ -912,9 +912,12 @@ impl FnGen<'_, '_> {
             let ct = ctype(&self.local_cty[i]);
             match (&kdecls[i], self.byte_blobs.get(i).cloned().flatten()) {
                 (Some(d), _) => self.out.push_str(d),
+                // An empty one has no initializer: `{0}` is too many for `v[0]`.
+                (None, Some(b)) if b.is_empty() => {
+                    let _ = writeln!(self.out, "static {ct} l{i};");
+                }
                 (None, Some(b)) => {
-                    let init = if b.is_empty() { "{0}".to_string() } else { format!("{{ .v = {} }}", c_bytes_lit(b.as_slice())) };
-                    let _ = writeln!(self.out, "static {ct} l{i} = {init};");
+                    let _ = writeln!(self.out, "static {ct} l{i} = {{ .v = {} }};", c_bytes_lit(b.as_slice()));
                 }
                 (None, None) => {
                     let _ = writeln!(self.out, "static {ct} l{i};");
