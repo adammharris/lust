@@ -526,6 +526,34 @@ impl Program {
     pub fn fn_info(&self, id: LocalDefId) -> &FnInfo {
         &self.fns[id.0 as usize]
     }
+    /// True for the hidden fn that holds a copy of a const or static
+    /// value with closures (expand/lazy.rs `hoist_value_closures`): it
+    /// lowers as the initializer would.
+    pub fn is_value_init_fn(&self, id: LocalDefId) -> bool {
+        self.fns.get(id.0 as usize).is_some_and(|f| self.name(f.name).contains(crate::expand::lazy::VALUE_INIT_PREFIX))
+    }
+    /// The hidden value fn holding the copy of the closure at `span` of
+    /// a const or static value, and the copy's ordinal among that fn's
+    /// closures (check/closure.rs `closure_def`).
+    pub fn value_closure_site(&self, span: Span) -> Option<(LocalDefId, u32)> {
+        (0..self.fns.len() as u32).map(LocalDefId).filter(|&f| matches!(self.fns[f.0 as usize].loc, FnLoc::Item(_) | FnLoc::Nested(_)) && self.is_value_init_fn(f)).find_map(|f| {
+            let (lo, hi) = self.fn_def(f).exprs;
+            let mut order: Vec<ast::ExprId> = (lo..hi).map(ast::ExprId).filter(|&x| matches!(self.ast.expr(x), ast::Expr::Closure { .. })).collect();
+            order.sort_by_key(|&x| (self.ast.expr_span(x).lo, x.0));
+            let at = order.iter().position(|&x| {
+                let s = self.ast.expr_span(x);
+                (s.file, s.lo, s.hi) == (span.file, span.lo, span.hi)
+            })?;
+            Some((f, at as u32))
+        })
+    }
+    /// The body fn of closure `ordinal` of hidden value fn `holder`
+    /// (`ConstValue::ClosureFn`), once that fn's closures are registered.
+    pub fn value_closure_fn(&self, holder: u32, ordinal: u32) -> Option<LocalDefId> {
+        let parent = *self.fn_defs.get(holder as usize)?;
+        let def = crate::def::DefId { krate: parent.krate, hash: crate::def::child_hash(parent.hash, crate::def::DefKind::Closure, "{closure}", ordinal) };
+        self.gx.closures.get(&def).map(|c| c.body_fn)
+    }
     /// The Ast def of fn `id` (an instance's or closure's is its source fn's).
     pub fn fn_def(&self, id: LocalDefId) -> &ast::FnDef {
         self.fns[id.0 as usize].loc.def(&self.ast)
@@ -8373,6 +8401,10 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             PendingState::Done(v) => Some(v),
             _ => None,
         }
+    }
+    fn closure_value(&mut self, closure: ast::ExprId, expected: Ty) -> Option<crate::ty::consteval::TypedValue> {
+        let (holder, ordinal) = self.p.value_closure_site(self.p.ast.expr_span(closure))?;
+        Some((crate::ty::consteval::ConstValue::ClosureFn(holder.0, ordinal), expected))
     }
     fn fn_item(&mut self, segs: &[ast::PathSeg], at: Span) -> Option<crate::ty::consteval::TypedValue> {
         // A plain safe Rust-ABI free fn with no generics. With params,

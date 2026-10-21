@@ -2182,6 +2182,10 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
             11u8.hash(h);
             p.fn_defs.get(*f as usize).map(|d| d.hash.0).hash(h);
         }
+        ConstValue::ClosureFn(f, o) => {
+            (15u8, o).hash(h);
+            p.fn_defs.get(*f as usize).map(|d| d.hash.0).hash(h);
+        }
         ConstValue::Bytes(b) => {
             12u8.hash(h);
             b.as_slice().hash(h);

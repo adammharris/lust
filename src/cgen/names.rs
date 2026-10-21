@@ -402,7 +402,7 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
         by_value_deps(&t, &mut held);
         collect_types(&t, &mut pointed);
         collect_promoted(p, &st.value, &t, &mut types);
-        const_fns(&st.value, &mut fns);
+        const_fns(p, &st.value, &mut fns);
         // A thread_local's native cell is defined here, by value.
         if let Some(cell) = super::native_tls_cell(p, i) {
             by_value_deps(&cell, &mut held);
@@ -448,7 +448,7 @@ fn statics_types(p: &Program, statics: impl Iterator<Item = usize>) -> (HashSet<
         by_value_deps(&t, &mut by_value);
         collect_types(&t, &mut pointed);
         collect_promoted(p, &st.value, &t, &mut held);
-        const_fns(&st.value, &mut fns);
+        const_fns(p, &st.value, &mut fns);
         // A thread_local's native cell is defined in its part, by value.
         if let Some(cell) = super::native_tls_cell(p, i) {
             by_value_deps(&cell, &mut by_value);
@@ -532,11 +532,20 @@ pub(crate) fn statics_content_fp(p: &Program, slots: &[u32]) -> (u64, u64) {
                 out.extend_from_slice(format!("{path:?}").as_bytes());
                 out.push(0);
             }
-            CV::FnPtr(f) => {
+            // A const closure is emitted as a pointer to its body fn (cgen.rs), so it
+            // hashes as that fn's pointer does.
+            CV::FnPtr(_) | CV::ClosureFn(..) => {
                 out.push(15);
-                if let Some(&slot) = slots.get(*f as usize) {
-                    out.extend_from_slice(fn_sig(p, LocalDefId(*f), slot).as_bytes());
-                    out.extend_from_slice(trampoline(p, LocalDefId(*f), slot).as_bytes());
+                let f = match v {
+                    CV::ClosureFn(h, o) => p.value_closure_fn(*h, *o),
+                    CV::FnPtr(f) => Some(LocalDefId(*f)),
+                    _ => unreachable!(),
+                };
+                if let Some(f) = f
+                    && let Some(&slot) = slots.get(f.0 as usize)
+                {
+                    out.extend_from_slice(fn_sig(p, f, slot).as_bytes());
+                    out.extend_from_slice(trampoline(p, f, slot).as_bytes());
                 }
                 out.push(0);
             }
@@ -775,12 +784,13 @@ fn names_found<'a>(text: &str, wanted: &crate::intern::FxSet<&'a str>) -> HashSe
 }
 
 /// The fns whose pointers the constant `v` holds.
-fn const_fns(v: &crate::ty::consteval::ConstValue, out: &mut Vec<u32>) {
+fn const_fns(p: &Program, v: &crate::ty::consteval::ConstValue, out: &mut Vec<u32>) {
     use crate::ty::consteval::ConstValue as CV;
     match v {
         CV::FnPtr(f) => out.push(*f),
-        CV::Aggregate(vs) | CV::Variant(_, vs) => vs.iter().for_each(|x| const_fns(x, out)),
-        CV::Repeat(x, _) | CV::Ref(x) => const_fns(x, out),
+        CV::ClosureFn(h, o) => out.extend(p.value_closure_fn(*h, *o).map(|f| f.0)),
+        CV::Aggregate(vs) | CV::Variant(_, vs) => vs.iter().for_each(|x| const_fns(p, x, out)),
+        CV::Repeat(x, _) | CV::Ref(x) => const_fns(p, x, out),
         _ => {}
     }
 }

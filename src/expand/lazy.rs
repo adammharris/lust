@@ -32,6 +32,11 @@ use crate::lexer::{Lexed, Tok, Token};
 /// no `static`, or with no `||` and no `LazyLock` / `LazyCell`, comes
 /// back unchanged.
 pub fn hoist_static_closures(lexed: Lexed, interner: &Interner) -> Lexed {
+    let lexed = hoist_lazy_closures(lexed, interner);
+    hoist_value_closures(lexed, interner)
+}
+
+fn hoist_lazy_closures(lexed: Lexed, interner: &Interner) -> Lexed {
     let toks = &lexed.tokens;
     let lazy_name = |t: &Token| matches!(t.tok, Tok::Ident(s) if matches!(interner.get(s), "LazyLock" | "LazyCell"));
     if !toks.iter().any(|t| t.tok == Tok::Static) || !toks.iter().any(|t| t.tok == Tok::OrOr || lazy_name(t)) {
@@ -389,4 +394,174 @@ fn cfg_attrs(toks: &[Token], at: usize, interner: &Interner) -> Vec<Token> {
         }
     }
     out
+}
+
+// Closures in const and static values (census-10): `const CASES: [Case; 2]
+// = [Case { start: |b| .. }, ..];`, each closure coerced to a fn pointer
+// field. The const evaluator runs no closure, and the closure has no body
+// fn of its own until a checked fn holds it, so the initializer's tokens
+// are copied into a hidden fn after the item:
+//
+//     const CASES: [Case; 2] = [Case { start: |b| .. }, ..];
+//     fn __lust_cinit$CASES$LO() -> [Case; 2] { [Case { start: |b| .. }, ..] }
+//
+// The hidden fn checks as any fn does, so each closure gets its type from
+// its position and a body fn (check/generics.rs `register_closures`). The
+// copied tokens keep their spans, so a closure of the item's value and its
+// copy in the fn have one span, and the evaluator names the copy's body fn
+// for the value's closure (`ConstValue::ClosureFn`). `LO` is the item
+// name's offset: two consts of one name in two blocks get two fns. The fn
+// stands in for the initializer's own check (check/const_body.rs skips the
+// item), and lowers as an initializer does (`Program::is_value_init_fn`).
+// Elided references in the type get `'static`, the lifetime a const's type
+// elides to, except inside fn pointer types and `Fn` sugar, whose elided
+// lifetimes are their own.
+//
+// An item in an `impl` or `trait` body (an associated const) is left
+// alone: a hidden fn there would be an associated fn.
+
+/// The name prefix of the hidden fns that hold a const or static value
+/// with closures.
+pub const VALUE_INIT_PREFIX: &str = "__lust_cinit$";
+
+/// Copies every const or static initializer that holds a closure into a
+/// hidden fn after its item. A file with no `const` or `static`, or with
+/// no `|`, comes back unchanged.
+fn hoist_value_closures(lexed: Lexed, interner: &Interner) -> Lexed {
+    let toks = &lexed.tokens;
+    if !toks.iter().any(|t| matches!(t.tok, Tok::Const | Tok::Static)) || !toks.iter().any(|t| matches!(t.tok, Tok::Pipe | Tok::OrOr)) {
+        return lexed;
+    }
+    // Hidden fns by the index of their item's `;`.
+    let mut adds: Vec<(usize, Vec<Token>)> = Vec::new();
+    // Per open `{`: true when it opens an `impl` or `trait` body.
+    let mut stack: Vec<bool> = Vec::new();
+    let mut header_assoc = false;
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i].tok {
+            Tok::Impl | Tok::Trait if item_start(toks, i) => header_assoc = true,
+            Tok::LBrace => {
+                stack.push(header_assoc);
+                header_assoc = false;
+            }
+            Tok::RBrace => {
+                stack.pop();
+                header_assoc = false;
+            }
+            Tok::Semi => header_assoc = false,
+            Tok::Const | Tok::Static if stack.last() != Some(&true) && item_start(toks, i) => {
+                if let Some((semi, f)) = value_init_fn(toks, i, interner) {
+                    adds.push((semi, f));
+                    i = semi + 1;
+                    header_assoc = false;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if adds.is_empty() {
+        return lexed;
+    }
+    let mut out: Vec<Token> = Vec::with_capacity(toks.len() + adds.iter().map(|(_, f)| f.len()).sum::<usize>());
+    let mut next = 0;
+    for (semi, f) in adds {
+        out.extend_from_slice(&toks[next..semi + 1]);
+        out.extend(f);
+        next = semi + 1;
+    }
+    out.extend_from_slice(&toks[next..]);
+    Lexed { tokens: out, strings: lexed.strings }
+}
+
+/// True when the keyword at `at` can start an item: it follows an item
+/// boundary, an attribute, or a visibility.
+fn item_start(toks: &[Token], at: usize) -> bool {
+    at == 0 || matches!(toks[at - 1].tok, Tok::Semi | Tok::LBrace | Tok::RBrace | Tok::RBracket | Tok::Pub | Tok::RParen | Tok::Unsafe)
+}
+
+/// The hidden fn for the `const` or `static` at `at` when its item is
+/// `const NAME: TY = INIT;` (or a non-`mut` static) and `INIT` holds a
+/// closure: the index of the item's `;` and the fn's tokens.
+fn value_init_fn(toks: &[Token], at: usize, interner: &Interner) -> Option<(usize, Vec<Token>)> {
+    let Tok::Ident(name) = toks.get(at + 1)?.tok else { return None };
+    if toks.get(at + 2)?.tok != Tok::Colon {
+        return None;
+    }
+    let ty_start = at + 3;
+    let eq = scan_to(toks, ty_start, true, |t| t == Tok::Eq)?;
+    let semi = scan_to(toks, eq + 1, false, |t| t == Tok::Semi)?;
+    let init = &toks[eq + 1..semi];
+    // A closure starts an operand: `|`/`||` after `=`, an opening
+    // bracket, a `,`, a `:` (a field), `=>`, `;`, `return` or `move`.
+    let opens_operand = |k: usize| {
+        let prev = if k == 0 { Tok::Eq } else { init[k - 1].tok };
+        matches!(prev, Tok::Eq | Tok::LParen | Tok::LBracket | Tok::LBrace | Tok::Comma | Tok::Colon | Tok::FatArrow | Tok::Semi | Tok::Return | Tok::Move)
+    };
+    if !init.iter().enumerate().any(|(k, t)| matches!(t.tok, Tok::Pipe | Tok::OrOr) && opens_operand(k)) {
+        return None;
+    }
+    let span = toks[at + 1].span;
+    let hidden = interner.intern(&format!("{VALUE_INIT_PREFIX}{}${}", interner.get(name), span.lo));
+    let mut f = cfg_attrs(toks, at, interner);
+    f.extend([
+        Token { tok: Tok::Fn, span },
+        Token { tok: Tok::Ident(hidden), span },
+        Token { tok: Tok::LParen, span },
+        Token { tok: Tok::RParen, span },
+        Token { tok: Tok::Arrow, span },
+    ]);
+    f.extend(value_lifetimes(&toks[ty_start..eq], span, interner));
+    f.push(Token { tok: Tok::LBrace, span });
+    f.extend_from_slice(init);
+    f.push(Token { tok: Tok::RBrace, span });
+    Some((semi, f))
+}
+
+/// `static_lifetimes` of a const's type, with the fn pointer types and
+/// `Fn`/`FnMut`/`FnOnce` sugar in it copied as written: their elided
+/// lifetimes are bound there, not `'static`.
+fn value_lifetimes(ty: &[Token], span: Span, interner: &Interner) -> Vec<Token> {
+    let mut out = Vec::with_capacity(ty.len() + 4);
+    let mut plain: Vec<Token> = Vec::new();
+    let mut i = 0;
+    while i < ty.len() {
+        let sugar = matches!(ty[i].tok, Tok::Ident(s) if matches!(interner.get(s), "Fn" | "FnMut" | "FnOnce"));
+        if (ty[i].tok == Tok::Fn || sugar) && ty.get(i + 1).is_some_and(|t| t.tok == Tok::LParen) {
+            let Some(close) = matching_close(ty, i + 1) else { break };
+            let mut end = close + 1;
+            if ty.get(end).is_some_and(|t| t.tok == Tok::Arrow) {
+                end = ret_ty_end(ty, end + 1);
+            }
+            out.extend(static_lifetimes(std::mem::take(&mut plain), span, interner));
+            out.extend_from_slice(&ty[i..end]);
+            i = end;
+            continue;
+        }
+        plain.push(ty[i].clone());
+        i += 1;
+    }
+    out.extend(static_lifetimes(plain, span, interner));
+    out
+}
+
+/// The end of the return type that starts at `from` in a type's tokens:
+/// the first `,`, `;` or `=` outside its own brackets, or the bracket
+/// (or `>`) that closes the group around it.
+fn ret_ty_end(ty: &[Token], from: usize) -> usize {
+    let mut depth = 0i32;
+    for (i, t) in ty.iter().enumerate().skip(from) {
+        match t.tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace | Tok::Lt => depth += 1,
+            Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Gt if depth == 0 => return i,
+            Tok::Shr if depth <= 1 => return i,
+            Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Gt => depth -= 1,
+            Tok::Shr => depth -= 2,
+            Tok::Comma | Tok::Semi | Tok::Eq if depth == 0 => return i,
+            _ => {}
+        }
+    }
+    ty.len()
 }

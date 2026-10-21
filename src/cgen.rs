@@ -10857,11 +10857,15 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 None => panic!("internal: a static place {path:?} outside its static's value"),
             },
         },
-        (CV::FnPtr(f), CTy::FnPtr(..)) => {
+        (CV::FnPtr(_) | CV::ClosureFn(..), CTy::FnPtr(..)) => {
             // Runtime fn pointer values are `lust_tramps[slot]`, not a
             // constant; this unit gets its own copy of the slot's
             // trampoline (forwarding through `lust_fns`), whose address is.
-            let f = LocalDefId(*f);
+            let f = match v {
+                CV::ClosureFn(h, o) => p.value_closure_fn(*h, *o).expect("internal: a const closure with no body fn"),
+                CV::FnPtr(f) => LocalDefId(*f),
+                _ => unreachable!(),
+            };
             let slot = *slots.get(f.0 as usize).expect("internal: a fn pointer in static data has no fn slot");
             let name = format!("stramp{}", names::fn_tag(slot));
             // Once per prelude (`cx` and `pre` live and die together): a scan of `pre`

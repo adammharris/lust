@@ -222,10 +222,11 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         Some(b) => (p.ast.block(b).span, Some(b)),
         None => (Span::default(), None),
     };
-    // A const or static initializer (check/const_body.rs): the
+    // A const or static initializer (check/const_body.rs), or the hidden
+    // fn holding a copy of one (`Program::is_value_init_fn`): the
     // temporaries its value extends live in static storage, as rustc
     // gives a const initializer's extended temporaries `'static`.
-    if f.loc.is_const_init()
+    if (f.loc.is_const_init() || p.is_value_init_fn(fid))
         && let Some(t) = body.and_then(|b| p.ast.block(b).tail)
     {
         lw.mark_extending(t, STATIC_SCOPE);
@@ -427,7 +428,7 @@ impl<'p> Lower<'p> {
     fn const_context(&self) -> bool {
         match self.as_code {
             Some(e) => !matches!(self.p.ast.expr(e), Expr::ConstBlock(_)),
-            None => self.p.fn_info(self.body.fn_id).loc.is_const_init(),
+            None => self.p.fn_info(self.body.fn_id).loc.is_const_init() || self.p.is_value_init_fn(self.body.fn_id),
         }
     }
     /// True when `&e` is promoted to `'static` (rustc's promotion rules,
@@ -7851,6 +7852,10 @@ impl<'p> Lower<'p> {
             CV::StaticPlace(idx, path) => self.static_place_into(*idx, path, ty, dest, span),
             // A fn pointer in a const value (W-STD-C): the slot trampoline.
             CV::FnPtr(f) => self.assign(dest.clone(), Rvalue::FnValue(LocalDefId(*f), ty), span),
+            CV::ClosureFn(h, o) => {
+                let f = self.p.value_closure_fn(*h, *o).expect("internal: a const closure with no body fn");
+                self.assign(dest.clone(), Rvalue::FnValue(f, ty), span)
+            }
             _ => {
                 let op = self.const_operand(v, ty, span);
                 self.assign(dest.clone(), Rvalue::Use(op), span);

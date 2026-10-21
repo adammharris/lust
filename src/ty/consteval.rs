@@ -72,6 +72,12 @@ pub enum ConstValue {
     /// (W-STD-C: `static LazyLock` init fns). It can be stored and moved,
     /// never called or compared here, as in rustc.
     FnPtr(u32),
+    /// A closure in a const or static value coerced to a fn pointer
+    /// (census-10): the hidden fn that holds the value's copy (its
+    /// `LocalDefId` index, expand/lazy.rs `hoist_value_closures`) and
+    /// the closure's ordinal there. Its body fn exists once that fn is
+    /// checked (`Program::value_closure_fn`); used as `FnPtr` is.
+    ClosureFn(u32, u32),
 }
 
 /// One step of a `ConstValue::StaticPlace` path.
@@ -309,6 +315,12 @@ pub trait ConstCx<'a> {
     /// A safe, non-generic free fn named by a path, as a fn pointer
     /// value with its `fn(..) -> R` type.
     fn fn_item(&mut self, _segs: &[ast::PathSeg], _at: Span) -> Option<TypedValue> {
+        None
+    }
+    /// A closure in a const or static value, as a fn pointer value of
+    /// the `fn(..) -> R` type `expected`: one that captures nothing and
+    /// has a hidden fn copy (`ConstValue::ClosureFn`).
+    fn closure_value(&mut self, _closure: ExprId, _expected: Ty) -> Option<TypedValue> {
         None
     }
     /// The struct or variant a struct literal names.
@@ -2304,6 +2316,10 @@ impl Evaluator {
                 Flow::Break(v, l) if l == Some(label.name) => v.unwrap_or((ConstValue::Unit, UNIT)),
                 Flow::Val(v) => v,
                 other => return Ok(other),
+            },
+            Expr::Closure { .. } if expected.is_some_and(|t| matches!(cx.tys_ref().kind(t), TyKind::FnPtr(_))) => match cx.closure_value(e, expected.unwrap()) {
+                Some(v) => v,
+                None => return Err(outside(span, "this expression")),
             },
             _ => return Err(outside(span, "this expression")),
         };

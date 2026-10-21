@@ -272,7 +272,19 @@ fn item_span(item: &ast::Item) -> Option<Span> {
 /// only when `keep` takes it: after a delta it takes a few of thousands.
 fn sites(p: &Program, keep: &dyn Fn(FnLoc) -> bool) -> Vec<Site> {
     let ast = &*p.ast;
+    // A value with closures has a hidden fn copy that checks as a fn
+    // (`Program::is_value_init_fn`), named at the item's name span: its
+    // item is no site, or each error would be reported twice.
+    let copied: std::collections::HashSet<(crate::diag::FileId, u32)> = (0..p.fns.len() as u32)
+        .map(LocalDefId)
+        .filter(|&f| matches!(p.fns[f.0 as usize].loc, FnLoc::Item(_) | FnLoc::Nested(_)) && p.is_value_init_fn(f))
+        .map(|f| {
+            let s = p.fn_def(f).name_span;
+            (s.file, s.lo)
+        })
+        .collect();
     let take = |loc: FnLoc, span: Span| p.shipped_crate_at(span).is_none() && !p.in_lang_methods(span) && keep(loc);
+    let uncopied = |name_span: Span| !copied.contains(&(name_span.file, name_span.lo));
     let plain = |loc, ty, span| Site {
         loc,
         ty: SiteTy::Written(ty),
@@ -287,10 +299,10 @@ fn sites(p: &Program, keep: &dyn Fn(FnLoc) -> bool) -> Vec<Site> {
     for (i, item) in ast.items.iter().enumerate() {
         let i = i as u32;
         match &item.kind {
-            ItemKind::Const(c) if c.init_fn.is_some() && take(FnLoc::ConstItem(i), c.span) => {
+            ItemKind::Const(c) if c.init_fn.is_some() && uncopied(c.name_span) && take(FnLoc::ConstItem(i), c.span) => {
                 out.push(plain(FnLoc::ConstItem(i), c.ty, c.span))
             }
-            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) && take(FnLoc::ConstItem(i), s.span) => {
+            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) && uncopied(s.name_span) && take(FnLoc::ConstItem(i), s.span) => {
                 out.push(plain(FnLoc::ConstItem(i), s.ty, s.span))
             }
             ItemKind::Impl(imp) if !imp.consts.is_empty() => {
@@ -350,8 +362,8 @@ fn sites(p: &Program, keep: &dyn Fn(FnLoc) -> bool) -> Vec<Site> {
     for (i, item) in ast.stmt_items.iter().enumerate() {
         let loc = FnLoc::NestedConst(i as u32);
         let mut site = match &item.kind {
-            ItemKind::Const(c) if c.init_fn.is_some() && take(loc, c.span) => plain(loc, c.ty, c.span),
-            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) && take(loc, s.span) => plain(loc, s.ty, s.span),
+            ItemKind::Const(c) if c.init_fn.is_some() && uncopied(c.name_span) && take(loc, c.span) => plain(loc, c.ty, c.span),
+            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) && uncopied(s.name_span) && take(loc, s.span) => plain(loc, s.ty, s.span),
             _ => continue,
         };
         apply_stmt_overlay(p, &mut site.parent.scope, item.span);
