@@ -162,7 +162,7 @@ It is never chosen by a source spelling.
 
 | Class | Meaning | Ts-rust examples |
 |---|---|---|
-| Lust source | Lust compiles the crate from Rust source like user code. | `goport_util`, `goport_lsproto` |
+| Lust source | Lust compiles the crate from Rust source like user code: a path package, or a registry package (by name, or name and version) that the project's `source-deps` config lists (docs/dev-features.md). | `goport_util`, `goport_lsproto` |
 | Adapter | Lust compiles a lust-owned crate with the same public API in place of the dependency. Section 3.6. | `indexmap`, `smallvec`, `rustc-hash` aliases over std maps |
 | Shim | A rustc-built static or shared library exports C functions. Lust links it. Section 3.7. | `rustix`, `nix`, `flate2`, `jiff` |
 

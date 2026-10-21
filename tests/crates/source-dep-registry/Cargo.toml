@@ -1,0 +1,16 @@
+# A registry dependency with no adapter compiles from its downloaded
+# source when the project's `source-deps` config names it
+# (docs/dev-features.md). The vendored directory source stands in for the
+# registry so the fixture runs offline.
+[package]
+name = "source-dep-registry"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+greet = "0.1.0"
+
+[package.metadata.lust]
+source-deps = ["greet"]
+
+[workspace]

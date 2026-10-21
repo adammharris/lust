@@ -85,6 +85,10 @@ pub struct SessionKey {
     pub target_triple: String,
     pub profile: ProfileFlags,
     pub cargo_net: CargoNet,
+    /// Registry packages the project config lets lust compile from their
+    /// downloaded source (`source-deps`, docs/dev-features.md): `name` or
+    /// `name@version`, sorted.
+    pub source_deps: Vec<String>,
 }
 
 /// How the Cargo runs lust starts may use the network: `--offline` and
@@ -129,6 +133,7 @@ impl SessionKey {
             target_triple: String::new(),
             profile: ProfileFlags::DEV_UNWIND,
             cargo_net: CargoNet::default(),
+            source_deps: Vec::new(),
         }
     }
 
@@ -138,7 +143,7 @@ impl SessionKey {
         let b = |x: bool| if x { "1" } else { "0" };
         let manifest = self.krate.manifest_path.as_ref().map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
         format!(
-            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} offline={} locked={}",
+            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} offline={} locked={} source_deps=[{}]",
             self.krate.package_id,
             manifest,
             self.krate.target_kind,
@@ -154,6 +159,7 @@ impl SessionKey {
             b(self.profile.debug_assertions),
             b(self.cargo_net.offline),
             b(self.cargo_net.locked),
+            self.source_deps.join(","),
         )
     }
 }
@@ -398,6 +404,12 @@ struct LustConfig {
     dev_exclude_features: Option<Vec<String>>,
 }
 
+/// The `source-deps` list in one TOML text, in the sections
+/// `lust_config_in` reads, first found.
+fn source_deps_in(text: &str) -> Option<Vec<String>> {
+    ["package.metadata.lust", "workspace.metadata.lust", ""].into_iter().find_map(|section| toml_array_in(text, section, "source-deps"))
+}
+
 impl LustConfig {
     fn any(&self) -> bool {
         self.dev_features.is_some() || self.dev_exclude_features.is_some()
@@ -478,37 +490,44 @@ fn lust_config_in(text: &str) -> LustConfig {
 /// config and the manifest text that owns the `[features]` table, when
 /// one was read.
 fn find_lust_config(file: &Path, key: &SessionKey) -> (LustConfig, Option<String>) {
+    let (cfg, own_text) = find_config(file, key, &|text| Some(lust_config_in(text)).filter(LustConfig::any));
+    (cfg.unwrap_or_default(), own_text)
+}
+
+/// The first config `read` finds for one crate, in `find_lust_config`'s
+/// order, and the crate manifest's text when one was read. Each key
+/// family looks up on its own: a manifest's `dev-features` does not hide
+/// a `.lust.toml` above it that only lists `source-deps`.
+fn find_config<T>(file: &Path, key: &SessionKey, read: &dyn Fn(&str) -> Option<T>) -> (Option<T>, Option<String>) {
     let manifest = key.krate.manifest_path.clone().or_else(|| find_manifest(file).map(|m| m.path));
     let mut own_text = None;
     if let Some(mp) = &manifest {
         if let Ok(text) = std::fs::read_to_string(mp) {
-            own_text = Some(text.clone());
-            let cfg = lust_config_in(&text);
-            if cfg.any() {
+            let cfg = read(&text);
+            own_text = Some(text);
+            if cfg.is_some() {
                 return (cfg, own_text);
             }
         }
         for anc in ancestor_manifests(mp) {
-            if let Ok(text) = std::fs::read_to_string(&anc) {
-                let cfg = lust_config_in(&text);
-                if cfg.any() {
-                    return (cfg, own_text);
-                }
+            if let Ok(text) = std::fs::read_to_string(&anc)
+                && let Some(cfg) = read(&text)
+            {
+                return (Some(cfg), own_text);
             }
         }
     }
     let start = manifest.as_deref().and_then(|p| p.parent()).or_else(|| file.parent());
     let mut dir = start;
     while let Some(d) = dir {
-        if let Ok(text) = std::fs::read_to_string(d.join(".lust.toml")) {
-            let cfg = lust_config_in(&text);
-            if cfg.any() {
-                return (cfg, own_text);
-            }
+        if let Ok(text) = std::fs::read_to_string(d.join(".lust.toml"))
+            && let Some(cfg) = read(&text)
+        {
+            return (Some(cfg), own_text);
         }
         dir = d.parent();
     }
-    (LustConfig::default(), own_text)
+    (None, own_text)
 }
 
 /// Cargo.toml files above `manifest` (not including it), nearest first.
@@ -594,6 +613,11 @@ fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey 
         key.krate.target_kind = "bin".into();
         key.krate.target_name = flags.bin.or_else(|| manifest.as_ref().and_then(|m| selected_bin(m, file))).unwrap_or(package);
     }
+    // Which registry packages compile from source does not depend on the
+    // feature flags: the config always applies.
+    let mut source_deps = find_config(file, &key, &source_deps_in).0.unwrap_or_default();
+    sort_features(&mut source_deps);
+    key.source_deps = source_deps;
     if !had_feature_selection {
         apply_dev_config(&mut key, file);
     }
@@ -887,7 +911,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
     let s = &r.session;
     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -901,6 +925,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
         s.features.len(),
         b(s.cargo_net.offline),
         b(s.cargo_net.locked),
+        s.source_deps.len(),
         build_id()
     )
     .into_bytes();
@@ -916,6 +941,9 @@ pub fn encode(r: &Request) -> Vec<u8> {
     put_field(&mut out, s.target_triple.as_bytes());
     for f in &s.features {
         put_field(&mut out, f.as_bytes());
+    }
+    for d in &s.source_deps {
+        put_field(&mut out, d.as_bytes());
     }
     path_field(&mut out, r.client.shown.as_deref());
     for (k, v) in r.client.env.iter().flatten() {
@@ -933,7 +961,7 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
         return Err(ReadError::Bad);
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 16 || f[15] != build_id() {
+    if f.len() != 17 || f[16] != build_id() {
         // The first word is always a command, so a short header of a known
         // command is a client from before this field.
         return Err(if matches!(f.first(), Some(&"check" | &"build")) { ReadError::OtherBuild } else { ReadError::Bad });
@@ -966,6 +994,15 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
         features.push(text(get_field(r)?)?);
     }
     sort_features(&mut features);
+    let n_source: usize = f[15].parse().ok()?;
+    if n_source > 4096 {
+        return None;
+    }
+    let mut source_deps = Vec::with_capacity(n_source);
+    for _ in 0..n_source {
+        source_deps.push(text(get_field(r)?)?);
+    }
+    sort_features(&mut source_deps);
     let shown = get_field(r)?;
     let env = match f[12] {
         "-" => None,
@@ -999,6 +1036,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
             target_triple,
             profile: ProfileFlags { panic_abort: f[8] == "1", overflow_checks: f[9] == "1", debug_assertions: f[10] == "1" },
             cargo_net: CargoNet { offline: f[13] == "1", locked: f[14] == "1" },
+            source_deps,
         },
         file,
         out,
@@ -1702,6 +1740,35 @@ mod tests {
         std::fs::remove_file(dir.join(".lust.toml")).unwrap();
         let req = compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib"]);
         assert!(req.session.features.is_empty() && req.session.default_features);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `source-deps` (docs/dev-features.md): read from a `.lust.toml`
+    /// above a manifest whose own lust table sets only features, kept
+    /// under command line feature flags, sorted, carried on the wire, and
+    /// named in the session's describe text.
+    #[test]
+    fn source_deps_config_joins_the_session_key() {
+        let dir = std::env::temp_dir().join(format!("lust-srcdeps-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("crate/src")).unwrap();
+        std::fs::write(
+            dir.join("crate/Cargo.toml"),
+            "[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[package.metadata.lust]\ndev-features = [\"fast\"]\n\n[features]\nfast = []\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".lust.toml"), "source-deps = [\"kit@7.0.0\", \"fig\"]\n").unwrap();
+        std::fs::write(dir.join("crate/src/lib.rs"), "").unwrap();
+        let lib = dir.join("crate/src/lib.rs");
+        let mp = dir.join("crate/Cargo.toml");
+        let req = compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib"]);
+        assert_eq!(req.session.source_deps, ["fig", "kit@7.0.0"]);
+        assert_eq!(req.session.features, ["fast"], "the manifest's feature config still applies");
+        assert!(req.session.describe().contains("source_deps=[fig,kit@7.0.0]"), "{}", req.session.describe());
+        let back = read_request(&mut std::io::Cursor::new(encode(&req))).unwrap();
+        assert_eq!(back.session, req.session);
+        let cli = compile_req(&["check", lib.to_str().unwrap(), "--manifest-path", mp.to_str().unwrap(), "--lib", "--all-features"]);
+        assert_eq!(cli.session.source_deps, ["fig", "kit@7.0.0"], "feature flags do not turn it off");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

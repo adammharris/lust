@@ -1550,8 +1550,9 @@ fn lust_dep_lib_root(name: &str) -> Option<PathBuf> {
 }
 
 /// How one resolved dependency classifies (ARCH 1.1): lust source with
-/// this lib root (a path package, or the lust-side adapter/shim crate),
-/// or unsupported with a reason that names the crate (L0508). The
+/// this lib root (a path package, a registry package the project's
+/// `source-deps` config names, or the lust-side adapter/shim crate), or
+/// unsupported with a reason that names the crate (L0508). The
 /// class is a property of the resolved package, never of a source
 /// spelling: a path package that happens to be named `indexmap` is
 /// plain lust source. `lust_owned` marks the library's own crates
@@ -1564,7 +1565,10 @@ enum DepClass {
 
 /// Classifies one dependency unit. See `DepClass`.
 fn classify_dep(dep: &super::cargo::DepUnit) -> DepClass {
-    if dep.source.is_none() {
+    // A registry package the config names compiles from its downloaded
+    // source like a path package, ahead of an adapter or shim: the list
+    // is the user's choice (docs/dev-features.md).
+    if dep.source.is_none() || dep.lust_source {
         return DepClass::Source { root: dep.lib_src.clone(), lust_owned: false, adapter: None };
     }
     let name = dep.package_name.as_str();
@@ -9407,6 +9411,7 @@ mod tests {
             build_check_cfgs: Vec::new(),
             features: Vec::new(),
             deps: Vec::new(),
+            lust_source: false,
         }
     }
 
@@ -9447,6 +9452,19 @@ mod tests {
             DepClass::Unsupported(why) => assert!(why.contains("frobnicator"), "{why}"),
             DepClass::Source { .. } => panic!("an unknown registry crate has no lust form"),
         }
+        // `source-deps` (docs/dev-features.md): a listed registry package
+        // compiles from its downloaded source, also one with an adapter.
+        let mut deps = vec![dep_unit("frobnicator", "1.0.0", registry), dep_unit("memchr", "2.8.3", registry), dep_unit("other", "1.0.0", registry)];
+        super::super::cargo::mark_source_deps(&mut deps, &["frobnicator".into(), "memchr@2.8.3".into(), "other@2.0.0".into()]);
+        for d in &deps[..2] {
+            match classify_dep(d) {
+                DepClass::Source { root, lust_owned, adapter } => {
+                    assert!(root == d.lib_src && !lust_owned && adapter.is_none(), "{}", d.package_name)
+                }
+                DepClass::Unsupported(why) => panic!("a listed registry package is source: {why}"),
+            }
+        }
+        assert!(matches!(classify_dep(&deps[2]), DepClass::Unsupported(_)), "another version stays unsupported");
     }
 
     /// The explicit-through-glob example of section 1.3 resolves, and a

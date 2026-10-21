@@ -1,0 +1,16 @@
+# Valid Rust lust rejects: the `source-deps` config names greet 0.2.0, but
+# the lockfile resolves 0.1.0, so the registry package has no lust form
+# and the use rejects with L0508 (docs/dev-features.md). The vendored
+# directory source stands in for the registry so the fixture runs offline.
+[package]
+name = "source-dep-version"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+greet = "0.1.0"
+
+[package.metadata.lust]
+source-deps = ["greet@0.2.0"]
+
+[workspace]

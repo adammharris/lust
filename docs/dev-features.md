@@ -116,6 +116,35 @@ Cargo's byte for byte. The fork's `.lust.toml` excludes it too, and
 `build-release.sh` turns it on for the default-features release build.
 `scripts/tsrust_parity.py` removes `GOPORT_TRACE` from its runs.
 
+## Registry packages from source
+
+A registry package with no adapter or shim rejects with `L0508`. When
+the package is plain Rust inside lust's subset (for example a sister
+project published on crates.io), the project config can name it, and
+lust then compiles its downloaded source (`~/.cargo/registry/src/..`)
+as it compiles a path package:
+
+```toml
+[package.metadata.lust]
+source-deps = ["fig", "fig-core", "fig-kit@7.0.0"]
+```
+
+An entry is a package name, which matches every version the lockfile
+resolves, or `name@version`, which matches that version only. A listed
+package is a lust source crate (ARCH 1.1), so the usual rules apply:
+edition 2024, no `unsafe`, no proc macros, and its own dependencies
+classify one by one (list them too, or they reject with `L0508`). A
+listed package wins over an adapter or shim of the same name. Its build
+script, if any, does not run.
+
+The key is read in the same places as the feature keys
+(`[package.metadata.lust]`, `[workspace.metadata.lust]`, `.lust.toml`),
+first found, but on its own: a manifest's `dev-features` does not hide
+a `.lust.toml` above it that lists `source-deps`, and feature flags on
+the command line do not turn it off. The list is part of the session
+key, so editing it starts a fresh session. Release builds by Cargo never
+read it: they build every package with rustc, as always.
+
 ## Tools
 
 - `lust-port scan` reads the same config and evaluates

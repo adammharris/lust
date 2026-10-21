@@ -2084,9 +2084,10 @@ fn resolved_setup(
         t.lap("cargo graph");
         front.display_root = Some(graph.workspace_root.clone());
         let pre_env = CfgEnv::new(&key.target_triple, &key.features, key.krate.test, key.profile);
-        let unit =
+        let mut unit =
             cargo::select_unit(&graph, &greq, &key.krate.target_kind, &key.krate.target_name, &pre_env, &front.interner, key.krate.test)
                 .map_err(code2)?;
+        cargo::mark_source_deps(&mut unit.deps, &key.source_deps);
         let root_text = std::fs::read_to_string(&unit.target.src_path)
             .map_err(|e| code2(format!("cannot read {}: {e}", unit.target.src_path.display())))?;
         // Edition and lint gates for the selected unit (section 1.1),

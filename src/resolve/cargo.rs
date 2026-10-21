@@ -307,6 +307,26 @@ pub struct DepUnit {
     /// The exact feature set of this unit, as for the selected unit.
     pub features: Vec<String>,
     pub deps: Vec<DepUnit>,
+    /// The project config names this registry package in `source-deps`
+    /// (`mark_source_deps`): lust compiles its downloaded source.
+    pub lust_source: bool,
+}
+
+/// Marks every dependency in `deps` (transitively) whose package the
+/// project's `source-deps` list names: `name` matches every version,
+/// `name@version` one.
+pub fn mark_source_deps(deps: &mut [DepUnit], names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    for d in deps {
+        d.lust_source = d.source.is_some()
+            && names.iter().any(|n| match n.split_once('@') {
+                Some((name, version)) => name == d.package_name && version == d.version,
+                None => *n == d.package_name,
+            });
+        mark_source_deps(&mut d.deps, names);
+    }
 }
 
 /// The full graph for one request.
@@ -1009,6 +1029,7 @@ pub fn select_unit(
                     build_check_cfgs: Vec::new(),
                     features: lib_features,
                     deps: deps.clone(),
+                    lust_source: false,
                 },
             );
         }
@@ -1075,6 +1096,7 @@ fn build_deps(
             build_check_cfgs: Vec::new(),
             features: dep_features,
             deps: sub,
+            lust_source: false,
         });
     }
     out
