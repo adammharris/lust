@@ -2625,9 +2625,15 @@ impl<'p> Ctx<'p> {
             return Some(Selection::Builtin);
         }
         self.rollback_vars(snap);
-        let open = self.deep(want);
-        let flags = self.tys.flags(open);
-        Some(if flags.contains_projection() && flags.contains_infer() { Selection::Ambiguous } else { Selection::NoImpl })
+        // Either side may be the open one: the fn value's own input too
+        // (`Cow::Owned` takes `<?B as ToOwned>::Owned` until the output
+        // type binds `?B`).
+        let open = |cx: &mut Self, t: Ty| {
+            let t = cx.deep(t);
+            let flags = cx.tys.flags(t);
+            flags.contains_projection() && flags.contains_infer()
+        };
+        Some(if open(self, want) || open(self, tuple) { Selection::Ambiguous } else { Selection::NoImpl })
     }
 
     /// The fn pointer two branch types join as when each is a closure
