@@ -1704,7 +1704,10 @@ impl<'b, 'p> Ck<'b, 'p> {
                     if m {
                         self.check_mutability(place, span, st, true);
                     }
-                    let live = self.live_for(q, Some(ops.len()), &carriers);
+                    let live = match self.activation_live(b, si, rv) {
+                        Some(live) => live,
+                        None => self.live_for(q, Some(ops.len()), &carriers),
+                    };
                     let p_range = match rv {
                         Rvalue::Subslice { lo, hi, inclusive, .. } => self.subslice_range(dest, lo, hi, *inclusive),
                         _ => None,
@@ -1817,6 +1820,45 @@ impl<'b, 'p> Ck<'b, 'p> {
         self.reserved.clear();
         let live = self.live_for(q, None, &[]);
         self.write_dest(dest, span, &live, st);
+    }
+
+    /// The loans a two-phase activation (`&mut` statement `si` of block
+    /// `b`, one of `two_phase_loans` of the call ending it) conflicts
+    /// with: those live after the call, and those the call's operands
+    /// carry in values that hold regions. The call's other operands are
+    /// read before the activation in Rust (into temporaries in MIR), so
+    /// a loan only they read (`self.walk(*c)` with `c = &self.v`) is no
+    /// conflict; a reference operand that carries it (`self.walk2(c)`)
+    /// is (rustc E0502). None for any other statement.
+    fn activation_live(&self, b: u32, si: u32, rv: &Rvalue) -> Option<BitSet> {
+        if !self.report || !matches!(rv, Rvalue::Ref(true, _)) {
+            return None;
+        }
+        let block = &self.body.blocks[b as usize];
+        let Terminator::Call { target, args, .. } = &block.term else { return None };
+        let activations = self.two_phase_loans(b, args);
+        if !activations.contains(&(si as usize)) {
+            return None;
+        }
+        let mut ops: Vec<&Operand> = args.iter().collect();
+        let callee_op;
+        if let CallTarget::Indirect(callee) = target {
+            callee_op = Operand::Copy(Place::local(*callee));
+            ops.insert(0, &callee_op);
+        }
+        let carriers = self.carriers(&ops, None);
+        let q = self.point_base[b as usize] + block.stmts.len();
+        let mut live = self.live_for(q, None, &carriers);
+        // The call's own activations are in scope at the call, this one
+        // included: no conflict with themselves.
+        let base = self.stmt_base[b as usize];
+        for k in activations {
+            let li = self.loan_at[base + k] as usize;
+            if li < self.loans.len() {
+                live.remove(li);
+            }
+        }
+        Some(live)
     }
 
     /// The statement indexes (in block `b`) of the two-phase `&mut`
