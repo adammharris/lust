@@ -3814,7 +3814,22 @@ impl<'b, 'p> Builder<'b, 'p> {
                     _ => matches!(self.body.tys.kind(self.body.locals[dest.local as usize].ty), TyKind::Ref(_, Mut::Mut, _)),
                 };
                 let (mut pv, mut derefs) = (Vec::new(), Vec::new());
-                let pt = self.place(place, &mut pv, &mut derefs);
+                let mut pt = self.place(place, &mut pv, &mut derefs);
+                // `&mut v[a..b]` borrows the bare slice temporary that holds
+                // the subslice (`local_slots`): a reborrow through its
+                // pointer slot, whose pointee is the slice itself. As the
+                // `&[T]` it reads as, the slice would meet the new
+                // reference's pointee and tie the pointer slot to the
+                // element regions (`'a: 's` for a `&'a mut [C<'s>]`).
+                if place.proj.is_empty()
+                    && matches!(rv, Rvalue::Ref(..))
+                    && let TyKind::Ref(_, _, inner) = self.body.tys.kind(pt)
+                    && fat_local(&self.body.tys, self.body.locals[place.local as usize].ty)
+                    && !pv.is_empty()
+                {
+                    derefs.push((pv.remove(0), mutable));
+                    pt = inner;
+                }
                 // Reborrow constraints (rustc `add_reborrow_constraint`): each
                 // dereferenced reference outlives the new loan, from the last
                 // deref back, stopping after the first shared one.

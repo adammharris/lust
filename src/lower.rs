@@ -372,6 +372,13 @@ impl<'p> Lower<'p> {
     // ---------- Building blocks ----------
 
     fn new_local(&mut self, ty: Ty, mutable: bool, name: Option<String>) -> Local {
+        // A bare slice or `str` local is a fat pointer that borrowck reads
+        // as the `&[T]` it stands for (regions.rs `place`), which needs
+        // that type interned in the body; else the local is an unknown
+        // shape there, and its pointer slot meets the element regions.
+        if matches!(self.body.tys.kind(ty), TyKind::Slice(_) | TyKind::Str) {
+            self.body.tys.intern(TyKind::Ref(Region::Erased, Mut::Shared, ty));
+        }
         self.body.locals.push(LocalDecl { ty, mutable, name });
         self.body.locals.len() as Local - 1
     }
