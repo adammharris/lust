@@ -316,6 +316,11 @@ pub struct ResolvedTables {
     /// import of the name replaces one; a glob binding of another item
     /// makes the name ambiguous (`insert_glob_std_alias`).
     pub std_glob_aliases: FxMap<(ModuleId, u8, Sym), ModuleId>,
+    /// Globs of a std crate root (`pub use std::*;`): the importing
+    /// module, the glob's visibility, and the root (`std`, `core`,
+    /// `alloc`), for the primitive-named modules such a glob binds no
+    /// alias for (`primitive_module_under_std_glob`).
+    pub std_root_globs: Vec<(ModuleId, VisKind, Sym)>,
     /// The source module a glob-bound name was copied from, keyed like
     /// `std_glob_aliases`. A glob copies the source module's current
     /// binding, and that binding can still upgrade (a glob binding in
@@ -508,6 +513,7 @@ impl ResolvedTables {
             crate_magic: FxMap::default(),
             std_aliases: BTreeMap::new(),
             std_glob_aliases: FxMap::default(),
+            std_root_globs: Vec::new(),
             glob_src: GlobSrc::default(),
             pending_single: FxMap::default(),
             import_stall: false,
@@ -1915,10 +1921,12 @@ impl ResolvedTables {
     /// overlay module (`std_overlay_items`) defines. Macros stay with
     /// macro resolution.
     pub fn std_glob_alias_items(&self, path: &[Sym], overlay: Option<&(ModuleId, Vec<(Namespace, Sym)>)>, interner: &Interner) -> Vec<(Namespace, Sym)> {
-        if path.len() < 2 {
+        let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
+        // `use std::*;` (serde's `mod core { pub use std::*; }`): a crate
+        // root's modules and items, as for any std module.
+        if path.is_empty() || (path.len() == 1 && !matches!(strs[0], "std" | "core" | "alloc")) {
             return Vec::new();
         }
-        let strs: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
         let mut out = Vec::new();
         for item in crate::resolve::stdpaths::std_items(&strs) {
             let name = interner.intern(item);
@@ -1934,6 +1942,60 @@ impl ResolvedTables {
             }
         }
         out
+    }
+
+    /// A `use` path written through a module's std alias, continued as
+    /// the std path it stands for: `self::core::cell::Cell` where module
+    /// `core` binds `cell` to `std::cell` (by `pub use std::cell;` or
+    /// `pub use std::*;`) is `std::cell::Cell`. None when no segment
+    /// after the first is a std alias visible from `from` (a real
+    /// binding of the name wins), or when the path leaves the crate's
+    /// own modules first.
+    pub fn std_alias_continued(&self, from: ModuleId, path: &[Sym], leading_colon: bool, interner: &Interner) -> Option<Vec<Sym>> {
+        for k in 1..path.len() {
+            let PathRes::Done(Target::Module(m)) = self.resolve_module_path(from, &path[..k], leading_colon, interner) else {
+                return None;
+            };
+            let last = k + 1 == path.len();
+            let namespaces: &[Namespace] = if last { &[Namespace::Type, Namespace::Value, Namespace::Macro] } else { &[Namespace::Type] };
+            if namespaces.iter().any(|&ns| self.lookup(m, ns, path[k]).is_some()) {
+                continue;
+            }
+            let alias = namespaces
+                .iter()
+                .find_map(|&ns| {
+                    let key = (m, ns_index(ns) as u8, path[k]);
+                    self.std_aliases.get(&key).map(|(vis, p)| ((vis.clone(), p.clone()), self.std_glob_aliases.get(&key).copied().unwrap_or(m)))
+                })
+                .or_else(|| self.primitive_module_under_std_glob(m, path[k], interner));
+            if let Some(((vis, std_path), def_module)) = alias {
+                if !self.visible(&vis, def_module, from, interner) {
+                    return None;
+                }
+                let mut full = std_path;
+                full.extend_from_slice(&path[k + 1..]);
+                return Some(full);
+            }
+            return None;
+        }
+        None
+    }
+
+    /// A std module named as a primitive type (`f32`) that a glob of a
+    /// std crate root in module `m` brings (`pub use std::*;`). Such a
+    /// glob binds no alias for it, so the name still reads as the type
+    /// in `m`; a path through it (`self::core::f32`) still names the
+    /// module. The glob's visibility and module, as for an alias.
+    fn primitive_module_under_std_glob(&self, m: ModuleId, name: Sym, interner: &Interner) -> Option<((VisKind, Vec<Sym>), ModuleId)> {
+        let n = interner.get(name);
+        if !crate::ty::lang::is_primitive_type_name(n) {
+            return None;
+        }
+        self.std_root_globs.iter().find_map(|(gm, vis, root)| {
+            let strs = [interner.get(*root), n];
+            (*gm == m && crate::resolve::stdpaths::std_has(&strs) == Some(crate::resolve::stdpaths::StdHas::Module))
+                .then(|| ((vis.clone(), vec![*root, name]), m))
+        })
     }
 
     /// The std source module a std path walks into at segment `seg`
@@ -2753,6 +2815,15 @@ pub fn std_import_namespaces(interner: &Interner, path: &[Sym]) -> Option<Vec<Na
         // A std platform module (W-SHIM): its items resolve through the
         // alias into the platform crate.
         None if strs.len() == 2 && strs[0] == "std" && STD_PLATFORM_MODULES.contains(&strs[1]) => vec![Namespace::Type],
+        // Any other std module (`std::net`, a source overlay): the alias
+        // lets a path through it go on (`std_alias_continued`). A module
+        // named as a primitive type (`std::f32`) binds nothing, so the
+        // name still reads as the type.
+        None if crate::resolve::stdpaths::std_has(&strs) == Some(crate::resolve::stdpaths::StdHas::Module)
+            && !strs.last().is_some_and(|l| crate::ty::lang::is_primitive_type_name(l)) =>
+        {
+            vec![Namespace::Type]
+        }
         None => return None,
     };
     if std_is_module_path(&strs) && !out.contains(&Namespace::Type) {
@@ -2868,6 +2939,20 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
         && (imp.leading_colon || tables.std_is_extern(imp.module, interner))
     {
         let imp2 = Import { kind: ImportKind::Single { path: redirected, name: *name }, leading_colon: false, ..imp.clone() };
+        return try_import(tables, &imp2, self_sym, interner, diags);
+    }
+    // `use self::core::cell::Cell;` where module `core` has `pub use
+    // std::*;` (or `pub use std::cell;`): the path goes on through the
+    // std alias, as `use std::cell::Cell;` (serde's `crate::lib`).
+    let redirect = |path: &[Sym]| tables.std_alias_continued(imp.module, path, imp.leading_colon, interner);
+    let kind = match &imp.kind {
+        ImportKind::Single { path, name } => redirect(path).map(|path| ImportKind::Single { path, name: *name }),
+        ImportKind::Glob { path } => redirect(path).map(|path| ImportKind::Glob { path }),
+        ImportKind::CheckPath { path } => redirect(path).map(|path| ImportKind::CheckPath { path }),
+        ImportKind::BadLeading { .. } => None,
+    };
+    if let Some(kind) = kind {
+        let imp2 = Import { kind, leading_colon: true, ..imp.clone() };
         return try_import(tables, &imp2, self_sym, interner, diags);
     }
     match &imp.kind {
@@ -3000,6 +3085,9 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 only.sort();
                                 only.dedup();
                                 changed |= copy_glob(tables, imp, *m, Some(&only), interner);
+                            }
+                            if path.len() == 1 && !tables.std_root_globs.iter().any(|(m, _, r)| *m == imp.module && *r == path[0]) {
+                                tables.std_root_globs.push((imp.module, imp.vis.clone(), path[0]));
                             }
                             for (ns, name) in tables.std_glob_alias_items(path, overlay.as_ref(), interner) {
                                 let mut full = path.clone();

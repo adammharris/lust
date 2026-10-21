@@ -7273,6 +7273,16 @@ impl Rewrite<'_> {
                 self.local_item_use(ast, &imp.kind, item, base, span, scopes);
                 continue;
             }
+            // A path through a module's std alias (`use crate::lib::net::IpAddr;`
+            // where `lib` binds `net` to `std::net`) goes on as the std
+            // path, as at module level (`std_alias_continued`).
+            if let ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } = &mut imp.kind
+                && self.frame_hit(path, Namespace::Type, scopes).is_none()
+                && let Some(full) = self.tables.std_alias_continued(module, path, imp.leading_colon, self.interner)
+            {
+                *path = full;
+                imp.leading_colon = true;
+            }
             match imp.kind {
                 ImportKind::BadLeading { .. } => {
                     self.diags.push(Diag::new(
