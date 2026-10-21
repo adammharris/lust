@@ -6056,6 +6056,11 @@ pub fn ty_uses_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
             tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| ty_uses_param(tys, e, idx)))
         }
+        // `dyn Rule<Out = O>`, `dyn Other<O>`: the principal's trait args
+        // (after the erased Self) and its bindings.
+        TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| {
+            tys.args(pr.value.args).iter().skip(1).chain(tys.bindings(pr.value.bindings).iter().map(|(_, g)| g)).any(|g| g.as_ty().is_some_and(|e| ty_uses_param(tys, e, idx)))
+        }),
         _ => false,
     }
 }
