@@ -187,6 +187,33 @@ impl FnGen<'_, '_> {
                 let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
                 format!("lust_bytes_is_ascii((const uint8_t *){ptr}, {len})")
             }
+            B::SliceToAsciiCase(upper) => {
+                let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (t, i) = (self.tmp(), self.tmp());
+                let (lo, hi, d) = if upper { ('a', 'z', "-= 32") } else { ('A', 'Z', "+= 32") };
+                let _ = writeln!(
+                    self.out,
+                    "    lust_Vec {t} = lust_vec_with_capacity({len}, 1, 1);\n    memcpy({t}.ptr, {ptr}, {len});\n    {t}.len = {len};\n    for (uint64_t {i} = 0; {i} < {t}.len; {i}++) if (((uint8_t*){t}.ptr)[{i}] >= '{lo}' && ((uint8_t*){t}.ptr)[{i}] <= '{hi}') ((uint8_t*){t}.ptr)[{i}] {d};"
+                );
+                t
+            }
+            B::SliceMakeAsciiCase(upper) => {
+                let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (q, i) = (self.tmp(), self.tmp());
+                let (lo, hi, d) = if upper { ('a', 'z', "-= 32") } else { ('A', 'Z', "+= 32") };
+                let _ = writeln!(
+                    self.out,
+                    "    uint8_t *{q} = (uint8_t*){ptr};\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) if ({q}[{i}] >= '{lo}' && {q}[{i}] <= '{hi}') {q}[{i}] {d};"
+                );
+                "((lust_Unit){})".into()
+            }
+            // alloc's `checked_mul(n).expect("capacity overflow")`, then a
+            // byte copy per round (`T: Copy`).
+            B::SliceRepeat => {
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let et = ctype(&e);
+                format!("lust_slice_repeat({ptr}, {len}, {}, sizeof({et}), _Alignof({et}))", vals[1])
+            }
             B::SliceRotateLeft | B::SliceRotateRight => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let n = &vals[1];

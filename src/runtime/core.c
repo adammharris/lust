@@ -1786,6 +1786,16 @@ lust_String lust_str_repeat(lust_str s, uint64_t n, lust_loc loc) LUST_BODY({
     return r;
 })
 
+/* `<[T]>::repeat(n)` for `T: Copy` (alloc's slice.rs), which `str::repeat`
+   calls: the same `checked_mul` panic, then RawVec's capacity limit. */
+lust_Vec lust_slice_repeat(const void *p, uint64_t len, uint64_t n, uint64_t elem, uint64_t align) LUST_BODY({
+    if (len && n > UINT64_MAX / len) { lust_panic_std("capacity overflow", "alloc/src/slice.rs:524:50"); return lust_vec_with_capacity(0, elem, align); }
+    lust_Vec r = lust_vec_with_capacity(len * n, elem, align);
+    if (elem && len) for (uint64_t i = 0; i < n; i++) memcpy((char *)r.ptr + i * len * elem, p, len * elem);
+    r.len = len * n;
+    return r;
+})
+
 void lust_string_shrink_to(lust_String *s, uint64_t min_cap) LUST_BODY({
     uint64_t target = min_cap > s->len ? min_cap : s->len;
     if (s->cap <= target) return;

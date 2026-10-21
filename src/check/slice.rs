@@ -54,6 +54,11 @@ impl<'p> Ctx<'p> {
             "concat" => "concat",
             "eq_ignore_ascii_case" => "eq_ignore_ascii_case",
             "is_ascii" => "is_ascii",
+            "to_ascii_lowercase" => "to_ascii_lowercase",
+            "to_ascii_uppercase" => "to_ascii_uppercase",
+            "make_ascii_lowercase" => "make_ascii_lowercase",
+            "make_ascii_uppercase" => "make_ascii_uppercase",
+            "repeat" => "repeat",
             "rotate_left" => "rotate_left",
             "rotate_right" => "rotate_right",
             "partition_point" => "partition_point",
@@ -109,6 +114,11 @@ impl<'p> Ctx<'p> {
             n,
             "eq_ignore_ascii_case"
                 | "is_ascii"
+                | "to_ascii_lowercase"
+                | "to_ascii_uppercase"
+                | "make_ascii_lowercase"
+                | "make_ascii_uppercase"
+                | "repeat"
                 | "rotate_left"
                 | "rotate_right"
                 | "partition_point"
@@ -855,6 +865,30 @@ impl<'p> Ctx<'p> {
                 (B::SliceEqIgnoreAsciiCase, Autoref::Ref, vec![r], BOOL)
             }
             "is_ascii" if bytes => (B::SliceIsAscii, Autoref::Ref, vec![], BOOL),
+            // `[u8]`'s ASCII case maps: a copy, or in place.
+            "to_ascii_lowercase" | "to_ascii_uppercase" if bytes => {
+                let v = self.tys.mk_vec(elem);
+                (B::SliceToAsciiCase(n == "to_ascii_uppercase"), Autoref::Ref, vec![], v)
+            }
+            "make_ascii_lowercase" | "make_ascii_uppercase" if bytes => (B::SliceMakeAsciiCase(n == "make_ascii_uppercase"), Autoref::RefMut, vec![], UNIT),
+            // `<[T]>::repeat(n)`, `T: Copy` (alloc's slice.rs).
+            "repeat" => {
+                let el = self.deep(elem);
+                if self.tys.flags(el).contains_infer() {
+                    self.deferred_copy.push((el, name_span));
+                } else if !crate::check::collect::is_copy(self.p, &self.tys, el) {
+                    let tn = self.tn(el);
+                    self.err(
+                        "L0110",
+                        name_span,
+                        format!("the trait `Copy` is not implemented for `{tn}`"),
+                        "`repeat` copies the elements: use a Copy element type, or clone them in a loop.",
+                    );
+                    return Some(self.slice_bail(args));
+                }
+                let v = self.tys.mk_vec(elem);
+                (B::SliceRepeat, Autoref::Ref, vec![USIZE], v)
+            }
             "rotate_left" => (B::SliceRotateLeft, Autoref::RefMut, vec![USIZE], UNIT),
             "rotate_right" => (B::SliceRotateRight, Autoref::RefMut, vec![USIZE], UNIT),
             "partition_point" => {

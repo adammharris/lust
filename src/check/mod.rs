@@ -362,6 +362,12 @@ pub enum Builtin {
     /// `[u8]::eq_ignore_ascii_case` and `[u8]::is_ascii` (tf-small-a, R4).
     SliceEqIgnoreAsciiCase,
     SliceIsAscii,
+    /// `[u8]::to_ascii_lowercase` (false) and `to_ascii_uppercase` (true).
+    SliceToAsciiCase(bool),
+    /// `[u8]::make_ascii_lowercase` (false) and `make_ascii_uppercase` (true).
+    SliceMakeAsciiCase(bool),
+    /// `<[T]>::repeat(n)` for a Copy `T`.
+    SliceRepeat,
     /// `[T]::rotate_left` and `rotate_right`: core's assert at its own
     /// site (core/src/slice/mod.rs), then bitwise moves.
     SliceRotateLeft,

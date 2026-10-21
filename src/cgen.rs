@@ -7866,6 +7866,9 @@ impl FnGen<'_, '_> {
             }
             B::SliceEqIgnoreAsciiCase
             | B::SliceIsAscii
+            | B::SliceToAsciiCase(_)
+            | B::SliceMakeAsciiCase(_)
+            | B::SliceRepeat
             | B::SliceRotateLeft
             | B::SliceRotateRight
             | B::SlicePartitionPoint
