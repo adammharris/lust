@@ -4167,14 +4167,14 @@ impl<'a> Expander<'a> {
                 {
                     expanded = vec![Tt::Delim(Delim::Paren, expanded, call.span)];
                 }
-                // A `()` or `[]` call in statement position is an
-                // expression in rustc, so an operator after it continues
-                // it: `matches!(x, 1) || y`. A block-like expansion
-                // (`match x { .. }`) would end the statement in the flat
-                // stream, so it gets parens.
-                if stmt_list
-                    && !item_list
-                    && stmt_boundary
+                // A `()` or `[]` call in statement position, or as a match
+                // arm's body, is an expression in rustc, so an operator
+                // after it continues it: `matches!(x, 1) || y`. A
+                // block-like expansion (`match x { .. }`) would end the
+                // statement or the arm in the flat stream, so it gets
+                // parens.
+                let arm_body = matches!(out.last(), Some(Tt::Tok(t)) if t.tok == Tok::FatArrow);
+                if (stmt_list && !item_list && stmt_boundary || arm_body)
                     && call.delim != Delim::Brace
                     && starts_block_like(&expanded)
                     && continues_expr(tok_at(&trees, next).map(|t| t.tok))
