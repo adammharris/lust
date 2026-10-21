@@ -925,12 +925,18 @@ pub fn select_unit(
     interner: &crate::intern::Interner,
     test_crate: bool,
 ) -> Result<UnitInfo, String> {
+    // Cargo's paths are canonical; the request's may hold `..`
+    // (`--manifest-path ../b/Cargo.toml`). A virtual workspace manifest
+    // names no package: it takes a member.
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let want = canon(&req.manifest_path);
+    let is_root = want.parent() == Some(canon(&graph.workspace_root).as_path());
     let pkg = graph
         .packages
         .iter()
         .find(|p| Some(&p.name) == req.package.as_ref())
-        .or_else(|| graph.packages.iter().find(|p| p.manifest_path == req.manifest_path))
-        .or_else(|| graph.packages.iter().find(|p| graph.workspace_members.contains(&p.id_repr)))
+        .or_else(|| graph.packages.iter().find(|p| canon(&p.manifest_path) == want))
+        .or_else(|| graph.packages.iter().find(|p| is_root && graph.workspace_members.contains(&p.id_repr)))
         .ok_or_else(|| format!("no package in the Cargo graph matches {}", req.manifest_path.display()))?;
     // A package has at most one lib target, and Cargo names it by the crate
     // name (`twig_kit` for package `twig-kit`, or a `[lib] name`), not the
@@ -1238,6 +1244,28 @@ mod tests {
             assert_eq!(unit.package.name, package);
             assert!(unit.target.src_path.ends_with(src), "{}", unit.target.src_path.display());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unit_of_a_manifest_path_through_dotdot() {
+        // `--manifest-path ../b/Cargo.toml` from member `a`: the path is
+        // not Cargo's canonical one, and must still pick `b`, never the
+        // first member.
+        let dir = std::env::temp_dir().join(format!("lust-cargo-dotdot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(m).join("src")).unwrap();
+            std::fs::write(dir.join(m).join("Cargo.toml"), format!("[package]\nname = \"{m}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")).unwrap();
+            std::fs::write(dir.join(m).join("src/lib.rs"), "").unwrap();
+        }
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"3\"\n").unwrap();
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let req = GraphRequest { manifest_path: dir.join("a/../b/Cargo.toml"), default_features: true, ..Default::default() };
+        let graph = load_graph(&req).expect("metadata");
+        let unit = select_unit(&graph, &req, "lib", "b", &env, &interner, false).expect("the lib unit");
+        assert_eq!(unit.package.name, "b");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -697,6 +697,9 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         return None;
     }
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    // A manifest names its package by path: canonical, as Cargo's are
+    // (`absolute` keeps a `..`).
+    let manifest_abs = |p: &Path| p.canonicalize().unwrap_or_else(|_| abs(p));
     // Release and the rustc oracle are build/check-only, with no extra lust flags.
     // Crate-selection flags are lust dev flags today: reject them there rather
     // than build a different crate selection than the user named.
@@ -715,7 +718,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         let typed = file.clone();
         let file = abs(&file);
         if let Some(p) = crate_flags.manifest_path.take() {
-            crate_flags.manifest_path = Some(abs(&p));
+            crate_flags.manifest_path = Some(manifest_abs(&p));
         }
         let profile_name = profile.as_deref().unwrap_or("release");
         let manifest = crate_flags.manifest_path.clone().or_else(|| find_manifest(&file).map(|m| m.path));
@@ -779,7 +782,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let typed = file.clone();
     let file = abs(&file);
     if let Some(p) = crate_flags.manifest_path.take() {
-        crate_flags.manifest_path = Some(abs(&p));
+        crate_flags.manifest_path = Some(manifest_abs(&p));
     }
     let mut session = session_key_for(&file, crate_flags, net);
     if let Some(abort) = panic_abort {
