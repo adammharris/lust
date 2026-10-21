@@ -619,6 +619,13 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
             node_deps.insert(id.to_string(), deps);
         }
     }
+    let name_of: std::collections::HashMap<&str, &str> = root
+        .get("packages")
+        .map(|v| v.as_arr())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|p| Some((p.get("id")?.as_str()?, p.get("name")?.as_str()?)))
+        .collect();
     let mut packages = Vec::new();
     for p in root.get("packages").map(|v| v.as_arr()).unwrap_or(&[]) {
         let id_repr = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -639,16 +646,21 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
             })
             .collect();
         // Fill each dependency's resolved package by matching the resolve
-        // edges of this package (dependency name plus kind plus target;
-        // the resolve node's name is the dependency lib name, with `-`
-        // read as `_` on both sides).
+        // edges of this package (dependency plus kind plus target). The
+        // resolve edge's name is the extern name (a rename, else the
+        // dependency's lib name, which a `[lib] name` may make other than
+        // the package name), so a plain dependency matches the edge by
+        // the package the edge resolves to.
         if let Some(edges) = node_deps.get(&id_repr) {
             for dep in &mut dependencies {
-                let want = dep.name.replace('-', "_");
+                let is_dep = |name: &str, pkg: &str| match &dep.rename {
+                    Some(r) => name.replace('-', "_") == r.replace('-', "_"),
+                    None => name_of.get(pkg).copied() == Some(dep.name.as_str()),
+                };
                 dep.pkg = edges
                     .iter()
-                    .find(|(name, _, kind, target)| name.replace('-', "_") == want && *kind == dep.kind && *target == dep.target)
-                    .or_else(|| edges.iter().find(|(name, _, kind, _)| name.replace('-', "_") == want && *kind == dep.kind))
+                    .find(|(name, pkg, kind, target)| is_dep(name, pkg) && *kind == dep.kind && *target == dep.target)
+                    .or_else(|| edges.iter().find(|(name, pkg, kind, _)| is_dep(name, pkg) && *kind == dep.kind))
                     .map(|(_, pkg, _, _)| pkg.clone());
             }
         }
@@ -1022,7 +1034,7 @@ fn build_deps(
         let Some(dep_pkg_id) = &dep.pkg else { continue };
         let Some(dep_pkg) = graph.packages.iter().find(|p| &p.id_repr == dep_pkg_id) else { continue };
         let Some(lib) = dep_pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib")) else { continue };
-        let extern_name = dep.rename.clone().unwrap_or_else(|| dep.name.replace('-', "_"));
+        let extern_name = dep.rename.clone().unwrap_or_else(|| lib.name.replace('-', "_"));
         let features = check_map
             .as_ref()
             .and_then(|m| m.get(&(dep_pkg.id_repr.clone(), lib.name.clone())).cloned())

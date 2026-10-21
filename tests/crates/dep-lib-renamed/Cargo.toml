@@ -1,0 +1,12 @@
+# A dependency whose `[lib] name` is not its package name: package
+# `kit-doc`, crate `kit`. Cargo's resolve names the edge `kit`, and the
+# extern name is the lib name, not the package name.
+[package]
+name = "dep-lib-renamed"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kit-doc = { path = "kit" }
+
+[workspace]
