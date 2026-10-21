@@ -2895,6 +2895,46 @@ impl<'x> ScalarEval<'x> {
         None
     }
 
+    /// The length of a literal a `.len()` reads: a string or byte string,
+    /// an array (`[a, b]`, `[x; n]`) or a reference to one (`&[a, b]`),
+    /// or a const whose value is one (`const ALL: &[Tag] = &[..]`).
+    fn literal_len(&mut self, env: &mut SEnv, e: ast::ExprId, depth: u32) -> Option<usize> {
+        use crate::ast::Expr;
+        if depth > 32 {
+            return None;
+        }
+        let ast = self.ast;
+        match ast.expr(e) {
+            Expr::Str(i) => ast.strings.get(*i as usize).map(String::len),
+            Expr::ByteStr(i) => ast.blobs.get(*i as usize).map(|b| b.len()),
+            Expr::Ref { expr, .. } => self.literal_len(env, *expr, depth + 1),
+            Expr::Array(elems) => Some(elems.len()),
+            Expr::ArrayRepeat { len, .. } => match self.val(env, *len, Some(SExp::Int(IntTy::Usize)), depth + 1)? {
+                SVal::Int(n, _) => usize::try_from(n).ok(),
+                _ => None,
+            },
+            Expr::Path(segs) if segs.len() == 1 && !env.iter().any(|(n, _)| *n == segs[0].name) => {
+                let value = match stmt_item_at(ast, segs[0].name, ast.expr_span(e)) {
+                    Some(si) => match &ast.stmt_items[si as usize].kind {
+                        ItemKind::Const(c) => c.value,
+                        _ => None,
+                    },
+                    None => named_const_expr(ast, &[segs[0].name]),
+                };
+                self.literal_len(&mut Vec::new(), value?, depth + 1)
+            }
+            Expr::Path(segs) if segs.len() == 2 && !segs[0].has_args() => {
+                let ty_name = if segs[0].name == self.known.self_type { self.self_name? } else { segs[0].name };
+                let value = named_const_expr(ast, &[ty_name, segs[1].name])?;
+                let outer_self = std::mem::replace(&mut self.self_name, Some(ty_name));
+                let n = self.literal_len(&mut Vec::new(), value, depth + 1);
+                self.self_name = outer_self;
+                n
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluates one expression.
     fn expr(&mut self, env: &mut SEnv, e: ast::ExprId, exp: Option<SExp>, depth: u32) -> SFlow {
         use crate::ast::{BinOp, Expr, MacroKind, UnOp};
@@ -3074,15 +3114,12 @@ impl<'x> ScalarEval<'x> {
                 _ => None,
             }),
             Expr::Call { callee, args } => SFlow::V(self.call(env, *callee, args, depth)),
-            // `"lit".len()` (`str::len` is a const fn): the literal's
-            // byte length, a `usize`.
+            // `"lit".len()` and `ALL.len()` (`str::len` and `<[T]>::len`
+            // are const fns): the literal's length, a `usize`.
             Expr::MethodCall { recv, name, generic_args, args, .. }
                 if args.is_empty() && generic_args.is_empty() && self.interner.get(*name) == "len" =>
             {
-                SFlow::V(match self.ast.expr(*recv) {
-                    Expr::Str(i) => self.ast.strings.get(*i as usize).map(|s| SVal::Int(s.len() as i128, Some(IntTy::Usize))),
-                    _ => None,
-                })
+                SFlow::V(self.literal_len(env, *recv, depth + 1).map(|n| SVal::Int(n as i128, Some(IntTy::Usize))))
             }
             Expr::Path(segs) => SFlow::V(self.path_value(env, segs, e, exp, depth)),
             Expr::Macro { kind, args, .. } => SFlow::V(match kind {
