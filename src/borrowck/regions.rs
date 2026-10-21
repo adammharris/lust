@@ -4720,10 +4720,19 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ => Vec::new(),
         };
         let mut srcs: Vec<u32> = Vec::new();
+        // `it.map(f)` and `it.flat_map(f)`: `f`'s values are the map's
+        // output part `B` only, slot by slot (`map_out_part`).
+        let out_part = self.map_out_part(&target, dt, &dv);
         for (i, (t, v)) in avs.iter().enumerate() {
-            if !tied.contains(&i) {
-                self.closure_sources(*t, v, &mut 0, &mut srcs);
+            if tied.contains(&i) {
+                continue;
             }
+            if let Some(bv) = &out_part
+                && self.closure_sources_into(*t, v, bv)
+            {
+                continue;
+            }
+            self.closure_sources(*t, v, &mut 0, &mut srcs);
         }
         self.flow_all(&srcs, &dv);
         // `catch_unwind(f)` returns what `f` returns, or a `'static`
@@ -5808,11 +5817,40 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let (mv, uv) = (dv[..nm].to_vec(), dv[nm..].to_vec());
         self.call_adapter(avs, m, &mv);
-        self.flow_all(&mv, &uv);
-        if has_interior(&self.body.tys, u) {
-            self.flow_all(&uv, &mv);
+        // The front and back iterators are values of the map's output
+        // `B` (the closure's return type, which is `U`): they hold what
+        // its `B` part holds, slot by slot, which `call_adapter` relates
+        // to `I`'s items and `f`'s captures. Every map region in every `U`
+        // slot would also put the outer iterator's own loan into `U`'s
+        // items (`flat_map(|l| l.iter().map(|d| d.name))` collected as
+        // `&'static str` asked the loan to be `'static`).
+        let interior = has_interior(&self.body.tys, u);
+        match self.map_out_slots(m, &mv) {
+            Some(bv) if bv.len() == uv.len() => {
+                for (&b, &x) in bv.iter().zip(&uv) {
+                    self.edge_v(b, x, if interior { Variance::Inv } else { Variance::Co });
+                }
+            }
+            _ => {
+                self.flow_all(&mv, &uv);
+                if interior {
+                    self.flow_all(&uv, &mv);
+                }
+            }
         }
         true
+    }
+
+    /// The slots of a `Map<I, F, B>`'s output part `B`, among the map's
+    /// slots `mv` (its own regions, then each type arg's), or None for
+    /// another shape.
+    fn map_out_slots(&mut self, m: Ty, mv: &[u32]) -> Option<Vec<u32>> {
+        let (_, args) = self.body.tys.adt_parts(m)?;
+        let comps: Vec<Ty> = self.body.tys.args(args).iter().filter_map(|g| g.as_ty()).collect();
+        let [i, f, b] = comps[..] else { return None };
+        let at = adt_regions(self.p, &self.body.tys, m) as usize + self.sc.slots(i) as usize + self.sc.slots(f) as usize;
+        let n = self.sc.slots(b) as usize;
+        Some(mv.get(at..at + n)?.to_vec())
     }
 
     /// A builtin that builds an iterator adapter (`map`, `filter`,
@@ -7607,8 +7645,21 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             TyKind::Adt(_, args) => {
                 *at += adt_regions(self.p, &self.body.tys, t) as usize;
-                for g in self.body.tys.args(args).to_vec() {
+                // The closure of a `Map<I, F, B>` (and `filter_map`'s,
+                // `map_while`'s) put what it returns in the map's `B` part
+                // when the map was made, and the map's items are that part:
+                // a call that takes the map holds those through its slots,
+                // not again through the closure.
+                let made = matches!(
+                    crate::ty::iter::iter_parts(&self.body.tys, t),
+                    Some((crate::ty::iter::IterKind::Map | crate::ty::iter::IterKind::FilterMap | crate::ty::iter::IterKind::MapWhile, _))
+                );
+                for (j, g) in self.body.tys.args(args).to_vec().into_iter().enumerate() {
                     if let GenericArg::Ty(e) = g {
+                        if made && j == 1 && matches!(self.body.tys.kind(e), TyKind::Closure(..)) {
+                            *at += self.sc.slots(e) as usize;
+                            continue;
+                        }
                         self.closure_sources(e, vars, at, out);
                     }
                 }
@@ -7621,6 +7672,72 @@ impl<'b, 'p> Builder<'b, 'p> {
             TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.closure_sources(e, vars, at, out),
             _ => *at += n,
         }
+    }
+
+    /// The slots of the output part `B` of the `Map<I, F, B>` that
+    /// `it.map(f)` makes, or that `it.flat_map(f)` makes inside its
+    /// `Flatten<Map<I, F, B>, U>` (its front and back `U` hold what `B`
+    /// holds, `call_flat_map`), among the result's slots `dv`.
+    fn map_out_part(&mut self, target: &CallTarget, dt: Ty, dv: &[u32]) -> Option<Vec<u32>> {
+        use crate::check::Builtin as B;
+        use crate::ty::iter::IterKind as K;
+        let CallTarget::Builtin(b @ (B::IterMap | B::IterFlatMap)) = *target else { return None };
+        let (m, mv) = match crate::ty::iter::iter_parts(&self.body.tys, dt)? {
+            (K::Map, _) if b == B::IterMap => (dt, dv.to_vec()),
+            (K::Flatten, a) if b == B::IterFlatMap => {
+                let m = *a.first()?;
+                let nm = self.sc.slots(m) as usize;
+                (m, dv.get(..nm)?.to_vec())
+            }
+            _ => return None,
+        };
+        if !matches!(crate::ty::iter::iter_parts(&self.body.tys, m), Some((K::Map, _))) {
+            return None;
+        }
+        self.map_out_slots(m, &mv)
+    }
+
+    /// For a closure argument `t` (vars `vars`) whose output has the
+    /// slots of `out`: what its body returns flows into those slots, per
+    /// output slot when `closure_reqs` knows it (`|l| l.iter().map(|d|
+    /// d.name)` holds `l`'s loan in its iterator, and nothing in its
+    /// `&'static str` items), else every source into every slot. False
+    /// when `t` is no such closure.
+    fn closure_sources_into(&mut self, t: Ty, vars: &[u32], out: &[u32]) -> bool {
+        let TyKind::Closure(def, args) = self.body.tys.kind(t) else { return false };
+        let Some(n_out) = self.p.gx.closures.get(&def).map(|c| self.sc.slots(c.output) as usize) else { return false };
+        if n_out != out.len() || vars.len() != self.sc.slots(t) as usize {
+            return false;
+        }
+        if n_out == 0 {
+            return true;
+        }
+        let mut roles = Vec::new();
+        closure_roles(&mut self.sc, def, args, &mut roles);
+        let av = self.closure_args.get(&def).cloned().unwrap_or_default();
+        let fe = self.fn_ends(def);
+        match self.closure_reqs(def, &roles) {
+            Some(reqs) => {
+                for &(x, y) in reqs.iter() {
+                    let End::Out(k) = y else { continue };
+                    let v = match x {
+                        End::Cap(i) => vars.get(i as usize).copied(),
+                        End::Arg(j) => av.get(j as usize).copied(),
+                        End::Fn(k) => fe.get(k as usize).copied().flatten(),
+                        End::Static | End::Out(_) => None,
+                    };
+                    if let (Some(v), Some(&o)) = (v, out.get(k as usize)) {
+                        self.edge(v, o);
+                    }
+                }
+            }
+            None => {
+                let mut srcs: Vec<u32> = roles.iter().enumerate().filter(|(_, r)| r.0).filter_map(|(i, _)| vars.get(i).copied()).collect();
+                srcs.extend(av);
+                self.flow_all(&srcs, out);
+            }
+        }
+        true
     }
 
     /// The conservative call rule: the result may hold any argument's
