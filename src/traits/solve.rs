@@ -954,6 +954,14 @@ impl Solver {
                     {
                         return self.normalize_inner(cx, index, env, out, depth + 1);
                     }
+                    // `<dyn Rule<Out = O> as Rule>::Out` is the object's
+                    // binding: the type erased into the object fixed it.
+                    if let TyKind::Dyn(b, _) = cx.tys().kind(deep)
+                        && let Some(pr) = cx.tys().dyn_bounds(b).principal
+                        && let Some(&(_, GenericArg::Ty(bound))) = cx.tys().bindings(pr.value.bindings).iter().find(|(d, _)| *d == assoc.0)
+                    {
+                        return self.normalize_inner(cx, index, env, bound, depth + 1);
+                    }
                 }
                 let Some(trait_def) = index.trait_of_assoc(assoc.0) else { return t };
                 // Normalize inside the trait args first, so nested
@@ -1030,6 +1038,25 @@ impl Solver {
                 let output = self.normalize_inner(cx, index, env, b.value.output, depth + 1);
                 let sig = cx.tys().intern_sig(Binder { count: b.count, value: FnSig { inputs, output, ..b.value } });
                 cx.tys().intern(TyKind::FnPtr(sig))
+            }
+            // `dyn Rule<Out = <Lit as Rule>::Out>` (a `BoxRule<Self::Out>`
+            // at `Self = Lit`): the principal's args and bindings.
+            TyKind::Dyn(b, r) => {
+                let bounds = cx.tys().dyn_bounds(b).clone();
+                let Some(pr) = bounds.principal else { return t };
+                let args = self.normalize_args(cx, index, env, pr.value.args, depth + 1);
+                let old: Vec<(DefId, GenericArg)> = cx.tys().bindings(pr.value.bindings).to_vec();
+                let new: Vec<(DefId, GenericArg)> = old
+                    .into_iter()
+                    .map(|(d, g)| match g {
+                        GenericArg::Ty(e) => (d, GenericArg::Ty(self.normalize_inner(cx, index, env, e, depth + 1))),
+                        other => (d, other),
+                    })
+                    .collect();
+                let bindings = cx.tys().intern_bindings(&new);
+                let principal = Some(Binder { count: pr.count, value: TraitRef { args, bindings, ..pr.value } });
+                let b = cx.tys().intern_dyn_bounds(DynBounds { principal, ..bounds });
+                cx.tys().intern(TyKind::Dyn(b, r))
             }
             _ => t,
         }

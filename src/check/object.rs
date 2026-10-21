@@ -98,6 +98,10 @@ pub struct DynInfo {
     pub fmt_debug: bool,
     /// The same for `Display`, through `VT_FMT_DISPLAY`.
     pub fmt_display: bool,
+    /// The trait's own associated types: a dyn type binds each
+    /// (`dyn Rule<Out = O>`, rustc E0191 otherwise), and a projection on
+    /// the dyn type is its binding (`traits::solve::normalize`).
+    pub assoc_types: Vec<(DefId, Sym)>,
 }
 
 impl DynInfo {
@@ -309,6 +313,11 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             if let Some(u) = &si.unsupported {
                 info.unsupported.get_or_insert(u.clone());
             }
+            // A supertrait's binding would ride along on upcasts and
+            // supertrait calls, which keep no bindings yet.
+            if let Some((_, a)) = si.assoc_types.first() {
+                info.unsupported.get_or_insert(format!("`dyn {tname}` whose supertrait `{}` has the associated type `{}`", p.name(srec.name), p.name(*a)));
+            }
             info.auto.send |= si.auto.send;
             info.auto.sync |= si.auto.sync;
             info.auto.unpin |= si.auto.unpin;
@@ -319,11 +328,11 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             info.supers.push(b.value);
         }
     }
-    for (_, aname, is_type) in &rec.assoc_items {
-        if *is_type {
-            info.unsupported.get_or_insert(format!("`dyn {tname}` with the associated type `{}`", p.name(*aname)));
+    for &(adef, aname, is_type) in &rec.assoc_items {
+        if is_type {
+            info.assoc_types.push((adef, aname));
         } else {
-            info.violation.get_or_insert((format!("it contains the associated const `{}`", p.name(*aname)), rec.span));
+            info.violation.get_or_insert((format!("it contains the associated const `{}`", p.name(aname)), rec.span));
         }
     }
     // Methods: dispatchable ones get vtable entries; `where Self:
@@ -531,7 +540,20 @@ pub fn dyn_type_diag(p: &Program, tys: &impl TyIntern, t: Ty, span: Span) -> Opt
                     .with_label(*item, "this item makes the trait not dyn compatible"),
                 );
             }
-            info.unsupported.as_ref().map(|u| crate::check::generics::dyn_not_yet(span, u))
+            if let Some(u) = &info.unsupported {
+                return Some(crate::check::generics::dyn_not_yet(span, u));
+            }
+            // rustc E0191: the object fixes every associated type.
+            let bound = tys.bindings(pr.bindings);
+            info.assoc_types.iter().find(|(d, _)| !bound.iter().any(|(b, _)| b == d)).map(|(_, a)| {
+                let a = p.name(*a);
+                Diag::new(
+                    "L0110",
+                    span,
+                    format!("the value of the associated type `{a}` in `{name}` must be specified"),
+                    format!("Write it in the dyn type: `dyn {name}<{a} = T>`."),
+                )
+            })
         }
         TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) => dyn_type_diag(p, tys, e, span),
         // A dyn value has no size, so it cannot be an element (rustc E0277).

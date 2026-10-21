@@ -5700,7 +5700,7 @@ impl<'p> Ctx<'p> {
                             // at exponential length: such a name is `_`.
                             let self_ty = self.resolve(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
                             let tn = if dropck::short_name(self.p, &self.tys, self_ty) == "_" { "_".to_string() } else { self.tn(self_ty) };
-                            let tr_name = self.trait_name(trait_ref.def);
+                            let tr_name = self.trait_name_bound(trait_ref);
                             self.err("L0612", span, format!("no impl of `{tr_name}` for `{tn}`"), "Add the impl, or change the bound.");
                         }
                         Selection::Overflow => {
@@ -5758,7 +5758,7 @@ impl<'p> Ctx<'p> {
                             Selection::Impl { .. } | Selection::ParamEvidence(_) | Selection::Builtin => {}
                             Selection::NoImpl => {
                                 let tn = self.tn(self.tys.args(trait_ref.args)[0].as_ty().unwrap_or(ERROR));
-                                let tr_name = self.trait_name(trait_ref.def);
+                                let tr_name = self.trait_name_bound(trait_ref);
                                 self.err("L0612", span, format!("no impl of `{tr_name}` for `{tn}`"), "Add the impl, or change the bound.");
                             }
                             _ => {
@@ -6114,6 +6114,28 @@ impl<'p> Ctx<'p> {
     /// The display name of a trait def, for obligation errors.
     fn trait_name(&self, def: DefId) -> String {
         self.p.gx.index.trait_record(def).map_or_else(|| "?".to_string(), |r| self.p.display_path(r.name))
+    }
+
+    /// `trait_name` with the obligation's associated type bindings
+    /// (`Rule<Out = String>`, a `dyn Rule<Out = String>` coercion's), so a
+    /// NoImpl that only the bindings refute names them (rustc E0271).
+    fn trait_name_bound(&mut self, tr: TraitRef) -> String {
+        let name = self.trait_name(tr.def);
+        let bs: Vec<(DefId, GenericArg)> = self.tys.bindings(tr.bindings).to_vec();
+        if bs.is_empty() {
+            return name;
+        }
+        let p = self.p;
+        let names: Vec<(DefId, Sym)> = p.gx.index.trait_record(tr.def).map(|r| r.assoc_items.iter().map(|&(d, n, _)| (d, n)).collect()).unwrap_or_default();
+        let parts: Vec<String> = bs
+            .into_iter()
+            .filter_map(|(d, g)| {
+                let n = names.iter().find(|(x, _)| *x == d)?.1;
+                let t = self.resolve(g.as_ty()?);
+                Some(format!("{} = {}", p.name(n), self.tn(t)))
+            })
+            .collect();
+        format!("{name}<{}>", parts.join(", "))
     }
 
     /// Replaces `_` markers in one resolved written type with

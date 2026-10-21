@@ -3941,11 +3941,9 @@ fn resolve_dyn(
                         "Use a reference to an owned type, or a generic `F: Fn(..)` parameter.",
                     ));
                 }
-                // The `Fn(..) -> R` sugar binds `Output`; other bindings
-                // are not supported yet.
-                if !fn_family && !tys.bindings(tr.bindings).is_empty() {
-                    return Err(dyn_not_yet(span, "associated type bindings in `dyn` types"));
-                }
+                // The `Fn(..) -> R` sugar binds `Output`; a crate trait's
+                // bindings fix its associated types (`dyn Rule<Out = O>`,
+                // each one required: `object::dyn_type_diag`).
                 principal = Some(Binder::plain(tr));
             }
         }
