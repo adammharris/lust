@@ -1,0 +1,3 @@
+# `lust test --lib` of a crate whose tests sit in the root, inline modules
+# and module files, with a dev-dependency that depends back on the lib.
+test=lib

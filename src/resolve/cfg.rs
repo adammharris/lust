@@ -97,12 +97,15 @@ pub struct CfgEnv {
 }
 
 impl CfgEnv {
-    /// This environment with another unit's feature set: the target,
-    /// profile, and test facts of a workspace session are shared by all
-    /// its crates (ARCH 1.8); only per-unit features differ.
+    /// The environment of a dependency crate with its own feature set: the
+    /// target and profile facts of a workspace session are shared by all its
+    /// crates (ARCH 1.8), but `test` is the selected test crate's alone.
+    /// Cargo builds a dependency without `--test`, so its `#[cfg(test)]`
+    /// code is off, also in a `cargo test` build.
     pub fn with_features(&self, features: &[String]) -> CfgEnv {
         let mut env = self.clone();
         env.features = features.iter().cloned().collect();
+        env.flags.remove("test");
         env
     }
 

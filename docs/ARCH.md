@@ -145,7 +145,11 @@ Terms:
 - Test crates: `lust test` builds the lib or bin crate again with
   `cfg(test)` on and `#[test]` fns as extra roots. Integration
   tests in `tests/` are normal bin-like crates that depend on the
-  lib crate. Ts-rust's baseline runner is such a target with
+  lib crate. `cfg(test)` is the test crate's alone: its
+  dependencies (also the package's own lib, under an integration
+  test or a dev-dependency) build as in any other session. The
+  harness shims go into in-memory copies of the crate's files
+  (`driver::set_source_overlay`, src/testrun/krate.rs). Ts-rust's baseline runner is such a target with
   `test = false` in `crates/ts_goport/Cargo.toml`, so target
   handling must not assume `cargo test` semantics.
 

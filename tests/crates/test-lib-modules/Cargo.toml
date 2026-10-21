@@ -1,0 +1,15 @@
+[package]
+name = "test-lib-modules"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+extra = []
+
+# The helper depends on this lib, as twig-kit's dev-dependencies do: the
+# lib compiles twice, as the test crate and as the helper's dependency.
+[dev-dependencies]
+helper = { path = "helper" }
+
+[workspace]
+members = ["helper"]
