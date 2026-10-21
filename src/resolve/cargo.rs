@@ -932,13 +932,12 @@ pub fn select_unit(
         .or_else(|| graph.packages.iter().find(|p| p.manifest_path == req.manifest_path))
         .or_else(|| graph.packages.iter().find(|p| graph.workspace_members.contains(&p.id_repr)))
         .ok_or_else(|| format!("no package in the Cargo graph matches {}", req.manifest_path.display()))?;
-    let target = pkg
-        .targets
-        .iter()
-        .find(|t| {
-            t.name == target_name
-                && (t.kind.iter().any(|k| k == target_kind) || target_kind == "lib" && t.kind.iter().any(|k| k == "lib" || k == "rlib"))
-        })
+    // A package has at most one lib target, and Cargo names it by the crate
+    // name (`twig_kit` for package `twig-kit`, or a `[lib] name`), not the
+    // package name the request carries, so a lib request takes it by kind.
+    let is_lib = |t: &&TargetInfo| t.kind.iter().any(|k| k == "lib" || k == "rlib");
+    let target = (if target_kind == "lib" { pkg.targets.iter().find(is_lib) } else { None })
+        .or_else(|| pkg.targets.iter().find(|t| t.name == target_name && t.kind.iter().any(|k| k == target_kind)))
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
@@ -1214,6 +1213,32 @@ mod tests {
         assert!(unit.package_id.contains("hello 0.1.0"), "{}", unit.package_id);
         check_edition(&unit).unwrap();
         check_lints(&graph, &unit).unwrap();
+    }
+
+    #[test]
+    fn lib_unit_of_a_dashed_package() {
+        // Cargo names the lib target by its crate name (`my_kit` for
+        // package `my-kit`), and a `[lib] name` renames it again, while
+        // `--lib` asks by the package name.
+        let dir = std::env::temp_dir().join(format!("lust-cargo-dashed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("other/rust")).unwrap();
+        let pkg = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        std::fs::write(dir.join("Cargo.toml"), format!("{}\n[workspace]\nmembers = [\"other\"]\n", pkg("my-kit"))).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.join("other/Cargo.toml"), format!("{}\n[lib]\nname = \"renamed\"\npath = \"rust/lib.rs\"\n", pkg("other-pkg"))).unwrap();
+        std::fs::write(dir.join("other/rust/lib.rs"), "").unwrap();
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        for (manifest, package, src) in [("Cargo.toml", "my-kit", "src/lib.rs"), ("other/Cargo.toml", "other-pkg", "rust/lib.rs")] {
+            let req = GraphRequest { manifest_path: dir.join(manifest), default_features: true, ..Default::default() };
+            let graph = load_graph(&req).expect("metadata");
+            let unit = select_unit(&graph, &req, "lib", package, &env, &interner, false).expect("the lib unit");
+            assert_eq!(unit.package.name, package);
+            assert!(unit.target.src_path.ends_with(src), "{}", unit.target.src_path.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
