@@ -39,6 +39,7 @@ pub const KNOWN_CFG_NAMES: &[&str] = &[
     "overflow_checks",
     "debug_assertions",
     "test",
+    "doctest",
     "docsrs",
     "fuzzing",
     "miri",
