@@ -10820,12 +10820,15 @@ impl<'p> Ctx<'p> {
     /// rustc's expectation does, instead of joining the branch types
     /// first (ARCH 2.8). Also a fn pointer type that names a lifetime of
     /// the fn (W-BORROW3): a method with the impl's early-bound lifetime
-    /// fits it, never the joined pointer type of the branches.
+    /// fits it, never the joined pointer type of the branches. And a
+    /// reference to a slice whose element is still open (`&[?T]`, an
+    /// argument of `Vec::new().extend_from_slice`): `&[u8; 2]` and
+    /// `&[u8; 3]` branches each unsize to it, where their join fails.
     fn dyn_ref_expectation(&self, expected: Option<Ty>) -> Option<Ty> {
         let t = self.resolve(expected?);
         match self.kind(t) {
             TyKind::FnPtr(s) if self.tys.sig(s).value.free_slots != 0 => Some(t),
-            TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..)) => Some(t),
+            TyKind::Ref(_, _, inner) if matches!(self.kind(inner), TyKind::Dyn(..) | TyKind::Slice(_)) => Some(t),
             TyKind::Adt(..) if self.tys.smart_elem(t).is_some_and(|e| matches!(self.kind(self.resolve(e)), TyKind::Dyn(..))) => Some(t),
             TyKind::Adt(..) if own::own_parts(&self.tys, t).is_some_and(|(_, e)| matches!(self.kind(e), TyKind::Slice(_)) || own::dyn_wrapped_elem(&self.tys, e).is_some()) => {
                 Some(t)
