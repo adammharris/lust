@@ -9,6 +9,41 @@
 // in src/ty/lang.rs, fx-stdos): this partial module must not
 // hide `std::os::unix::fs` items that resolved before it.
 
+/// `std::os::raw`: the C type aliases, as `core::ffi` defines them on
+/// 64-bit Linux. Not here: `c_void`.
+pub mod raw {
+    /// `char` in C: unsigned on aarch64 Linux, signed on x86_64.
+    #[cfg(target_arch = "aarch64")]
+    pub type c_char = u8;
+    /// `char` in C: unsigned on aarch64 Linux, signed on x86_64.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub type c_char = i8;
+    /// `signed char` in C.
+    pub type c_schar = i8;
+    /// `unsigned char` in C.
+    pub type c_uchar = u8;
+    /// `short` in C.
+    pub type c_short = i16;
+    /// `unsigned short` in C.
+    pub type c_ushort = u16;
+    /// `int` in C.
+    pub type c_int = i32;
+    /// `unsigned int` in C.
+    pub type c_uint = u32;
+    /// `long` in C (LP64).
+    pub type c_long = i64;
+    /// `unsigned long` in C (LP64).
+    pub type c_ulong = u64;
+    /// `long long` in C.
+    pub type c_longlong = i64;
+    /// `unsigned long long` in C.
+    pub type c_ulonglong = u64;
+    /// `float` in C.
+    pub type c_float = f32;
+    /// `double` in C.
+    pub type c_double = f64;
+}
+
 /// `std::os::fd`: raw and owned Unix file descriptors, as std
 /// defines them on Linux. `borrow_raw` and `from_raw_fd` are
 /// `unsafe` in std; lust source cannot spell `unsafe fn`, so they

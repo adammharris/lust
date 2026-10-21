@@ -1,7 +1,8 @@
 // `std::ffi` (W-SHIM): `OsStr` and `OsString` as on Unix, raw bytes
 // with no encoding promise, plus `CStr` (tf-adapters: the borrowed
-// NUL-terminated form rustix `RawDir` names return). `CString`, the
-// `c_*` type aliases, and `FromBytesUntilNulError` forms are not here.
+// NUL-terminated form rustix `RawDir` names return), and the `c_*` type
+// aliases of 64-bit Linux (as `std::os::raw`). `CString`, `c_void`, and
+// `FromBytesUntilNulError` forms are not here.
 //
 // `OsStr` is an unsized newtype over `[u8]` (the compiler lays it out
 // as its field; shipped source may turn `&[u8]` into `&OsStr`).
@@ -11,6 +12,37 @@ use alloc::borrow::Cow;
 use core::cmp::Ordering;
 use core::fmt;
 use core::ops::Deref;
+
+/// `char` in C: unsigned on aarch64 Linux, signed on x86_64.
+#[cfg(target_arch = "aarch64")]
+pub type c_char = u8;
+/// `char` in C: unsigned on aarch64 Linux, signed on x86_64.
+#[cfg(not(target_arch = "aarch64"))]
+pub type c_char = i8;
+/// `signed char` in C.
+pub type c_schar = i8;
+/// `unsigned char` in C.
+pub type c_uchar = u8;
+/// `short` in C.
+pub type c_short = i16;
+/// `unsigned short` in C.
+pub type c_ushort = u16;
+/// `int` in C.
+pub type c_int = i32;
+/// `unsigned int` in C.
+pub type c_uint = u32;
+/// `long` in C (LP64).
+pub type c_long = i64;
+/// `unsigned long` in C (LP64).
+pub type c_ulong = u64;
+/// `long long` in C.
+pub type c_longlong = i64;
+/// `unsigned long long` in C.
+pub type c_ulonglong = u64;
+/// `float` in C.
+pub type c_float = f32;
+/// `double` in C.
+pub type c_double = f64;
 
 /// Borrowed platform string: a byte slice on Unix.
 pub struct OsStr {
