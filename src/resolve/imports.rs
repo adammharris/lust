@@ -1983,6 +1983,15 @@ impl ResolvedTables {
         None
     }
 
+    /// The root module of the dependency the extern prelude names
+    /// `name` in `module`'s crate, when lust compiles it from source in
+    /// this session (`extern_target`).
+    pub fn source_extern_root(&self, module: ModuleId, name: Sym, interner: &Interner) -> Option<ModuleId> {
+        let root = self.root_of(module);
+        let n = interner.get(name);
+        self.externs.iter().find(|e| e.owner == root && e.name == n).and_then(|e| e.root_module)
+    }
+
     /// The path target an extern prelude entry resolves to: the
     /// dependency crate's root module when lust compiles it from
     /// source in this session, else the extern root itself.
@@ -3187,6 +3196,31 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     }
                     _ => TryOut::Wait,
                 };
+            }
+            // `pub use dep as kit;` and `use dep;`: with no binding of
+            // its own here, the one segment is the extern prelude entry
+            // of a dependency lust compiles from source, whose root is a
+            // module of these tables. The use binds that module, as
+            // `use ::dep as kit;` does.
+            if path.len() == 1
+                && !imp.leading_colon
+                && tables.lookup(imp.module, Namespace::Type, path[0]).is_none()
+                && let Some(src) = tables.source_extern_root(imp.module, path[0], interner)
+            {
+                let bind_name = import_bind_name(*name, Target::Module(src), interner);
+                let dup = explicit_exists(tables, imp, Namespace::Type, bind_name);
+                let out = tables.insert(
+                    imp.module,
+                    Namespace::Type,
+                    bind_name,
+                    Bind { target: Target::Module(src), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
+                );
+                if dup && interner.get(*name) != "_" {
+                    diags.push(dup_diag(imp, *name, interner));
+                } else {
+                    report_dup(out, imp, *name, interner, diags);
+                }
+                return TryOut::Done(out == InsertOut::Changed);
             }
             // `use std;` and `use std as s;`: the one segment names
             // the extern crate root itself, so there is no module

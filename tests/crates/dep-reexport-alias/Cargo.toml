@@ -1,0 +1,12 @@
+# A dependency crate re-exported under a new name (`pub use util_a as
+# helpers;`), which a module then reads as `crate::helpers`, and a plain
+# `pub use util_a;` re-export of it under its own name.
+[package]
+name = "dep-reexport-alias"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+util-a = { path = "util" }
+
+[workspace]
