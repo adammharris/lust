@@ -1024,6 +1024,15 @@ pub fn select_unit(
                 .as_ref()
                 .and_then(|m| m.get(&(pkg.id_repr.clone(), lib.name.clone())).cloned())
                 .unwrap_or_else(|| features.clone());
+            // A bin's dependencies are its lib's. A test crate's also hold its
+            // dev-dependencies, which the lib never sees: one that depends back
+            // on the package (`k` dev-depends on `d`, `d` on `k`) would make the
+            // lib a dependent of itself.
+            let lib_deps = if test_crate {
+                build_deps(graph, pkg, &lib_features, env, interner, false, &check_map, &mut vec![pkg.id_repr.clone()])
+            } else {
+                deps.clone()
+            };
             deps.insert(
                 0,
                 DepUnit {
@@ -1040,7 +1049,7 @@ pub fn select_unit(
                     build_cfgs: Vec::new(),
                     build_check_cfgs: Vec::new(),
                     features: lib_features,
-                    deps: deps.clone(),
+                    deps: lib_deps,
                     lust_source: false,
                 },
             );

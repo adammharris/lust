@@ -3,4 +3,10 @@ name = "test-integration"
 version = "0.1.0"
 edition = "2024"
 
+# Depends back on this package: the integration test sees the lib twice,
+# directly and through `wrap`, and both are the one plain lib.
+[dev-dependencies]
+wrap = { path = "wrap" }
+
 [workspace]
+members = ["wrap"]

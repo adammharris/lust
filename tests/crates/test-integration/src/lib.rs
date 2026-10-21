@@ -1,3 +1,8 @@
+pub mod names {
+    #[derive(Debug, PartialEq)]
+    pub struct Name(pub String);
+}
+
 pub fn greet(name: &str) -> String {
     format!("hello, {name}")
 }

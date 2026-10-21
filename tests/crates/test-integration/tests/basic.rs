@@ -13,6 +13,12 @@ fn runs_in_the_package_dir() {
     assert_eq!(std::path::Path::new(&dir).join("Cargo.toml").is_file(), true);
 }
 
+#[test]
+fn through_a_dev_dependency() {
+    let n: test_integration::names::Name = wrap::Name("lust".into());
+    assert_eq!(wrap::api::shout(&n), "LUST");
+}
+
 mod more {
     #[test]
     fn nested() {
