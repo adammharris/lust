@@ -8133,6 +8133,45 @@ fn static_only(tys: &GlobalTys, t: Ty) -> bool {
     }
 }
 
+/// True when the only regions a type holds are its references': no raw
+/// pointer, fn pointer, trait object, or lifetime argument
+/// (`CollectCx::fn_item`).
+fn refs_only(tys: &GlobalTys, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::RawPtr(..) | TyKind::FnPtr(_) | TyKind::Dyn(..) => false,
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => refs_only(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| refs_only(tys, e)),
+        TyKind::Adt(_, a) => tys.args(a).iter().all(|g| match g {
+            GenericArg::Ty(e) => refs_only(tys, *e),
+            GenericArg::Lifetime(_) => false,
+            GenericArg::Const(_) => true,
+        }),
+        _ => true,
+    }
+}
+
+/// True when every reference a written type holds is written `&'static`
+/// (`&'static str`, `Option<&'static [u8]>`): none is elided.
+fn refs_written_static(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
+    let go = |t: ast::TyId| refs_written_static(ast, interner, t);
+    match ast.ty(id) {
+        TyExpr::Ref { lifetime, inner, .. } => lifetime.is_some_and(|l| interner.get(l.name) == "static") && go(*inner),
+        TyExpr::Paren(inner) | TyExpr::Slice(inner) => go(*inner),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => go(*inner),
+        TyExpr::Tuple(elems) => elems.iter().all(|&e| go(e)),
+        TyExpr::Path(segs) => segs.iter().all(|s| match &s.args {
+            ast::GenericArgs::Angle(a) => a.iter().all(|g| match g {
+                ast::GenericArg::Type(t) => go(*t),
+                _ => true,
+            }),
+            ast::GenericArgs::None => true,
+            _ => false,
+        }),
+        TyExpr::Unit => true,
+        _ => false,
+    }
+}
+
 /// True when a type holds no reference, raw pointer, fn pointer, trait
 /// object, or lifetime argument (`CollectCx::fn_item`).
 fn region_free(tys: &GlobalTys, t: Ty) -> bool {
@@ -8338,19 +8377,41 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
         // references only: each one is late-bound, as the written
         // pointer type's are. With no params every lifetime in the
         // return type is `'static` (W-STD-C).
-        let [seg] = segs else { return None };
-        if !seg.type_args().is_empty() {
-            return None;
-        }
-        let f = match self.span_lookup(seg.name, at).or_else(|| self.scope_lookup(seg.name)) {
-            Some(ScopeItem::Fn(f)) => f,
-            Some(_) => return None,
-            None => *self.p.fn_names.get(&seg.name)?,
+        // Also `Type::method`, a fn of a non-generic inherent impl of a
+        // local non-generic type (fig-core's `const _: fn(Literal) ->
+        // &'static str = Literal::name;`), its `self` the first param.
+        let (f, method) = match segs {
+            [seg] => {
+                if !seg.type_args().is_empty() {
+                    return None;
+                }
+                let f = match self.span_lookup(seg.name, at).or_else(|| self.scope_lookup(seg.name)) {
+                    Some(ScopeItem::Fn(f)) => f,
+                    Some(_) => return None,
+                    None => *self.p.fn_names.get(&seg.name)?,
+                };
+                (f, false)
+            }
+            [ty_seg, seg] => {
+                if ty_seg.has_args() || !seg.type_args().is_empty() {
+                    return None;
+                }
+                let adt = *self.p.type_names.get(&ty_seg.name)?;
+                if self.p.gx.adt_generics.get(adt.0 as usize).is_none_or(|g| !g.params.is_empty()) {
+                    return None;
+                }
+                let def = self.p.def_of_adt(adt);
+                let [f] = self.p.gx.inherent_methods.get(&(def, seg.name))?.as_slice() else { return None };
+                if self.p.gx.inherent_self_pats.get(f).is_none_or(|(_, g)| !g.params.is_empty()) {
+                    return None;
+                }
+                (*f, true)
+            }
+            _ => return None,
         };
         let info = self.p.fn_info(f);
         let q = &info.def(&self.p.ast).qual;
-        if info.owner.is_some()
-            || info.self_kind.is_some()
+        if (!method && (info.owner.is_some() || info.self_kind.is_some()))
             || q.is_async
             || q.is_unsafe
             || q.abi.is_some()
@@ -8362,7 +8423,10 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             return None;
         }
         let (params, ret) = (info.params.clone(), info.ret);
-        if !params.is_empty() && !region_free(&self.p.tys, ret) {
+        // A return type whose references are all written `&'static`
+        // (`-> &'static str`) keeps no link to an input either.
+        let ret_static = info.def(&self.p.ast).ret.is_some_and(|r| refs_written_static(&self.p.ast, &self.p.interner, r)) && refs_only(&self.p.tys, ret);
+        if !params.is_empty() && !region_free(&self.p.tys, ret) && !ret_static {
             return None;
         }
         // The fn's param types erase a written `'static` (and any
@@ -8376,7 +8440,13 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
         let inputs = self.p.tys.intern_tys(&params);
         // With no params, every reference the fn returns is `'static`
         // (elision): the pointer type keeps that (W-BORROW3).
-        let ret = if params.is_empty() { static_refs_in(&mut self.p.tys, ret) } else { ret };
+        let ret = if params.is_empty() {
+            static_refs_in(&mut self.p.tys, ret)
+        } else if ret_static {
+            crate::check::const_body::all_static(&mut self.p.tys, ret)
+        } else {
+            ret
+        };
         let sig = self.p.tys.intern_sig(crate::ty::Binder::plain(crate::ty::FnSig::plain(inputs, ret)));
         let t = self.p.tys.intern(TyKind::FnPtr(sig));
         Some((crate::ty::consteval::ConstValue::FnPtr(f.0), t))
