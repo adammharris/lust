@@ -114,6 +114,13 @@ pub enum CTy {
     /// tuple form held it). Its own type so its Debug glue writes core's
     /// text (`IntoIter { inner: Item { opt: .. } }`), not a tuple's.
     OptIter(bool, Box<CTy>),
+    /// A `core::ops` range in a Debug glue key only (cgen/fmt.rs
+    /// `dbg_cty`): its range kind (`fmt::range_code`) and the tuple of
+    /// its stored fields, the CTy `cty` makes for it. Every other use
+    /// sees that tuple (`strip_ranges`): the C type is the tuple's, and
+    /// only the Debug glue name and body differ, so `Option<Range<T>>`
+    /// prints `Some(1..2)`, not `Some((1, 2))`.
+    Range(u8, Box<CTy>),
     /// A `vec::Drain<T>`: the runtime's `lust_VecDrain`, a pointer to
     /// the drained Vec plus its range bookkeeping.
     VecDrain(Box<CTy>),
@@ -578,6 +585,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::VecIter(_) => "lust_VecIter".into(),
         CTy::ArrayIter(..) => format!("AI_{}", mangle(t)),
         CTy::OptIter(..) => format!("OI_{}", mangle(t)),
+        CTy::Range(_, inner) => ctype(inner),
         CTy::VecDrain(_) | CTy::StrDrain => "lust_VecDrain".into(),
         CTy::Weak(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::RefCell(inner) => format!("RCL_{}", mangle(inner)),
@@ -587,8 +595,8 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Ptr(inner) => format!("{}*", ctype(inner)),
         CTy::FatPtr(inner) => ctype(inner),
         CTy::Adt(a) => names::adt(*a),
-        CTy::Option(_) => format!("O_{}", mangle(t)),
-        CTy::Result(..) => format!("R_{}", mangle(t)),
+        CTy::Option(_) => format!("O_{}", plain_mangle(t)),
+        CTy::Result(..) => format!("R_{}", plain_mangle(t)),
         CTy::ExitCode => "uint8_t".into(),
         CTy::AccessError => "lust_Unit".into(),
         CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
@@ -596,9 +604,9 @@ pub fn ctype(t: &CTy) -> String {
         CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) => "lust_dyn".into(),
         CTy::Sync(k, e) => sync::sync_ctype(*k, e),
         CTy::Chars => "lust_Chars".into(),
-        CTy::Tuple(_) => format!("Tup_{}", mangle(t)),
-        CTy::Array(..) => format!("Arr_{}", mangle(t)),
-        CTy::Slice(_) => format!("Sl_{}", mangle(t)),
+        CTy::Tuple(_) => format!("Tup_{}", plain_mangle(t)),
+        CTy::Array(..) => format!("Arr_{}", plain_mangle(t)),
+        CTy::Slice(_) => format!("Sl_{}", plain_mangle(t)),
         CTy::Float(f) => (*f).name().replace("f64", "double").replace("f32", "float"),
         CTy::FnPtr(..) => format!("Fp_{}", mangle(t)),
         CTy::Dyn => "lust_dyn".into(),
@@ -678,6 +686,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::VecIter(e) => tok(s, "VI", &[e]),
         CTy::ArrayIter(e, n) => tok(s, &format!("AI{n}"), &[e]),
         CTy::OptIter(r, e) => tok(s, if *r { "RI" } else { "OI" }, &[e]),
+        CTy::Range(k, e) => tok(s, &format!("RG{k}"), &[e]),
         CTy::VecDrain(e) => tok(s, "VD", &[e]),
         CTy::StrDrain => tok(s, "SDr", &[]),
         CTy::Weak(e) => tok(s, "Wk", &[e]),
@@ -714,6 +723,11 @@ fn str_of(v: &str, t: &CTy) -> String {
 }
 
 fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
+    // A Debug key's range marks (`fmt::dbg_cty`) declare no types of
+    // their own: the plain types they stand for.
+    if has_range_mark(t) {
+        return collect_types(&strip_ranges(t), out);
+    }
     match t {
         CTy::Adt(_) => {
             out.insert(t.clone());
@@ -872,6 +886,9 @@ fn opens_nothing(b: Builtin) -> bool {
 
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
+    if has_range_mark(t) {
+        return by_value_deps(&strip_ranges(t), out);
+    }
     match t {
         CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) | CTy::ArrayIter(..) | CTy::OptIter(..) => {
             out.push(t.clone())
@@ -1673,6 +1690,7 @@ fn c_layout_walk(p: &Program, t: &CTy) -> Option<Layout> {
             }
             // As the one-field tuple form it replaces.
             CTy::OptIter(_, e) => go(p, &CTy::Tuple(vec![CTy::Option(e.clone())]), seen),
+            CTy::Range(_, inner) => go(p, inner, seen),
             CTy::Array(e, 0) => Some(plain_layout(0, go(p, e, seen).map_or(1, |l| l.align))),
             CTy::Array(e, n) => layout::array_layout(&go(p, e, seen)?, *n).ok(),
             CTy::Option(e) => {
@@ -2012,6 +2030,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 (es * (*n).max(1), ea)
             }
             CTy::OptIter(_, e) => go(p, &CTy::Tuple(vec![CTy::Option(e.clone())]), seen),
+            CTy::Range(_, inner) => go(p, inner, seen),
             CTy::ArrayIter(e, n) => {
                 let (es, ea) = go(p, e, seen);
                 let align = ea.max(8);
@@ -6243,6 +6262,18 @@ impl FnGen<'_, '_> {
             let (v, t) = self.operand(o, loc, post);
             vals.push(v);
             tys.push(t);
+        }
+        // A formatting builder's value formats as `{:?}` does: its range
+        // marks (`fmt::dbg_cty`) from the operand's own type.
+        if matches!(b, B::DsField | B::DtField | B::DlEntry | B::DmKey | B::DmValue | B::DmEntry) {
+            for (i, o) in ops.iter().enumerate() {
+                if let Operand::Copy(pl) | Operand::Move(pl) = o
+                    && let Some(t) = self.place_sem_ty(pl)
+                    && crate::check::collect::contains_range(&self.body.tys, t)
+                {
+                    tys[i] = fmt::dbg_cty(&self.body.tys, t);
+                }
+            }
         }
         let int_of = |t: &CTy| match t {
             CTy::Int(i) => *i,
@@ -13081,6 +13112,40 @@ fn zst_out_glue(g: &Glue, t: &CTy, def: &str, protos: &mut String, defs: &mut St
     defs.push_str(&body);
 }
 
+/// True when `t` holds a `CTy::Range` mark (in the shapes `strip_ranges` walks).
+fn has_range_mark(t: &CTy) -> bool {
+    match t {
+        CTy::Range(..) => true,
+        CTy::Option(e) | CTy::Vec(e) | CTy::Boxed(e) | CTy::Ref(e) | CTy::Slice(e) | CTy::Array(e, _) => has_range_mark(e),
+        CTy::Result(a, e) => has_range_mark(a) || has_range_mark(e),
+        CTy::Tuple(es) => es.iter().any(has_range_mark),
+        _ => false,
+    }
+}
+
+/// The mangle a C type name uses: a range mark's type is its tuple's.
+fn plain_mangle(t: &CTy) -> String {
+    if has_range_mark(t) { mangle(&strip_ranges(t)) } else { mangle(t) }
+}
+
+/// `t` without its `CTy::Range` marks (`fmt::dbg_cty` makes them, in the
+/// shapes it walks): the type the C code and layouts see.
+pub fn strip_ranges(t: &CTy) -> CTy {
+    let b = |e: &CTy| Box::new(strip_ranges(e));
+    match t {
+        CTy::Range(_, inner) => strip_ranges(inner),
+        CTy::Option(e) => CTy::Option(b(e)),
+        CTy::Result(a, e) => CTy::Result(b(a), b(e)),
+        CTy::Vec(e) => CTy::Vec(b(e)),
+        CTy::Boxed(e) => CTy::Boxed(b(e)),
+        CTy::Ref(e) => CTy::Ref(b(e)),
+        CTy::Slice(e) => CTy::Slice(b(e)),
+        CTy::Array(e, n) => CTy::Array(b(e), *n),
+        CTy::Tuple(es) => CTy::Tuple(es.iter().map(strip_ranges).collect()),
+        _ => t.clone(),
+    }
+}
+
 /// `glue_def` for every glue whose value C returns directly.
 #[allow(clippy::too_many_arguments)]
 fn glue_def_value(
@@ -13094,13 +13159,15 @@ fn glue_def_value(
     types: &mut Vec<CTy>,
 ) {
     let m = mangle(t);
-    let ct = ctype(t);
+    // A Debug key with range marks is its plain type in C.
+    let lt = strip_ranges(t);
+    let ct = ctype(&lt);
     let mut need = |g: Glue, t: &CTy| more.push((g, t.clone()));
     let mut body = String::new();
     // Discriminant reads and the Option payload access for the enum
     // shaped glue arms below (unused strings for other shapes).
-    let disc_p = disc_call(p, t, "p");
-    let pf = variant_field(p, t, "(*p)", 1, 0);
+    let disc_p = disc_call(p, &lt, "p");
+    let pf = variant_field(p, &lt, "(*p)", 1, 0);
     // The `clonefrom` glue handles every shape itself (an owning
     // fat pointer takes the default body there).
     if matches!(g, Glue::CloneFrom) {

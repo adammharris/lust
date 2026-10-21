@@ -539,8 +539,8 @@ pub fn check_fmt_impl(p: &mut Program, imp: &ast::ImplDef, tr: TraitRef, self_pa
 /// A range kind a `{:?}` argument of type `t` names through plain
 /// references, with its bound type (unit for `..`) and the reference
 /// count: core's range Debug, which lowering writes as format parts at
-/// the site (lower/range_fmt.rs). Ranges have no Debug glue, so a range
-/// inside another type is not Debug in lust.
+/// the site (lower/range_fmt.rs). A range inside another type formats
+/// through Debug glue (cgen/fmt.rs `dbg_cty`).
 pub fn range_fmt_kind(tys: &impl TyIntern, t: Ty) -> Option<(crate::ty::iter::IterKind, Ty, u32)> {
     let mut t = t;
     let mut refs = 0;

@@ -3,9 +3,9 @@
 //! formatter (its flags and width), with the separators written plain:
 //! `start.fmt(f)?; write!(f, "..")?; end.fmt(f)`, and `RangeInclusive`
 //! adds " (exhausted)" when its flag is set. Lowering spells that out
-//! as format parts at the format site (`fmt_parts`); the glue has no
-//! range form, so check takes only a range a format argument names
-//! through plain references (`range_fmt_kind`).
+//! as format parts at the format site (`fmt_parts`) for a range a
+//! format argument names through plain references (`range_fmt_kind`);
+//! a range inside another type uses Debug glue (cgen/fmt.rs `dbg_cty`).
 
 use super::*;
 use crate::ty::iter::IterKind;

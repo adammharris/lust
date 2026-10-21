@@ -10237,6 +10237,23 @@ pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     glue_debug(p, tys, t, &mut GlueSeen::default())
 }
 
+/// True when `t` holds a `core::ops` range in a std shape: itself, or
+/// under a reference, a tuple, an array, a slice, or a std Adt's type
+/// arguments (cgen's `dbg_cty` marks the ranges of these shapes).
+pub fn contains_range(tys: &impl TyIntern, t: Ty) -> bool {
+    if crate::ty::iter::iter_parts(tys, t).is_some_and(|(k, _)| k.is_range()) {
+        return true;
+    }
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => contains_range(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| contains_range(tys, e)),
+        TyKind::Adt(..) if tys.local_adt(t).is_none() => {
+            tys.adt_parts(t).is_some_and(|(_, a)| tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| contains_range(tys, e))))
+        }
+        _ => false,
+    }
+}
+
 /// The walk behind `has_debug`; `seen` stops recursive generic types.
 fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     if let Some(b) = cow_arg(tys, t) {
@@ -10246,6 +10263,15 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
     // (check/own.rs): a reject, even for `dyn Any`.
     if crate::check::own::dyn_wrapped_elem(tys, t).is_some() {
         return false;
+    }
+    // A range (core's Debug: its bounds' with `..` between): the Debug
+    // glue of cgen's `dbg_cty` mark. A range bound that holds a range is
+    // not marked.
+    if let Some((k, a)) = crate::ty::iter::iter_parts(tys, t)
+        && k.is_range()
+    {
+        let bound = a.first().copied().unwrap_or(UNIT);
+        return !contains_range(tys, bound) && glue_debug(p, tys, bound, seen);
     }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
@@ -10282,6 +10308,13 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
                 || crate::ty::fmt::fmt_kind(tys, t) == Some(crate::ty::fmt::FmtTy::Arguments)
             {
                 return true;
+            }
+            // cgen's `dbg_cty` marks ranges under `Option`, `Result`,
+            // `Vec`, and `Box` only: a range in another std type's
+            // element would print as its tuple.
+            let marked = tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() || tys.boxed_elem(t).is_some() || tys.result_args(t).is_some();
+            if !marked && contains_range(tys, t) {
+                return false;
             }
             match crate::check::sync::sync_glue(tys, t, crate::check::sync::SyncGlue::Debug) {
                 Some(Ok(b)) => return b,

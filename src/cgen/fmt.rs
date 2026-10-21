@@ -161,8 +161,93 @@ fn builder_list(n: &str, elem: &str, et: &CTy, need: &mut dyn FnMut(Glue, &CTy))
     )
 }
 
+/// The `CTy::Range` code of a `core::ops` range kind.
+fn range_code(k: crate::ty::iter::IterKind) -> Option<u8> {
+    use crate::ty::iter::IterKind as K;
+    Some(match k {
+        K::Range => 0,
+        K::RangeFrom => 1,
+        K::RangeTo => 2,
+        K::RangeToInclusive => 3,
+        K::RangeFull => 4,
+        K::RangeInclusive => 5,
+        _ => return None,
+    })
+}
+
+/// The CTy that formats `t` with `{:?}`: `cty`, with each range (in the
+/// shapes `check::collect::has_debug` admits a range under: references,
+/// `Box`, `Option`, `Result`, `Vec`, arrays, slices, tuples) marked as a
+/// `CTy::Range`, so its Debug glue writes core's range text (`1..3`)
+/// where the tuple's would write `(1, 3)`.
+pub(super) fn dbg_cty(tys: &impl TyIntern, t: Ty) -> CTy {
+    let c = cty(tys, t);
+    if !crate::check::collect::contains_range(tys, t) {
+        return c;
+    }
+    let b = |e: Ty| Box::new(dbg_cty(tys, e));
+    if let Some((k, _)) = crate::ty::iter::iter_parts(tys, t)
+        && let Some(code) = range_code(k)
+    {
+        return CTy::Range(code, Box::new(c));
+    }
+    match (tys.kind(t), c) {
+        (TyKind::Ref(_, _, e), CTy::Ref(_)) => CTy::Ref(b(e)),
+        (TyKind::Ref(_, _, e), CTy::Slice(_)) | (TyKind::Slice(e), CTy::Slice(_)) => match tys.kind(e) {
+            TyKind::Slice(el) => CTy::Slice(b(el)),
+            _ => CTy::Slice(b(e)),
+        },
+        (TyKind::Array(e, _), CTy::Array(_, n)) => CTy::Array(b(e), n),
+        (TyKind::Tuple(ts), CTy::Tuple(_)) => CTy::Tuple(tys.tys_of(ts).iter().map(|&e| dbg_cty(tys, e)).collect()),
+        (_, CTy::Option(_)) => CTy::Option(b(tys.option_elem(t).unwrap_or(ERROR))),
+        (_, CTy::Vec(_)) => CTy::Vec(b(tys.vec_elem(t).unwrap_or(ERROR))),
+        (_, CTy::Boxed(_)) => CTy::Boxed(b(tys.boxed_elem(t).unwrap_or(ERROR))),
+        (_, CTy::Result(..)) => {
+            let (a, e) = tys.result_args(t).unwrap_or((ERROR, ERROR));
+            CTy::Result(b(a), b(e))
+        }
+        (_, c) => c,
+    }
+}
+
+/// The body of `dbg_<m>` for a range: core 1.99's Debug for the six
+/// `core::ops` kinds formats each bound with `f` (its flags and width)
+/// and writes the separators plain (`write!(f, "..")`), and
+/// `RangeInclusive` adds " (exhausted)" when its flag is set.
+fn range_glue_body(code: u8, inner: &CTy, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let es: Vec<CTy> = match inner {
+        CTy::Tuple(es) => es.clone(),
+        _ => Vec::new(),
+    };
+    let mut bound = |i: usize| match es.get(i) {
+        Some(e) => fmt_expr(e, FmtKind::Debug, "f", &format!("(&p->f{i})"), need),
+        None => "0".to_string(),
+    };
+    let sep = |s: &str| format!("lust_f_write_str(f, {})", lit(s));
+    let steps: Vec<String> = match code {
+        0 => vec![bound(0), sep(".."), bound(1)],
+        1 => vec![bound(0), sep("..")],
+        2 => vec![sep(".."), bound(0)],
+        3 => vec![sep("..="), bound(0)],
+        4 => vec![sep("..")],
+        _ => vec![bound(0), sep("..="), bound(1), format!("(p->f2 ? {} : 0)", sep(" (exhausted)"))],
+    };
+    let mut body = String::from("  (void)p;\n");
+    for s in steps {
+        let _ = writeln!(body, "  if ({s}) return 1;");
+    }
+    body.push_str("  return 0;\n");
+    body
+}
+
 /// The body of `dbg_<m>`: Rust's Debug for `t`, through the builders.
 pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+    if let CTy::Range(code, inner) = t {
+        return range_glue_body(*code, inner, need);
+    }
+    // A key with range marks inside (`Option<Range<T>>`): the plain type
+    // for the C accessors, `t` itself for the elements' glue.
+    let lt = crate::cgen::strip_ranges(t);
     // `PhantomData<T>`: core's `write!(f, "PhantomData<{}>", type_name::<T>())`,
     // which ignores the width and fill. Check admits only a `T` lust can
     // name (`collect::phantom_debug_text`).
@@ -199,16 +284,16 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dy
     if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {
         return format!("  {decl}\n  return {};\n", fmt_expr(&rb, FmtKind::Debug, "f", "(&v_)", need));
     }
-    let disc_p = disc_call(p, t, "p");
+    let disc_p = disc_call(p, &lt, "p");
     let mut body = String::new();
     match t {
         CTy::Option(inner) => {
-            let some = builder_fields("Some", false, &[(String::new(), format!("&{}", variant_field(p, t, "(*p)", 1, 0)), (**inner).clone())], need);
+            let some = builder_fields("Some", false, &[(String::new(), format!("&{}", variant_field(p, &lt, "(*p)", 1, 0)), (**inner).clone())], need);
             let _ = writeln!(body, "  if ({disc_p}) {some}\n  return lust_f_write_str(f, {});", lit("None"));
         }
         CTy::Result(a, b) => {
-            let ok = builder_fields("Ok", false, &[(String::new(), format!("&{}", variant_field(p, t, "(*p)", 0, 0)), (**a).clone())], need);
-            let err = builder_fields("Err", false, &[(String::new(), format!("&{}", variant_field(p, t, "(*p)", 1, 0)), (**b).clone())], need);
+            let ok = builder_fields("Ok", false, &[(String::new(), format!("&{}", variant_field(p, &lt, "(*p)", 0, 0)), (**a).clone())], need);
+            let err = builder_fields("Err", false, &[(String::new(), format!("&{}", variant_field(p, &lt, "(*p)", 1, 0)), (**b).clone())], need);
             let _ = writeln!(body, "  if ({disc_p}) {err}\n  {ok}");
         }
         CTy::Tuple(es) => {
@@ -352,7 +437,7 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dy
                     // rustc prints the source name.
                     let name = p.display_name(v.name);
                     let fields: Vec<(String, String, CTy)> =
-                        v.fields.iter().enumerate().map(|(fi, fd)| (p.name(fd.name).to_string(), format!("&{}", access(fi)), cty(&p.tys, fd.ty))).collect();
+                        v.fields.iter().enumerate().map(|(fi, fd)| (p.name(fd.name).to_string(), format!("&{}", access(fi)), dbg_cty(&p.tys, fd.ty))).collect();
                     builder_fields(name, v.shape == VariantShape::Named, &fields, need)
                 };
                 if adt.is_enum {
@@ -602,6 +687,7 @@ fn may_fail(t: &CTy) -> bool {
         CTy::Unsized(..) => true,
         CTy::Result(a, b) => may_fail(a) || may_fail(b),
         CTy::Tuple(es) => es.iter().any(may_fail),
+        CTy::Range(_, e) => may_fail(e),
         // A `format_args!` value formats its own arguments.
         CTy::Fmt(crate::ty::fmt::FmtTy::Arguments) => true,
         _ => false,
@@ -820,7 +906,7 @@ impl FnGen<'_, '_> {
                 }
                 FmtPart::Arg { value, ty, spec, width, prec, .. } => {
                     let (v, vt) = self.fmt_operand(value, env, loc, post);
-                    let t = cty(&self.body.tys, *ty);
+                    let t = if spec.kind == FmtKind::Debug { dbg_cty(&self.body.tys, *ty) } else { cty(&self.body.tys, *ty) };
                     // An unsized `str` or `[T]` argument arrives as its
                     // fat value; the formatters take a pointer to it.
                     let ptr = if self.unsized_arg(*ty) {
@@ -831,7 +917,7 @@ impl FnGen<'_, '_> {
                         v
                     };
                     let mut want: Vec<(Glue, CTy)> = Vec::new();
-                    self.note_fmt_opens(&t, spec.kind);
+                    self.note_fmt_opens(&crate::cgen::strip_ranges(&t), spec.kind);
                     let e = fmt_expr(&t, spec.kind, &format!("(&{s}f)"), &ptr, &mut |g, t| want.push((g, t.clone())));
                     for (g, t) in want {
                         self.want(g, &t);
@@ -1254,7 +1340,7 @@ impl FnGen<'_, '_> {
                 }
                 FmtPart::Arg { value, ty, spec, width, prec, .. } => {
                     let (v, vt) = self.operand(value, loc, post);
-                    let t = cty(&self.body.tys, *ty);
+                    let t = if spec.kind == FmtKind::Debug { dbg_cty(&self.body.tys, *ty) } else { cty(&self.body.tys, *ty) };
                     let ptr = if self.unsized_arg(*ty) {
                         let tmp = self.tmp();
                         let _ = writeln!(self.out, "    {} {tmp} = {v};", ctype(&vt));
@@ -1263,7 +1349,7 @@ impl FnGen<'_, '_> {
                         v
                     };
                     let mut want: Vec<(Glue, CTy)> = Vec::new();
-                    self.note_fmt_opens(&t, spec.kind);
+                    self.note_fmt_opens(&crate::cgen::strip_ranges(&t), spec.kind);
                     let e = fmt_expr(&t, spec.kind, &format!("(&{s}f)"), &ptr, &mut |g, t| want.push((g, t.clone())));
                     for (g, t) in want {
                         self.want(g, &t);
