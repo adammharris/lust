@@ -842,19 +842,22 @@ pub fn build_dir(manifest: &Path, env: Option<&[(String, String)]>) -> Option<Pa
 /// (graph key plus watch stamp) in this process, and on disk (see `features_disk_path`): its answer does
 /// not depend on the sources. Returns None when the run fails; the caller then falls back
 /// to resolve-node features and the session still works for single-package
-/// graphs.
-fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
+/// graphs. A feature request Cargo refuses (`--features x` of a package with
+/// no `x`, which `cargo metadata` takes when another member has it) is an
+/// error, as in Cargo: the fallback's workspace-wide features would build
+/// another unit than the one asked for.
+fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Result<Option<std::collections::HashMap<(String, String), Vec<String>>>, String> {
     let key = graph.key;
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, std::collections::HashMap<(String, String), Vec<String>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(v) = cache.lock().unwrap().get(&key) {
-        return Some(v.clone());
+        return Ok(Some(v.clone()));
     }
     let disk = features_disk_path(graph);
     if let Some(map) = disk.as_deref().and_then(read_features_file) {
         cache.lock().unwrap().insert(key, map.clone());
-        return Some(map);
+        return Ok(Some(map));
     }
     let mut cmd = crate::resolve::probe::check_command(&req.manifest_path, &req.target_triple, req.env.as_deref());
     if let Some(pkg) = &req.package {
@@ -870,7 +873,13 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         cmd.arg("--all-features");
     }
     cmd.args(req.cargo_net.args());
-    let out = cmd.output().ok()?;
+    let Ok(out) = cmd.output() else { return Ok(None) };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if let Some(line) = err.lines().find(|l| l.starts_with("error:") && l.contains("feature")) {
+            return Err(line.trim_start_matches("error:").trim_start().to_string());
+        }
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut map = std::collections::HashMap::new();
     for line in text.lines() {
@@ -884,13 +893,13 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         map.insert((pkg, target), feats);
     }
     if map.is_empty() {
-        return None;
+        return Ok(None);
     }
     if let Some(path) = disk {
         write_features_file(&path, &map);
     }
     cache.lock().unwrap().insert(key, map.clone());
-    Some(map)
+    Ok(Some(map))
 }
 
 /// The disk cache file of `unit_features_via_check`:
@@ -990,7 +999,7 @@ pub fn select_unit(
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
-    let check_map = if simple_graph { None } else { unit_features_via_check(req, graph) };
+    let check_map = if simple_graph { None } else { unit_features_via_check(req, graph)? };
     let features = check_map
         .as_ref()
         .and_then(|m| m.get(&(pkg.id_repr.clone(), target.name.clone())).cloned())
@@ -1309,6 +1318,32 @@ mod tests {
             assert_eq!(unit.package.name, package);
             assert!(unit.target.src_path.ends_with(src), "{}", unit.target.src_path.display());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_feature_the_package_lacks_is_an_error() {
+        // `cargo metadata --features x` takes a feature another member has;
+        // `cargo check` of the asked package refuses it, and so does lust,
+        // rather than building the workspace's unified features.
+        let dir = std::env::temp_dir().join(format!("lust-cargo-nofeat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(m).join("src")).unwrap();
+            std::fs::write(dir.join(m).join("src/lib.rs"), "").unwrap();
+        }
+        let pkg = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"3\"\n").unwrap();
+        std::fs::write(dir.join("a/Cargo.toml"), format!("{}\n[features]\nx = []\n", pkg("a"))).unwrap();
+        std::fs::write(dir.join("b/Cargo.toml"), pkg("b")).unwrap();
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let req = GraphRequest { manifest_path: dir.join("b/Cargo.toml"), features: vec!["x".into()], default_features: true, ..Default::default() };
+        let err = match load_graph(&req) {
+            Ok(graph) => select_unit(&graph, &req, "lib", "b", &env, &interner, false).err(),
+            Err(e) => Some(e),
+        };
+        assert!(err.as_deref().is_some_and(|e| e.contains("feature")), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
