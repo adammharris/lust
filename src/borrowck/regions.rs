@@ -1583,6 +1583,52 @@ fn param_covered_regions(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<Region
     }
 }
 
+/// True when `b` (the same shape as `a`, as for `param_covered_regions`)
+/// holds only `'static` data in every place where `a` has a type param or
+/// a projection: no region but `'static`, and nothing (a type param, a
+/// dyn, an opaque, a fn pointer, a closure) whose regions are not written.
+fn static_at_params(tys: &impl TyIntern, a: Ty, b: Ty) -> bool {
+    match (tys.kind(a), tys.kind(b)) {
+        (TyKind::Param(_) | TyKind::Projection(..), _) => static_closed(tys, b),
+        (TyKind::Ref(_, _, x), TyKind::Ref(_, _, y))
+        | (TyKind::Array(x, _), TyKind::Array(y, _))
+        | (TyKind::Slice(x), TyKind::Slice(y))
+        | (TyKind::RawPtr(_, x), TyKind::RawPtr(_, y)) => static_at_params(tys, x, y),
+        (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+            let (x, y) = (tys.tys_of(x).to_vec(), tys.tys_of(y).to_vec());
+            x.len() == y.len() && x.into_iter().zip(y).all(|(x, y)| static_at_params(tys, x, y))
+        }
+        (TyKind::Adt(da, xa), TyKind::Adt(db, xb)) if da == db => {
+            tys.args(xa).to_vec().into_iter().zip(tys.args(xb).to_vec()).all(|(x, y)| match (x, y) {
+                (GenericArg::Ty(x), GenericArg::Ty(y)) => static_at_params(tys, x, y),
+                _ => true,
+            })
+        }
+        (TyKind::Adt(..) | TyKind::Tuple(_) | TyKind::Ref(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::RawPtr(..), _) => false,
+        _ => true,
+    }
+}
+
+/// True when `t` holds no region but `'static` and no part whose regions
+/// are not written in it (see `static_at_params`).
+fn static_closed(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Unit | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str => true,
+        TyKind::Ref(r, _, e) => r == Region::Static && static_closed(tys, e),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => static_closed(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).to_vec().into_iter().all(|e| static_closed(tys, e)),
+        TyKind::Adt(_, args) => {
+            !tys.is_chars_ty(t)
+                && tys.args(args).to_vec().into_iter().all(|g| match g {
+                    GenericArg::Ty(e) => static_closed(tys, e),
+                    GenericArg::Lifetime(r) => r == Region::Static,
+                    GenericArg::Const(_) => true,
+                })
+        }
+        _ => false,
+    }
+}
+
 /// The pairs of regions at the same places of two regioned types (a
 /// callee's bound and the argument's signature, `entail_bound`); a type
 /// param or projection on either side (an instantiation) pairs nothing.
@@ -8888,6 +8934,14 @@ impl<'b, 'p> Builder<'b, 'p> {
         };
         if let (Some(ins), Some(r)) = (g.inputs.iter().map(|&t| bare(t)).collect::<Option<Vec<u32>>>(), bare(out))
             && self.flow_by_signature(t, &ins, r, binds)
+        {
+            return;
+        }
+        // A source whose output holds only `'static` data where `G`'s output
+        // has its type params (`fn f(v: &V) -> &'static [u8]` for `Fn(&V) ->
+        // T`) returns nothing of what it takes.
+        if let Some(Some((_, Some(s_out), _))) = self.source_fn_sig(t, n_in)
+            && static_at_params(&p.tys, out, s_out)
         {
             return;
         }
