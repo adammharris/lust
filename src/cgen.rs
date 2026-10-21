@@ -8390,7 +8390,7 @@ impl FnGen<'_, '_> {
                 CTy::Dyn => format!("(({0}).data == ({1}).data && ({0}).vt == ({1}).vt)", vals[0], vals[1]),
                 _ => format!("((void*)({0}).ptr == (void*)({1}).ptr && ({0}).len == ({1}).len)", vals[0], vals[1]),
             },
-            B::PtrEqFn | B::PtrAddrEqFn => format!("({} == {})", ptr_addr(&vals[0], &tys[0]), ptr_addr(&vals[1], &tys[1])),
+            B::PtrEqFn | B::PtrAddrEqFn | B::PtrFnAddrEqFn => format!("({} == {})", ptr_addr(&vals[0], &tys[0]), ptr_addr(&vals[1], &tys[1])),
             B::PtrIsNull => format!("({} == 0)", ptr_addr(&vals[0], &tys[0])),
             B::PtrCast => ptr_addr(&vals[0], &tys[0]),
             B::PtrCastMut => vals[0].clone(),

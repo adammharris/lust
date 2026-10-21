@@ -724,6 +724,8 @@ pub enum Builtin {
     PtrEqFn,
     /// `core::ptr::addr_eq`: address equality only.
     PtrAddrEqFn,
+    /// `core::ptr::fn_addr_eq`: address equality of two fn pointers.
+    PtrFnAddrEqFn,
     /// Raw pointer methods by value (w-cinterop): `is_null`.
     PtrIsNull,
     /// `cast`: the address at a new (sized) pointee.
@@ -2081,6 +2083,8 @@ struct Ctx<'p> {
     /// `[x; n]` element types still open at the repeat (`[None; N]`,
     /// whose `Option<?T>` a later use fixes): tested for Copy at body end.
     deferred_array_repeat: Vec<(Ty, Span)>,
+    /// `ptr::fn_addr_eq` operand types: each must be a fn pointer.
+    deferred_fn_ptr: Vec<(Ty, Span)>,
     /// `Range<{integer}>::len` and kin: the element must end as one of
     /// core's exact-size range integers (check/iter.rs `exact_size`).
     deferred_exact_range: Vec<(Ty, bool, Span)>,
@@ -2647,6 +2651,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_copy: Vec::new(),
         deferred_repeat_n: Vec::new(),
         deferred_array_repeat: Vec::new(),
+        deferred_fn_ptr: Vec::new(),
         deferred_exact_range: Vec::new(),
         deferred_io_copy: Vec::new(),
         stmt_expr: None,
@@ -12732,6 +12737,7 @@ impl<'p> Ctx<'p> {
                 ("ptr", "null") | ("ptr", "null_mut") => Some(Builtin::PtrNull),
                 ("ptr", "eq") => Some(Builtin::PtrEqFn),
                 ("ptr", "addr_eq") => Some(Builtin::PtrAddrEqFn),
+                ("ptr", "fn_addr_eq") => Some(Builtin::PtrFnAddrEqFn),
                 _ => None,
             };
             if let Some(b) = b {
@@ -15625,6 +15631,27 @@ impl<'p> Ctx<'p> {
                             self.deferred_raw.push((t, span, if is_eq { RawUse::NotDyn("`ptr::eq`") } else { RawUse::Pointee }));
                             self.tys.intern(TyKind::RawPtr(Mut::Shared, t))
                         });
+                        (ps.to_vec(), BOOL)
+                    }
+                    // `fn_addr_eq::<T, U>`: two fn pointers, maybe of
+                    // two signatures. A fn item is none (rustc's `FnPtr`
+                    // bound), so the operands are tested at body end.
+                    Builtin::PtrFnAddrEqFn => {
+                        let written = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs.last().map(|s| s.type_args()).unwrap_or_default(),
+                            _ => Vec::new(),
+                        };
+                        if !matches!(written.len(), 0 | 2) {
+                            self.err("L0105", span, "this function takes two type arguments", "Write two types in the `::<...>`.");
+                        }
+                        let mut one = |i: usize| match written.get(i) {
+                            Some(&w) => self.resolve_written(w),
+                            None => self.new_var(false),
+                        };
+                        let ps = [one(0), one(1)];
+                        for t in ps {
+                            self.deferred_fn_ptr.push((t, span));
+                        }
                         (ps.to_vec(), BOOL)
                     }
                     // `Option::iter(&o)`, `Result::into_iter(r)`, and
@@ -24850,6 +24877,18 @@ impl<'p> Ctx<'p> {
             let t = self.deep(t);
             if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 self.repeat_copy_err(span);
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_fn_ptr) {
+            let t = self.deep(t);
+            if !matches!(self.kind(t), TyKind::FnPtr(_) | TyKind::Error) {
+                let tn = self.tn(t);
+                self.err(
+                    "L0110",
+                    span,
+                    format!("`fn_addr_eq` needs fn pointers, found `{tn}`"),
+                    "Cast a fn item or closure to a fn pointer type first (`f as fn(u8) -> u8`).",
+                );
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_repeat_n) {
