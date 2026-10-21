@@ -1704,10 +1704,8 @@ impl<'b, 'p> Ck<'b, 'p> {
                     if m {
                         self.check_mutability(place, span, st, true);
                     }
-                    let live = match self.activation_live(b, si, rv) {
-                        Some(live) => live,
-                        None => self.live_for(q, Some(ops.len()), &carriers),
-                    };
+                    let mut live = self.live_for(q, Some(ops.len()), &carriers);
+                    self.activation_prune(b, si, rv, &mut live);
                     let p_range = match rv {
                         Rvalue::Subslice { lo, hi, inclusive, .. } => self.subslice_range(dest, lo, hi, *inclusive),
                         _ => None,
@@ -1822,43 +1820,52 @@ impl<'b, 'p> Ck<'b, 'p> {
         self.write_dest(dest, span, &live, st);
     }
 
-    /// The loans a two-phase activation (`&mut` statement `si` of block
-    /// `b`, one of `two_phase_loans` of the call ending it) conflicts
-    /// with: those live after the call, and those the call's operands
-    /// carry in values that hold regions. The call's other operands are
-    /// read before the activation in Rust (into temporaries in MIR), so
-    /// a loan only they read (`self.walk(*c)` with `c = &self.v`) is no
-    /// conflict; a reference operand that carries it (`self.walk2(c)`)
-    /// is (rustc E0502). None for any other statement.
-    fn activation_live(&self, b: u32, si: u32, rv: &Rvalue) -> Option<BitSet> {
+    /// At a two-phase activation (`&mut` statement `si` of block `b`, one
+    /// of `two_phase_loans` of the call ending it), drops from `live` the
+    /// loans only the call's own reads end: the other arguments are read
+    /// before the activation in Rust (into temporaries in MIR), so a loan
+    /// that an argument reads a region-free value through (`self.walk(*c)`
+    /// with `c = &self.v`) is over by then. A loan live after the call, or
+    /// carried by an argument's value (a reference `self.walk2(c)`, or an
+    /// iterator moved in, `v.splice(.., v.iter().copied())`: rustc E0502),
+    /// stays.
+    fn activation_prune(&self, b: u32, si: u32, rv: &Rvalue, live: &mut BitSet) {
         if !self.report || !matches!(rv, Rvalue::Ref(true, _)) {
-            return None;
+            return;
         }
         let block = &self.body.blocks[b as usize];
-        let Terminator::Call { target, args, .. } = &block.term else { return None };
+        let Terminator::Call { target, args, .. } = &block.term else { return };
         let activations = self.two_phase_loans(b, args);
         if !activations.contains(&(si as usize)) {
-            return None;
+            return;
         }
+        let base = self.stmt_base[b as usize];
+        let own: Vec<usize> = activations.iter().map(|&k| self.loan_at[base + k] as usize).collect();
         let mut ops: Vec<&Operand> = args.iter().collect();
         let callee_op;
         if let CallTarget::Indirect(callee) = target {
             callee_op = Operand::Copy(Place::local(*callee));
             ops.insert(0, &callee_op);
         }
-        let carriers = self.carriers(&ops, None);
         let q = self.point_base[b as usize] + block.stmts.len();
-        let mut live = self.live_for(q, None, &carriers);
-        // The call's own activations are in scope at the call, this one
-        // included: no conflict with themselves.
-        let base = self.stmt_base[b as usize];
-        for k in activations {
-            let li = self.loan_at[base + k] as usize;
-            if li < self.loans.len() {
+        let after = self.live_for(q, None, &[]);
+        let candidates: Vec<usize> = bit_iter(live.words()).collect();
+        for li in candidates {
+            if own.contains(&li) || bit_has(after.words(), li) {
+                continue;
+            }
+            // An operand carries the loan unless it is a read through a
+            // dereference of a value that holds no region.
+            let carried = ops.iter().any(|o| match o {
+                Operand::Copy(p) | Operand::Move(p) => {
+                    self.carries(li, p.local) && !(p.proj.contains(&Proj::Deref) && !self.has_regions(self.value_ty(p)))
+                }
+                Operand::Const(_) => false,
+            });
+            if !carried {
                 live.remove(li);
             }
         }
-        Some(live)
     }
 
     /// The statement indexes (in block `b`) of the two-phase `&mut`
