@@ -259,6 +259,17 @@ pub trait CfgRead {
     fn string_text(&self, tok: Tok) -> Option<String>;
 }
 
+/// The token of a cfg value: a literal, also one a macro passed in an
+/// `expr` or `literal` fragment (`target_has_atomic = $size`, as serde's
+/// `atomic_impl!` writes it), which rustc reads as the literal.
+fn cfg_value_tok(tree: Option<&Tt>) -> Option<crate::lexer::Token> {
+    match tree? {
+        Tt::Tok(t) => Some(*t),
+        Tt::Frag(FragKind::Expr | FragKind::Expr2021 | FragKind::Literal, inner, _) if inner.len() == 1 => cfg_value_tok(inner.first()),
+        _ => None,
+    }
+}
+
 fn cfg_expr(trees: &[Tt], i: &mut usize, env: &CfgEnv, st: &impl CfgRead) -> Result<bool, Diag> {
     let span = trees.get(*i).map_or(Span::default(), |t| t.span());
     let Some(name_tok) = tok_at(trees, *i) else {
@@ -297,7 +308,7 @@ fn cfg_expr(trees: &[Tt], i: &mut usize, env: &CfgEnv, st: &impl CfgRead) -> Res
         }
         _ => {
             if tok_at(trees, *i).map(|t| t.tok) == Some(Tok::Eq) {
-                let value = match tok_at(trees, *i + 1) {
+                let value = match cfg_value_tok(trees.get(*i + 1)) {
                     Some(t) => st.string_text(t.tok),
                     None => None,
                 };
