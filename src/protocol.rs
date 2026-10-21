@@ -364,7 +364,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Clone, Default)]
@@ -373,6 +373,8 @@ struct CrateFlags {
     package: Option<String>,
     bin: Option<String>,
     lib: bool,
+    /// `--test <name>`: an integration test target (`lust test` only).
+    test_target: Option<String>,
     features: Vec<String>,
     no_default_features: bool,
     all_features: bool,
@@ -387,6 +389,7 @@ impl CrateFlags {
             || self.package.is_some()
             || self.bin.is_some()
             || self.lib
+            || self.test_target.is_some()
             || !self.features.is_empty()
             || self.no_default_features
             || self.all_features
@@ -580,7 +583,7 @@ fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey 
     // Project dev config fills the feature selection only when the
     // command line named none of its own.
     let had_feature_selection = !key.features.is_empty() || flags.no_default_features || flags.all_features;
-    if flags.manifest_path.is_none() && flags.package.is_none() && flags.bin.is_none() && !flags.lib {
+    if flags.manifest_path.is_none() && flags.package.is_none() && flags.bin.is_none() && !flags.lib && flags.test_target.is_none() {
         if !had_feature_selection {
             apply_dev_config(&mut key, file);
         }
@@ -609,6 +612,11 @@ fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey 
     if flags.lib {
         key.krate.target_kind = "lib".into();
         key.krate.target_name = package;
+    } else if let Some(name) = flags.test_target {
+        // An integration test target (`tests/<name>.rs`) is its own test crate.
+        key.krate.target_kind = "test".into();
+        key.krate.target_name = name;
+        key.krate.test = true;
     } else {
         key.krate.target_kind = "bin".into();
         key.krate.target_name = flags.bin.or_else(|| manifest.as_ref().and_then(|m| selected_bin(m, file))).unwrap_or(package);
@@ -636,12 +644,30 @@ pub fn waits_for_sources(args: &[String]) -> bool {
 
 /// Parses the command line (without the program name). Paths become absolute.
 pub fn parse_args(args: &[String]) -> Option<Invocation> {
+    // The client reads every command line here, and `lust test` is not a
+    // compile request: it goes on to `lust-core`'s test runner.
+    if args.first().is_some_and(|c| c == "test") {
+        return None;
+    }
+    parse_command(args)
+}
+
+/// The crate build of `lust test <root.rs> --manifest-path .. --lib | --test <name>`
+/// (testrun/krate.rs): `args` start with `test`, and the crate flags are
+/// `check`'s and `build`'s plus `--test <name>`. Never called by the client.
+pub fn parse_test_args(args: &[String]) -> Option<Invocation> {
+    args.first().is_some_and(|c| c == "test").then(|| parse_command(args)).flatten()
+}
+
+fn parse_command(args: &[String]) -> Option<Invocation> {
     let mut it = args.iter();
     let cmd = it.next()?;
     if cmd == "daemon" {
         return Some(Invocation::Daemon);
     }
-    if !["check", "build", "run"].contains(&cmd.as_str()) {
+    // `test` is `lust test`'s own crate build (`parse_test_args`): a build
+    // of a test crate, which alone takes `--test <name>`.
+    if !["check", "build", "run", "test"].contains(&cmd.as_str()) {
         return None;
     }
     let mut file = PathBuf::new();
@@ -693,6 +719,9 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             "--bin" => crate_flags.bin = Some(it.next()?.clone()),
             _ if a.starts_with("--bin=") => crate_flags.bin = Some(a["--bin=".len()..].to_string()),
             "--lib" => crate_flags.lib = true,
+            // `lust test` passes these through `parse_args` as a build.
+            "--test" if cmd == "test" => crate_flags.test_target = Some(it.next()?.clone()),
+            _ if cmd == "test" && a.starts_with("--test=") => crate_flags.test_target = Some(a["--test=".len()..].to_string()),
             "--features" => push_features(&mut crate_flags.features, it.next()?)?,
             _ if a.starts_with("--features=") => push_features(&mut crate_flags.features, &a["--features=".len()..])?,
             "--no-default-features" => crate_flags.no_default_features = true,
@@ -714,7 +743,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             _ => return None,
         }
     }
-    if crate_flags.lib && crate_flags.bin.is_some() {
+    if [crate_flags.lib, crate_flags.bin.is_some(), crate_flags.test_target.is_some()].iter().filter(|&&b| b).count() > 1 {
         return None;
     }
     if file.as_os_str().is_empty() {
@@ -1286,7 +1315,7 @@ pub fn cargo_profile(manifest: Option<&Path>, name: &str) -> Result<CargoProfile
 /// Reads package name, package version, and `[[bin]]` tables from manifest
 /// text. Section-gated on purpose: a `name` in `[dependencies]` or a profile
 /// table must never match.
-fn parse_manifest(text: &str) -> (Option<String>, Option<String>, Vec<(String, Option<String>)>) {
+pub(crate) fn parse_manifest(text: &str) -> (Option<String>, Option<String>, Vec<(String, Option<String>)>) {
     let mut package = None;
     let mut version = None;
     let mut bins: Vec<(String, Option<String>)> = Vec::new();

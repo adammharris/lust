@@ -2088,7 +2088,7 @@ fn resolved_setup(
             cargo::select_unit(&graph, &greq, &key.krate.target_kind, &key.krate.target_name, &pre_env, &front.interner, key.krate.test)
                 .map_err(code2)?;
         cargo::mark_source_deps(&mut unit.deps, &key.source_deps);
-        let root_text = std::fs::read_to_string(&unit.target.src_path)
+        let root_text = crate::driver::read_source(&unit.target.src_path)
             .map_err(|e| code2(format!("cannot read {}: {e}", unit.target.src_path.display())))?;
         // Edition and lint gates for the selected unit (section 1.1),
         // rendered against the crate root file.
@@ -2606,7 +2606,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
     }
     let path = req.file.to_string_lossy().to_string();
-    let mut src = match std::fs::read_to_string(&req.file) {
+    let mut src = match crate::driver::read_source(&req.file) {
         Ok(s) => s,
         Err(e) => return Response { stderr: format!("error: cannot read {path}: {e}\n"), code: 2, ..Default::default() },
     };

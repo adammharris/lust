@@ -26,7 +26,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: lust test <file.rs> [filter] [--json] [--list] [--timeout SECONDS] [--max-errors N]";
+mod krate;
+
+const USAGE: &str = "usage: lust test <file.rs> [filter] [--json] [--list] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [--package <name>] [--features <a,b>] [--no-default-features] [--all-features] [filter] [--json] [--list] [--timeout SECONDS]";
 
 struct Opts {
     file: PathBuf,
@@ -78,9 +80,13 @@ struct Outcome {
 }
 
 /// Runs the binary once for test `index`, capturing output and enforcing the timeout.
-fn run_one(bin: &PathBuf, index: usize, name: &str, timeout: Duration) -> Outcome {
+fn run_one(run: &Run, index: usize, name: &str, timeout: Duration) -> Outcome {
     let start = Instant::now();
-    let mut cmd = Command::new(bin);
+    let mut cmd = Command::new(run.bin);
+    if let Some(dir) = run.cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.envs(run.env.iter().cloned());
     cmd.args(std::iter::repeat_n("x", index + 1)).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -321,6 +327,16 @@ fn summary_json(file: &str, hash: &str, build: &str, outcomes: &[Outcome], filte
 
 /// Entry point for `lust test`. Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
+    // A Cargo target (`--manifest-path`, `--lib`, `--test <name>`, ...): krate.rs.
+    if let Some((rest, crate_args)) = krate::split_args(args) {
+        return match parse_opts(&rest) {
+            Ok(o) => krate::run(&o, &crate_args),
+            Err(u) => {
+                eprintln!("{u}");
+                2
+            }
+        };
+    }
     let opts = match parse_opts(args) {
         Ok(o) => o,
         Err(u) => {
@@ -490,12 +506,35 @@ pub fn run(args: &[String]) -> i32 {
         return 101;
     }
 
-    // Run each selected test in its own child process.
+    let cases: Vec<(usize, TestCase)> = selected.iter().cloned().enumerate().collect();
+    let harness_name = harness_path.to_string_lossy().into_owned();
+    let run = Run { bin: &bin, path: &path, hash: &hash, cwd: None, env: &[], rename: Some(&harness_name) };
+    let code = run_cases(&run, &cases, &opts, filtered_out, start);
+    let _ = std::fs::remove_dir_all(session.obj_dir());
+    let _ = std::fs::remove_dir_all(&dir);
+    code
+}
+
+/// What `run_cases` runs: the test binary, the names it reports under, and
+/// the process setup. `rename` is a harness file path that panic text names,
+/// shown as the user's file instead.
+struct Run<'a> {
+    bin: &'a PathBuf,
+    path: &'a str,
+    hash: &'a str,
+    cwd: Option<&'a std::path::Path>,
+    env: &'a [(String, String)],
+    rename: Option<&'a str>,
+}
+
+/// Runs each case (harness index, test) in its own child process and
+/// reports it; returns the exit code (0 when every case passes, else 101).
+fn run_cases(run: &Run, cases: &[(usize, TestCase)], opts: &Opts, filtered_out: usize, start: Instant) -> i32 {
     if !opts.json {
-        println!("running {} tests", selected.len());
+        println!("running {} tests", cases.len());
     }
     let mut outcomes: Vec<Outcome> = Vec::new();
-    for (i, t) in selected.iter().enumerate() {
+    for (i, t) in cases {
         // An ignored test is reported, never run, as in rustc.
         let mut o = if t.ignored {
             Outcome {
@@ -507,11 +546,13 @@ pub fn run(args: &[String]) -> i32 {
                 stderr: String::new(),
             }
         } else {
-            run_one(&bin, i, &t.name, opts.timeout)
+            run_one(run, *i, &t.name, opts.timeout)
         };
         // Panic messages name the harness file; its lines match the user file, so rename it back.
-        o.stderr = o.stderr.replace(&harness_path.to_string_lossy().into_owned(), &path);
-        o.stdout = o.stdout.replace(&harness_path.to_string_lossy().into_owned(), &path);
+        if let Some(h) = run.rename {
+            o.stderr = o.stderr.replace(h, run.path);
+            o.stdout = o.stdout.replace(h, run.path);
+        }
         // A `should_panic` test passes only when it panics, and its
         // output must hold the expected text when one is written.
         // A timeout stays a timeout.
@@ -540,13 +581,15 @@ pub fn run(args: &[String]) -> i32 {
                 "ignored" => "ignored",
                 _ => "FAILED",
             };
-            println!("test {} ... {} ({:.1}ms)", o.name, word, o.duration_ms);
+            // As cargo test names a `should_panic` test.
+            let mark = if t.should_panic.is_some() { " - should panic" } else { "" };
+            println!("test {}{mark} ... {} ({:.1}ms)", o.name, word, o.duration_ms);
         }
         outcomes.push(o);
     }
     let failed = outcomes.iter().filter(|o| matches!(o.status, "fail" | "timeout")).count();
     if opts.json {
-        println!("{}", summary_json(&path, &hash, "ok", &outcomes, filtered_out, start));
+        println!("{}", summary_json(run.path, run.hash, "ok", &outcomes, filtered_out, start));
     } else {
         if failed > 0 {
             println!("\nfailures:");
@@ -573,7 +616,5 @@ pub fn run(args: &[String]) -> i32 {
             filtered_out
         );
     }
-    let _ = std::fs::remove_dir_all(session.obj_dir());
-    let _ = std::fs::remove_dir_all(&dir);
     if failed == 0 { 0 } else { 101 }
 }

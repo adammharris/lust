@@ -195,7 +195,11 @@ A target in a Cargo workspace:
 ```sh
 lust check crates/ts_goport/src/lib.rs --manifest-path crates/ts_goport/Cargo.toml --lib
 lust build crates/ts_goport/src/bin/tsgo.rs --manifest-path crates/ts_goport/Cargo.toml --bin tsgo -o tsgo
+lust test crates/twig-kit/src/lib.rs --manifest-path crates/twig-kit/Cargo.toml --lib [filter]
+lust test crates/twig/tests/api.rs --manifest-path crates/twig/Cargo.toml --test api
 ```
+
+`lust test` of a Cargo target runs the lib's unit tests (`--lib`) or one integration test (`--test <name>`), as `cargo test --lib` and `cargo test --test <name>` do: `cfg(test)` on for that crate only, dev-dependencies in, each test in its own process in the package directory with Cargo's runtime env (`CARGO_MANIFEST_DIR`, `CARGO_PKG_NAME`, ...). Tests in module files and inline modules count, a test that `cfg` turns off is no test, and a test that returns `Result` fails on `Err`. The harness goes into copies of the crate's files in memory, so the files on disk stay as they are (`LUST_TEST_KEEP=1` keeps the generated C and the test binary).
 
 Crate flags work as in Cargo: `--features`, `--no-default-features`, `--all-features`, `--package`, `--target`, `--offline`, `--locked`. A project can drop features from lust dev builds (for example jemalloc) with `dev-exclude-features` in `.lust.toml`. See [docs/dev-features.md](docs/dev-features.md).
 

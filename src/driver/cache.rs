@@ -248,7 +248,7 @@ impl Cache {
     /// Opens the cache for `src_file`. None when turned off or the dir cannot be made.
     pub fn open(src_file: &Path) -> Option<Cache> {
         // A std or adapter source override: the compiler id does not cover that tree.
-        if env_on("LUST_NO_CACHE") || crate::protocol::source_override().is_some() {
+        if env_on("LUST_NO_CACHE") || crate::protocol::source_override().is_some() || crate::driver::has_source_overlay() {
             return None;
         }
         let dir = cache_dir(src_file);

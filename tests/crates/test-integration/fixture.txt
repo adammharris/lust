@@ -1,0 +1,3 @@
+# `lust test --test basic`: an integration test crate over the package's
+# lib, with a shared `mod common;` module file and Cargo's runtime env.
+test=basic

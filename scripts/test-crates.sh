@@ -27,6 +27,11 @@
 #                     `lust check <root> --lib` must both accept (or both
 #                     reject, with expect=); nothing runs. root= names the
 #                     lib root (default src/lib.rs)
+#   test=<lib|name>   run tests instead: `cargo test --lib` (or `--test <name>`)
+#                     and `lust test <root> --manifest-path .. --lib` (or
+#                     `--test <name>`); the sorted `test <name> ... <status>`
+#                     lines and the exit status (zero or not) must match.
+#                     root= defaults to src/lib.rs or tests/<name>.rs
 #   projdir=<name>    the project directory's name in the work dir (default
 #                     proj), for paths Cargo percent-encodes in package ids
 #                     (a space, `#`, a non-ASCII char)
@@ -115,6 +120,7 @@ for dir in "$fixtures"/*/; do
   cargo_pass=""
   stderr_mode=""
   lib=""
+  test_sel=""
   daemon=""
   prog_args=()
   if [ -f "$proj/fixture.txt" ]; then
@@ -130,6 +136,7 @@ for dir in "$fixtures"/*/; do
         cargo) cargo_pass=$v ;;
         stderr) stderr_mode=$v ;;
         lib) lib=$v ;;
+        test) test_sel=$v ;;
         daemon) daemon=$v ;;
         projdir) ;;
         args) # split on spaces by design (see header)
@@ -164,6 +171,30 @@ for dir in "$fixtures"/*/; do
   if [ -n "$lib" ]; then
     cargo_args=(build --manifest-path "$proj/$manifest" --lib)
     lust_args=(check "$proj/$root_file" --manifest-path "$proj/$manifest" --lib)
+  fi
+
+  if [ -n "$test_sel" ]; then
+    # A test fixture: the test targets' per-test results, not one program.
+    if [ "$test_sel" = lib ]; then sel=(--lib); dflt=src/lib.rs; else sel=(--test "$test_sel"); dflt=tests/$test_sel.rs; fi
+    grep -q '^root=' "$proj/fixture.txt" || root_file=$dflt
+    feat=()
+    [ -n "$features" ] && feat=(--features "$features")
+    results() { grep -E '^test .* \.\.\. (ok|FAILED|ignored|TIMEOUT)' "$1" | sed -E 's/ \([0-9.]+ms\)$//' | sort; }
+    (cd "$proj" && timeout 120 cargo test --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}" --target-dir "$case_dir/cargo-target" -- --test-threads 1) >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"
+    cst=$?
+    (cd "$proj" && lust_cc "$lust" test "$proj/$root_file" --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}") >"$case_dir/lust.out" 2>"$case_dir/lust.err"
+    st=$?
+    if is_timeout "$st"; then
+      report bad "$name" "HANG lust test timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    elif [ "$(results "$case_dir/cargo.out")" != "$(results "$case_dir/lust.out")" ] || [ $((cst == 0)) -ne $((st == 0)) ]; then
+      report bad "$name" "results differ (cargo exit $cst, lust exit $st): $(diff <(results "$case_dir/cargo.out") <(results "$case_dir/lust.out") | head -5) $(head -3 "$case_dir/lust.err")"
+    elif ! grep -q '^test ' "$case_dir/cargo.out"; then
+      report bad "$name" "cargo ran no tests: $(tail -3 "$case_dir/cargo.err")"
+    else
+      slow_note "$name" "lust test"
+      report ok "$name"
+    fi
+    continue
   fi
 
   cargo_ok=1

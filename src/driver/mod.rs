@@ -26,6 +26,31 @@ pub(crate) mod release_c;
 pub mod read_cover;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
+
+/// Source texts that stand in for files on disk, by canonical path, for this
+/// process: `lust test` of a Cargo target adds its harness shims to copies of
+/// the crate's files and builds those (testrun.rs). Every crate source read
+/// (the root, module files) goes through `read_source`, and the disk cache is
+/// off while an overlay is set, as under `protocol::source_override`.
+static SOURCE_OVERLAY: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+
+/// Sets this process's source overlay (once; a later call is ignored).
+pub fn set_source_overlay(files: std::collections::HashMap<String, String>) {
+    let _ = SOURCE_OVERLAY.set(files);
+}
+
+/// True when this process has a source overlay.
+pub fn has_source_overlay() -> bool {
+    SOURCE_OVERLAY.get().is_some_and(|m| !m.is_empty())
+}
+
+/// The text of a crate source file: the overlay's, else the file's.
+pub fn read_source(path: &std::path::Path) -> std::io::Result<String> {
+    if let Some(text) = SOURCE_OVERLAY.get().and_then(|m| m.get(&crate::resolve::modules::canonical_string(path))) {
+        return Ok(text.clone());
+    }
+    std::fs::read_to_string(path)
+}
 pub use compile::{Stamps, defer_cc, drop_parked_cc, finish_parked_cc, parked_cc_result, release_bases, sweep_bases};
 pub(crate) use item_oracle::failure as oracle_failure;
 pub(crate) use patch::drop_unkept;

@@ -1901,7 +1901,7 @@ pub fn resolve_crate_with(
         let pre = std::sync::Mutex::new(crate::resolve::prefetch::take().unwrap_or_default());
         let read = |path: &PathBuf| {
             let hit = pre.lock().unwrap().remove(path);
-            hit.or_else(|| std::fs::read_to_string(path).ok())
+            hit.filter(|_| !crate::driver::has_source_overlay()).or_else(|| crate::driver::read_source(path).ok())
         };
         for ((_, canon), text) in seen.iter().zip(par_map(&seen, |(path, _)| read(path))) {
             if let Some(text) = text {
@@ -2064,7 +2064,7 @@ fn add_dep_job(
             "Set `edition = \"2024\"` in the dependency package manifest.",
         ));
     }
-    let root_text = std::fs::read_to_string(&root).map_err(|e| {
+    let root_text = crate::driver::read_source(&root).map_err(|e| {
         Diag::new(
             "L0503",
             Span::default(),
@@ -2266,7 +2266,7 @@ fn outline_mods(
                     let fcanon = modules::canonical_string(&f);
                     let ftext = match shared.text_by_path.get(&fcanon) {
                         Some(t) => t.clone(),
-                        None => match std::fs::read_to_string(&f) {
+                        None => match crate::driver::read_source(&f) {
                             Ok(t) => {
                                 shared.text_by_path.insert(fcanon, t.clone());
                                 t
