@@ -378,14 +378,14 @@ pub struct Program {
     /// (`const_body::Shape`): `check_dirty` may skip the walk while they
     /// hold and no edited header has a signature anon const.
     pub const_sites_shape: super::const_body::Shape,
-    pub type_names: HashMap<Sym, AdtId>,
+    pub type_names: crate::driver::read_cover::NameMap<AdtId>,
     /// Adts with a written `Drop` impl, by written name. Const items
     /// evaluate before the impl index and `gx.drop_methods` exist;
     /// the const evaluator's drop check (`needs_drop_const`) reads
     /// this set instead. Filled in `collect` before const items run.
     pub drop_adts: std::collections::HashSet<AdtId>,
     /// Non-generic type aliases by (flat) name, fully resolved.
-    pub aliases: HashMap<Sym, Ty>,
+    pub aliases: crate::driver::read_cover::NameMap<Ty>,
     pub fn_names: HashMap<Sym, LocalDefId>,
     /// Inherent methods by (template Adt, name), in registration
     /// order. Several inherent impls of one Adt may define the
@@ -1382,8 +1382,8 @@ pub fn resolve_ty(
     ast: &Ast,
     interner: &Interner,
     known: &Known,
-    type_names: &HashMap<Sym, AdtId>,
-    aliases: &HashMap<Sym, Ty>,
+    type_names: &crate::driver::read_cover::NameMap<AdtId>,
+    aliases: &crate::driver::read_cover::NameMap<Ty>,
     tys: &mut impl TyIntern,
     id: ast::TyId,
     self_ty: Option<Ty>,
@@ -1913,8 +1913,8 @@ fn eval_len_layout_query(
     ast: &Ast,
     interner: &Interner,
     known: &Known,
-    type_names: &HashMap<Sym, AdtId>,
-    aliases: &HashMap<Sym, Ty>,
+    type_names: &crate::driver::read_cover::NameMap<AdtId>,
+    aliases: &crate::driver::read_cover::NameMap<Ty>,
     tys: &mut impl TyIntern,
     e: ast::ExprId,
 ) -> Option<u128> {
@@ -3476,9 +3476,9 @@ pub fn collect_reuse(
         fn_siblings: HashMap::default(),
         const_body_reads: Vec::new(),
         const_sites_shape: Default::default(),
-        type_names: HashMap::default(),
+        type_names: crate::driver::read_cover::NameMap::new("type"),
         drop_adts: Default::default(),
-        aliases: HashMap::default(),
+        aliases: crate::driver::read_cover::NameMap::new("alias"),
         fn_names: HashMap::default(),
         methods: Default::default(),
         main: None,

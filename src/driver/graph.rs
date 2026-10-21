@@ -386,7 +386,7 @@ impl Reads {
             return;
         }
         if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
-            v.insert(Read { fingerprint: fingerprint(), failed });
+            v.insert(Read { fingerprint: super::read_cover::muted(fingerprint), failed });
         }
     }
 
@@ -2537,6 +2537,12 @@ impl<'a> Program {
     /// recording door. The resolver tables (W-RESOLVE) answer here
     /// first, so replays see the same answers as `binding`.
     pub(crate) fn binding_res(&self, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
+        super::read_cover::note(super::read_cover::Access::Binding(module, ns, name));
+        // The key of this answer covers the tables it reads.
+        super::read_cover::muted(|| self.binding_res_quiet(module, ns, name))
+    }
+
+    fn binding_res_quiet(&self, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
         // Spliced std source sees no user names (see `STD_MODULE`).
         if module == crate::ty::defs::STD_MODULE {
             return BindingRes::Absent;
@@ -2960,6 +2966,12 @@ impl<'a> Program {
 
     /// The `std_import` answer without recording.
     pub(crate) fn std_import_answer(&self, module: ModuleId, std_mod: Sym, name: Sym) -> bool {
+        super::read_cover::note(super::read_cover::Access::StdImport(module, std_mod, name));
+        // The key of this answer covers the tables it reads.
+        super::read_cover::muted(|| self.std_import_answer_quiet(module, std_mod, name))
+    }
+
+    fn std_import_answer_quiet(&self, module: ModuleId, std_mod: Sym, name: Sym) -> bool {
         let Some(res) = &self.resolved else { return false };
         let roots = |s: Sym| matches!(self.interner.get(s), "std" | "core" | "alloc");
         if self.interner.get(name) == "*" {
@@ -2973,6 +2985,12 @@ impl<'a> Program {
 
     /// The `trait_in_module` answer without recording. See `binding_res`.
     pub(crate) fn trait_in_module_answer(&self, module: ModuleId, trait_def: DefId) -> bool {
+        super::read_cover::note(super::read_cover::Access::TraitInModule(module, trait_def));
+        // The key of this answer covers the tables it reads.
+        super::read_cover::muted(|| self.trait_in_module_answer_quiet(module, trait_def))
+    }
+
+    fn trait_in_module_answer_quiet(&self, module: ModuleId, trait_def: DefId) -> bool {
         use crate::resolve::imports::{BindState, ns_index};
         let Some(res) = &self.resolved else { return true };
         let Some(info) = res.def_info.get(&trait_def) else { return true };

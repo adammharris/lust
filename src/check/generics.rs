@@ -1489,19 +1489,19 @@ pub struct GenericAlias {
 
 pub struct ResolveCx<'x> {
     /// User Adt name to its session-local (template) index.
-    pub type_names: &'x FxMap<Sym, AdtId>,
+    pub type_names: &'x crate::driver::read_cover::NameMap<AdtId>,
     /// User Adt template def and declared type/const parameter
     /// count, by session-local index.
     pub adt_info: &'x [(DefId, usize)],
     /// Lifetime param names of user Adt templates (W-BORROW).
     pub adt_lifetimes: &'x FxMap<DefId, Vec<Sym>>,
     /// User trait name to its def. Lang traits answer after it.
-    pub trait_names: &'x FxMap<Sym, DefId>,
+    pub trait_names: &'x crate::driver::read_cover::NameMap<DefId>,
     /// Type aliases by name (collect pass 1.5). A generic alias's target
     /// is over its own params (`Param(i)`).
-    pub aliases: &'x FxMap<Sym, Ty>,
+    pub aliases: &'x crate::driver::read_cover::NameMap<Ty>,
     /// Generic type aliases (W-BORROW).
-    pub generic_aliases: &'x FxMap<Sym, GenericAlias>,
+    pub generic_aliases: &'x crate::driver::read_cover::NameMap<GenericAlias>,
     pub index: &'x ImplIndex,
     pub lang: &'x LangTraits,
     /// `GenTables::item_index`.
@@ -5565,7 +5565,7 @@ pub struct InstanceInfo {
 pub struct GenTables {
     pub lang: LangTraits,
     pub index: ImplIndex,
-    pub trait_names: FxMap<Sym, DefId>,
+    pub trait_names: crate::driver::read_cover::NameMap<DefId>,
     pub trait_scopes: FxMap<DefId, Scope>,
     pub trait_methods: FxMap<DefId, TraitMethodTemplate>,
     /// Signatures of the lang trait methods, by method def
@@ -5593,7 +5593,7 @@ pub struct GenTables {
     /// param indexes and instance keys as before.
     pub adt_lifetimes: FxMap<DefId, Vec<Sym>>,
     /// Generic type aliases, by name (W-BORROW).
-    pub generic_aliases: FxMap<Sym, GenericAlias>,
+    pub generic_aliases: crate::driver::read_cover::NameMap<GenericAlias>,
     pub adt_generics: Vec<Generics>,
     pub adt_envs: Vec<Vec<Predicate>>,
     pub adt_scopes: Vec<Scope>,
@@ -5832,7 +5832,7 @@ impl Default for GenTables {
         GenTables {
             lang: LangTraits::new(),
             index: ImplIndex::new(),
-            trait_names: FxMap::default(),
+            trait_names: crate::driver::read_cover::NameMap::new("trait"),
             trait_scopes: FxMap::default(),
             trait_methods: FxMap::default(),
             lang_method_sigs: FxMap::default(),
@@ -5842,7 +5842,7 @@ impl Default for GenTables {
             wf_headers: Vec::new(),
             adt_info: Vec::new(),
             adt_lifetimes: FxMap::default(),
-            generic_aliases: FxMap::default(),
+            generic_aliases: crate::driver::read_cover::NameMap::new("generic alias"),
             adt_generics: Vec::new(),
             adt_envs: Vec::new(),
             adt_scopes: Vec::new(),
@@ -5917,11 +5917,11 @@ impl GenTables {
     /// The resolve context over the tables built so far.
     /// `resolve_cx` for an item of spliced std source when `std` is set:
     /// no user type, alias, or trait is visible (see `STD_MODULE`).
-    pub fn resolve_cx_in<'x>(&'x self, type_names: &'x FxMap<Sym, AdtId>, aliases: &'x FxMap<Sym, Ty>, std: bool) -> ResolveCx<'x> {
-        static NO_ADTS: std::sync::LazyLock<FxMap<Sym, AdtId>> = std::sync::LazyLock::new(FxMap::default);
-        static NO_TYS: std::sync::LazyLock<FxMap<Sym, Ty>> = std::sync::LazyLock::new(FxMap::default);
-        static NO_DEFS: std::sync::LazyLock<FxMap<Sym, DefId>> = std::sync::LazyLock::new(FxMap::default);
-        static NO_ALIASES: std::sync::LazyLock<FxMap<Sym, GenericAlias>> = std::sync::LazyLock::new(FxMap::default);
+    pub fn resolve_cx_in<'x>(&'x self, type_names: &'x crate::driver::read_cover::NameMap<AdtId>, aliases: &'x crate::driver::read_cover::NameMap<Ty>, std: bool) -> ResolveCx<'x> {
+        static NO_ADTS: crate::driver::read_cover::NameMap<AdtId> = crate::driver::read_cover::NameMap::new("type");
+        static NO_TYS: crate::driver::read_cover::NameMap<Ty> = crate::driver::read_cover::NameMap::new("alias");
+        static NO_DEFS: crate::driver::read_cover::NameMap<DefId> = crate::driver::read_cover::NameMap::new("trait");
+        static NO_ALIASES: crate::driver::read_cover::NameMap<GenericAlias> = crate::driver::read_cover::NameMap::new("generic alias");
         static NO_ITEMS: std::sync::LazyLock<FxMap<Sym, u32>> = std::sync::LazyLock::new(FxMap::default);
         if !std {
             return self.resolve_cx(type_names, aliases);
@@ -5940,7 +5940,7 @@ impl GenTables {
         }
     }
 
-    pub fn resolve_cx<'x>(&'x self, type_names: &'x FxMap<Sym, AdtId>, aliases: &'x FxMap<Sym, Ty>) -> ResolveCx<'x> {
+    pub fn resolve_cx<'x>(&'x self, type_names: &'x crate::driver::read_cover::NameMap<AdtId>, aliases: &'x crate::driver::read_cover::NameMap<Ty>) -> ResolveCx<'x> {
         ResolveCx {
             type_names,
             adt_info: &self.adt_info,

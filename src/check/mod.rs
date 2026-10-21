@@ -2445,10 +2445,28 @@ pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>)
 pub(crate) fn check_fn_with<'p>(p: &'p Program, fid: LocalDefId, lints: bool) -> (Checked<'p>, Vec<Diag>) {
     // Derive lists the check reads become `Derives` reads (R12).
     // So do const fns the scalar evaluator ran for a length (`Checked`).
-    let (((mut ck, mut errs), noted), called) =
-        scalar_reads::scoped(p.record_reads, || derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid)));
+    let ((((mut ck, mut errs), noted), called), accessed) = crate::driver::read_cover::scoped(|| {
+        scalar_reads::scoped(p.record_reads, || derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid)))
+    });
     derive_delta::record(p, &mut ck.reads, &noted);
     scalar_reads::record(p, &mut ck.reads, &called);
+    // Std source bodies see no user name (`STD_MODULE`): their user-map
+    // lookups only rule a std name in or out, and record no read.
+    let span = p.fn_def(fid).name_span;
+    let std_body = p.std_source_span(span) || p.in_lang_methods(span) || defining_module(p, fid) == crate::ty::defs::STD_MODULE;
+    // Each flat name the check looked up records its type binding read
+    // (`read_cover::names`): the name maps record none of their own.
+    if p.record_reads && !std_body {
+        let module = defining_module(p, fid);
+        for s in crate::driver::read_cover::names(&accessed) {
+            p.binding(&mut ck.reads, module, Namespace::Type, s);
+        }
+    }
+    // `LUST_CHECK_READS`: every table answer the check used has a read.
+    if p.record_reads && errs.is_empty() && !accessed.is_empty() && !std_body {
+        let missing = crate::driver::read_cover::uncovered(p, &ck.reads, &accessed);
+        crate::driver::read_cover::report(p, p.interner.get(p.fn_def(fid).name), &missing);
+    }
     if lints
         && errs.is_empty()
         && let Some(d) = lint_tail(p, fid, &mut ck)
@@ -3639,7 +3657,11 @@ impl<'p> Ctx<'p> {
                 }
                 _ => {}
             }
-            if let Some(a) = p.adt_by_def(def).or_else(|| flat.and_then(|f| p.type_names.get(&f).copied())) {
+            // The flat lookup is covered by the binding read (`LUST_CHECK_READS`):
+            // for a def that is no Adt, a hit is an enum or a named-field
+            // struct of the same name, which give `Other` as a miss does.
+            let flat_adt = |f| crate::driver::read_cover::muted(|| p.type_names.get(&f).copied());
+            if let Some(a) = p.adt_by_def(def).or_else(|| flat.and_then(flat_adt)) {
                 if p.adt(a).is_enum {
                     // A variant import answers with the enum's def in
                     // the binding query; the raw table keeps the variant.
@@ -3670,7 +3692,11 @@ impl<'p> Ctx<'p> {
         if p.static_names.contains_key(&name) {
             return PatIdent::Static;
         }
-        if let Some(&a) = p.type_names.get(&name)
+        // Covered by the value binding read above (`LUST_CHECK_READS`): it
+        // answered no def, so no unit or tuple struct of the name is in
+        // scope (the single-file layer reads this map for it), and a hit is
+        // an enum or a named-field struct.
+        if let Some(&a) = crate::driver::read_cover::muted(|| p.type_names.get(&name))
             && !p.adt(a).is_enum
             && p.adt(a).variants[0].shape != VariantShape::Named
         {
@@ -14176,6 +14202,8 @@ impl<'p> Ctx<'p> {
     /// variables.
     fn written_trait_ref(&mut self, base: Ty, tref: &ast::TraitRefExpr, span: Span) -> Result<TraitRef, Diag> {
         let p = self.p;
+        // The trait's name resolves through the flat maps: its binding read.
+        self.written_path(&tref.path, Namespace::Type);
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let tr =
             generics::resolve_trait_ref(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, &self.body_scope.clone(), base, tref, span)?;
@@ -25559,6 +25587,12 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
             let elem = expected.and_then(|t| self.cx.tys.option_elem(t)).unwrap_or(ERROR);
             let ty = self.cx.tys.mk_option(elem);
             return Some((AdtId(u32::MAX), 0, ty));
+        }
+        // A single name looks the type maps up by flat name: its binding read.
+        if let [seg] = segs
+            && seg.name != p.known.self_type
+        {
+            self.cx.binding(Namespace::Type, seg.name);
         }
         let (adt, variant) = self.self_variant_of(segs)?;
         if p.adt(adt).variants[variant as usize].shape != VariantShape::Unit {

@@ -23,6 +23,7 @@ pub(crate) mod sig_nodes;
 mod span_shift;
 mod session;
 pub(crate) mod release_c;
+pub mod read_cover;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
 pub use compile::{Stamps, defer_cc, drop_parked_cc, finish_parked_cc, parked_cc_result, release_bases, sweep_bases};
