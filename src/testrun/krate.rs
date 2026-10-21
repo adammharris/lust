@@ -18,6 +18,7 @@ use crate::ast::{Ast, Attr, Item, ItemKind, TyExpr};
 use crate::diag::{self, Diag, FileId, SourceMap};
 use crate::driver::{self, Cmd};
 use crate::intern::{Interner, Known};
+use crate::lexer::Tok;
 use crate::{lexer, parser};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -145,10 +146,28 @@ impl Discovery<'_> {
         };
         let ast = match parse_file(path, &src, self.interner, self.known, &self.cargo_env) {
             Ok(a) => a,
-            Err(d) => {
-                self.bad.push((path.to_path_buf(), src, d));
-                return;
-            }
+            // A file whose macros live in another file (`err!` from the
+            // crate root) neither expands nor parses alone: its tests are
+            // found from its tokens. The build reports a real error.
+            Err(d) => match lexer::lex(&src, FileId(0), 0, self.interner) {
+                Ok(lexed) => {
+                    let before = self.tests.len();
+                    let mut cfgs = cfgs.to_vec();
+                    let toks = &lexed.tokens;
+                    let end = toks.iter().position(|t| t.tok == Tok::Eof).unwrap_or(toks.len());
+                    let s = Scan { toks, strings: &lexed.strings, src: &src };
+                    self.scan_items(&s, 0, end, path, owns_dir, module, &[], &mut cfgs);
+                    if self.tests.len() > before && !module.is_empty() {
+                        self.sites.push(ShimSite { path: module.to_vec(), file: path.to_path_buf(), at: src.len() });
+                    }
+                    self.texts.push((path.to_path_buf(), src));
+                    return;
+                }
+                Err(_) => {
+                    self.bad.push((path.to_path_buf(), src, d));
+                    return;
+                }
+            },
         };
         let mut cfgs = cfgs.to_vec();
         if let Some(last) = cfgs.last_mut() {
@@ -235,6 +254,187 @@ impl Discovery<'_> {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+/// One file's tokens, for the token-level test walk (`Discovery::scan_items`).
+struct Scan<'a> {
+    toks: &'a [lexer::Token],
+    strings: &'a [String],
+    src: &'a str,
+}
+
+impl Scan<'_> {
+    fn tok(&self, i: usize) -> Tok {
+        self.toks.get(i).map_or(Tok::Eof, |t| t.tok)
+    }
+    /// The index of the closer of the opener at `i`.
+    fn close_of(&self, i: usize) -> usize {
+        let mut depth = 0usize;
+        for j in i..self.toks.len() {
+            match self.tok(j) {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.toks.len()
+    }
+    fn text(&self, lo: usize, hi: usize) -> &str {
+        self.src.get(self.toks[lo].span.lo as usize..self.toks[hi].span.hi as usize).unwrap_or("")
+    }
+}
+
+/// One outer attribute as the token walk keeps it: its name, its text, and
+/// its first string literal (`should_panic(expected = "..")`, `path = ".."`).
+struct ScanAttr {
+    name: String,
+    text: String,
+    string: Option<String>,
+}
+
+/// The predicate of a `cfg` attribute text, as `cfg_preds` reads it.
+fn cfg_pred_of(text: &str) -> Option<String> {
+    let open = text.find("cfg")? + 3;
+    let open = open + text[open..].find('(')?;
+    let close = text.rfind(')')?;
+    (close > open).then(|| text[open + 1..close].trim().to_string())
+}
+
+impl Discovery<'_> {
+    /// The token-level walk over the items in `s.toks[i..end]`: modules (in
+    /// files and inline), `#[test]` fns, and every other item skipped by its
+    /// delimiters. For a file `parse_file` cannot read alone.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_items(&mut self, s: &Scan, mut i: usize, end: usize, file: &Path, owns_dir: bool, module: &[String], inline: &[String], cfgs: &mut Vec<Vec<String>>) {
+        let mut attrs: Vec<ScanAttr> = Vec::new();
+        while i < end {
+            match s.tok(i) {
+                Tok::Pound if s.tok(i + 1) == Tok::Bang && s.tok(i + 2) == Tok::LBracket => {
+                    // An inner attribute: a `cfg` scopes the whole module.
+                    let close = s.close_of(i + 2);
+                    if let (Tok::Ident(n), Some(last)) = (s.tok(i + 3), cfgs.last_mut())
+                        && self.interner.get(n) == "cfg"
+                        && let Some(p) = cfg_pred_of(s.text(i, close))
+                    {
+                        last.push(p);
+                    }
+                    i = close + 1;
+                    continue;
+                }
+                Tok::Pound if s.tok(i + 1) == Tok::LBracket => {
+                    let close = s.close_of(i + 1);
+                    let name = match s.tok(i + 2) {
+                        Tok::Ident(n) => self.interner.get(n).to_string(),
+                        _ => String::new(),
+                    };
+                    let string = (i..close).find_map(|j| match s.tok(j) {
+                        Tok::Str(k, _) => s.strings.get(k as usize).cloned(),
+                        _ => None,
+                    });
+                    attrs.push(ScanAttr { name, text: s.text(i, close).to_string(), string });
+                    i = close + 1;
+                    continue;
+                }
+                Tok::Pub => {
+                    i += 1;
+                    if s.tok(i) == Tok::LParen {
+                        i = s.close_of(i) + 1;
+                    }
+                    continue;
+                }
+                Tok::Const | Tok::Async | Tok::Unsafe if matches!(s.tok(i + 1), Tok::Fn | Tok::Unsafe | Tok::Extern | Tok::Async) => {
+                    i += 1;
+                    continue;
+                }
+                Tok::Mod if matches!(s.tok(i + 1), Tok::Ident(_)) => {
+                    let Tok::Ident(n) = s.tok(i + 1) else { unreachable!() };
+                    let name = self.interner.get(n).to_string();
+                    let mut path = module.to_vec();
+                    path.push(name.clone());
+                    let mut sub = cfgs.clone();
+                    sub.push(attrs.iter().filter(|a| a.name == "cfg").filter_map(|a| cfg_pred_of(&a.text)).collect());
+                    if s.tok(i + 2) == Tok::LBrace {
+                        let close = s.close_of(i + 2);
+                        let mut inl = inline.to_vec();
+                        inl.push(name);
+                        let before = self.tests.len();
+                        self.scan_items(s, i + 3, close, file, owns_dir, &path, &inl, &mut sub);
+                        if self.tests.len() > before {
+                            self.sites.push(ShimSite { path, file: file.to_path_buf(), at: s.toks[close].span.lo as usize });
+                        }
+                        i = close + 1;
+                    } else {
+                        let path_attr = attrs.iter().find(|a| a.name == "path").and_then(|a| a.string.clone());
+                        if let Ok(f) = crate::resolve::modules::module_file(file, owns_dir, inline, &name, path_attr.as_deref(), s.toks[i].span) {
+                            self.file(&f, path_attr.is_some(), &path, &sub);
+                        }
+                        i += 3;
+                    }
+                }
+                Tok::Fn if matches!(s.tok(i + 1), Tok::Ident(_)) => {
+                    let Tok::Ident(n) = s.tok(i + 1) else { unreachable!() };
+                    let fn_name = self.interner.get(n).to_string();
+                    let mut j = i + 2;
+                    if s.tok(j) == Tok::Lt {
+                        // Generics: a test fn has none, but skip them.
+                        while j < end && s.tok(j) != Tok::LParen {
+                            j += 1;
+                        }
+                    }
+                    let params_close = if s.tok(j) == Tok::LParen { s.close_of(j) } else { j };
+                    let no_params = params_close == j + 1;
+                    let returns = s.tok(params_close + 1) == Tok::Arrow && !(s.tok(params_close + 2) == Tok::LParen && s.tok(params_close + 3) == Tok::RParen);
+                    let mut k = params_close + 1;
+                    while k < end && !matches!(s.tok(k), Tok::LBrace | Tok::Semi) {
+                        k += 1;
+                    }
+                    let body_end = if s.tok(k) == Tok::LBrace { s.close_of(k) } else { k };
+                    if attrs.iter().any(|a| a.name == "test") {
+                        if no_params {
+                            let ignored = attrs.iter().any(|a| a.name == "ignore");
+                            let should_panic = attrs.iter().find(|a| a.name == "should_panic").map(|a| a.string.clone());
+                            let name = module.iter().chain([&fn_name]).cloned().collect::<Vec<_>>().join("::");
+                            self.tests.push(CrateTest {
+                                case: TestCase { name, module: module.to_vec(), fn_name, ignored, should_panic },
+                                mod_cfgs: cfgs.clone(),
+                                fn_cfgs: attrs.iter().filter(|a| a.name == "cfg").filter_map(|a| cfg_pred_of(&a.text)).collect(),
+                                returns,
+                            });
+                        } else {
+                            let d = Diag::new("L0110", s.toks[i + 1].span, format!("test function `{fn_name}` must take no arguments"), format!("Change the signature to `fn {fn_name}() {{ ... }}`."));
+                            self.bad.push((file.to_path_buf(), s.src.to_string(), d));
+                        }
+                    }
+                    i = body_end + 1;
+                }
+                _ => {
+                    // Any other item: to its `;` or its closing brace at this level.
+                    let mut j = i;
+                    while j < end {
+                        match s.tok(j) {
+                            Tok::Semi => break,
+                            Tok::LBrace => {
+                                j = s.close_of(j);
+                                if s.tok(j + 1) != Tok::Semi {
+                                    break;
+                                }
+                            }
+                            Tok::LParen | Tok::LBracket => j = s.close_of(j),
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    i = j + 1;
+                }
+            }
+            attrs.clear();
         }
     }
 }
