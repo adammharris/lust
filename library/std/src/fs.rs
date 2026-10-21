@@ -499,6 +499,36 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
     status(core::intrinsics::sys_rename(bytes_of(from.as_ref()), bytes_of(to.as_ref())))
 }
 
+/// Copies the contents and permissions of one file to another, as std's
+/// Linux `copy`: the source must be a regular file; the destination is
+/// opened write, create, truncate with the source's mode (so a copy onto
+/// itself empties it, as in std), then takes the source's permissions.
+/// Returns the number of bytes copied. std moves the bytes in the kernel
+/// (`copy_file_range`); a read then a write gives the same file.
+pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
+    use crate::io::{Read, Write};
+    let mut reader = File::open(from)?;
+    let reader_metadata = reader.metadata()?;
+    if !reader_metadata.is_file() {
+        return Err(io::Error::simple_message(
+            io::ErrorKind::InvalidInput,
+            "the source path is neither a regular file nor a symlink to a regular file",
+        ));
+    }
+    let perm = reader_metadata.permissions();
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    opts.mode = perm.mode as u32;
+    let mut writer = opts.open(to.as_ref())?;
+    if writer.metadata()?.is_file() {
+        set_permissions(to.as_ref(), perm)?;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let n = reader.read_to_end(&mut buf)?;
+    writer.write_all(&buf)?;
+    Ok(n as u64)
+}
+
 /// The absolute path with every symlink resolved.
 pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     let mut buf: Vec<u8> = Vec::new();
