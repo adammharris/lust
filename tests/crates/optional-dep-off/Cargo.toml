@@ -1,0 +1,16 @@
+# Optional dependencies follow the unit's features, not the whole
+# workspace's resolve. `lib-a` turns on `lib-bad` by default and
+# `lib-good` with `extra` (`dep:` syntax). This package takes `lib-a`
+# without its defaults and with `extra`, while the member `other` takes
+# its defaults, so the workspace resolve has `lib-bad` on. `lib-bad` is
+# valid Rust lust rejects (`unsafe`): a unit that pulled it in fails.
+[package]
+name = "optional-dep-off"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lib-a = { path = "lib-a", default-features = false, features = ["extra"] }
+
+[workspace]
+members = ["lib-a", "lib-bad", "lib-good", "other"]

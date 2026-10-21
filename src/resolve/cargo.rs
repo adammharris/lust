@@ -220,6 +220,9 @@ pub struct DepInfo {
     pub target: Option<String>,
     /// The resolved package id repr, when the resolve graph names it.
     pub pkg: Option<String>,
+    /// An `optional = true` dependency: it joins a unit only when one of
+    /// the unit's features turns it on (`dep_enabled`).
+    pub optional: bool,
 }
 
 /// One Cargo package in the graph.
@@ -245,6 +248,9 @@ pub struct PackageInfo {
     pub targets: Vec<TargetInfo>,
     pub dependencies: Vec<DepInfo>,
     pub features: Vec<String>,
+    /// Each feature with what it turns on (`"dep:x"`, `"x/f"`, `"x?/f"`,
+    /// or another feature), as the manifest's `[features]` lists them.
+    pub feature_table: Vec<(String, Vec<String>)>,
     /// Features the resolve node activated for this package id.
     pub resolved_features: Vec<String>,
 }
@@ -643,6 +649,7 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
                 },
                 target: d.get("target").and_then(|v| v.as_str()).map(str::to_string),
                 pkg: None,
+                optional: d.get("optional").is_some_and(|v| v.as_bool()),
             })
             .collect();
         // Fill each dependency's resolved package by matching the resolve
@@ -702,6 +709,10 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
                     _ => Vec::new(),
                 })
                 .unwrap_or_default(),
+            feature_table: match p.get("features") {
+                Some(Json::Obj(kvs)) => kvs.iter().map(|(k, v)| (k.clone(), v.strings())).collect(),
+                _ => Vec::new(),
+            },
         });
     }
     Ok(CrateGraph { key, watch: Vec::new(), stamp: 0, workspace_root, packages, workspace_members: members })
@@ -968,7 +979,7 @@ pub fn select_unit(
     // them for this unit, recursively. Dev-dependencies join only the
     // selected test crate itself, never its dependencies.
     let mut stack = vec![pkg.id_repr.clone()];
-    let mut deps = build_deps(graph, pkg, env, interner, test_crate, &check_map, &mut stack);
+    let mut deps = build_deps(graph, pkg, &features, env, interner, test_crate, &check_map, &mut stack);
     // A bin, test, example, or bench target of a package with a lib
     // target depends on that lib implicitly (Cargo adds it as an
     // extern named by the lib crate name; it is not in the manifest
@@ -1016,9 +1027,11 @@ pub fn select_unit(
 /// package already on the stack (a dev-dependency cycle, the only cycle
 /// Cargo allows) is not entered again; its unit still appears at the
 /// level where it was first reached.
+#[allow(clippy::too_many_arguments)]
 fn build_deps(
     graph: &CrateGraph,
     pkg: &PackageInfo,
+    features: &[String],
     env: &CfgEnv,
     interner: &crate::intern::Interner,
     test_crate: bool,
@@ -1028,14 +1041,14 @@ fn build_deps(
     let mut out = Vec::new();
     for dep in &pkg.dependencies {
         let kind_ok = dep.kind == "normal" || (test_crate && dep.kind == "dev");
-        if !kind_ok || !dep_target_matches(env, dep.target.as_deref(), interner) {
+        if !kind_ok || !dep_target_matches(env, dep.target.as_deref(), interner) || !dep_enabled(pkg, dep, features) {
             continue;
         }
         let Some(dep_pkg_id) = &dep.pkg else { continue };
         let Some(dep_pkg) = graph.packages.iter().find(|p| &p.id_repr == dep_pkg_id) else { continue };
         let Some(lib) = dep_pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib")) else { continue };
         let extern_name = dep.rename.clone().unwrap_or_else(|| lib.name.replace('-', "_"));
-        let features = check_map
+        let dep_features = check_map
             .as_ref()
             .and_then(|m| m.get(&(dep_pkg.id_repr.clone(), lib.name.clone())).cloned())
             .unwrap_or_else(|| dep_pkg.resolved_features.clone());
@@ -1043,7 +1056,7 @@ fn build_deps(
             Vec::new()
         } else {
             stack.push(dep_pkg.id_repr.clone());
-            let s = build_deps(graph, dep_pkg, env, interner, false, check_map, stack);
+            let s = build_deps(graph, dep_pkg, &dep_features, env, interner, false, check_map, stack);
             stack.pop();
             s
         };
@@ -1060,11 +1073,29 @@ fn build_deps(
             cargo_env: package_cargo_env(dep_pkg, lib),
             build_cfgs: Vec::new(),
             build_check_cfgs: Vec::new(),
-            features,
+            features: dep_features,
             deps: sub,
         });
     }
     out
+}
+
+/// True when a dependency joins a unit with these features: always for a
+/// required one; for an optional one, when an enabled feature turns it on:
+/// the implicit feature of its name, `dep:name`, or `name/feature` (not
+/// the weak `name?/feature`, which only follows it).
+fn dep_enabled(pkg: &PackageInfo, dep: &DepInfo, features: &[String]) -> bool {
+    if !dep.optional {
+        return true;
+    }
+    let key = dep.rename.as_deref().unwrap_or(&dep.name);
+    features.iter().any(|f| f == key)
+        || pkg
+            .feature_table
+            .iter()
+            .filter(|(f, _)| features.contains(f))
+            .flat_map(|(_, v)| v)
+            .any(|e| e.strip_prefix("dep:") == Some(key) || e.split_once('/').is_some_and(|(d, _)| d == key))
 }
 
 /// The edition gate for a selected unit (section 1.1): lust source crates
@@ -1257,6 +1288,54 @@ mod tests {
             assert!(unit.target.src_path.ends_with(src), "{}", unit.target.src_path.display());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn optional_dep_follows_the_unit_features() {
+        // An optional dependency joins a unit only when an enabled feature
+        // turns it on: its implicit feature, `dep:x`, or `x/f`, never the
+        // weak `x?/f`. A required one always joins.
+        let dep = |name: &str, optional: bool| DepInfo {
+            name: name.into(),
+            rename: None,
+            kind: "normal".into(),
+            target: None,
+            pkg: None,
+            optional,
+        };
+        let table = |rows: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
+            rows.iter().map(|(f, v)| (f.to_string(), v.iter().map(|s| s.to_string()).collect())).collect()
+        };
+        let mut pkg = PackageInfo {
+            id_repr: String::new(),
+            name: "p".into(),
+            version: "0.1.0".into(),
+            edition: "2024".into(),
+            manifest_path: PathBuf::new(),
+            authors: Vec::new(),
+            description: None,
+            homepage: None,
+            license: None,
+            license_file: None,
+            repository: None,
+            readme: None,
+            rust_version: None,
+            source: None,
+            targets: Vec::new(),
+            dependencies: Vec::new(),
+            features: Vec::new(),
+            feature_table: Vec::new(),
+            resolved_features: Vec::new(),
+        };
+        pkg.feature_table = table(&[("x", &[]), ("on", &["dep:y"]), ("sub", &["z/f"]), ("weak", &["w?/f"])]);
+        let on = |feats: &[&str], d: &DepInfo| dep_enabled(&pkg, d, &feats.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(on(&[], &dep("req", false)));
+        assert!(!on(&[], &dep("x", true)));
+        assert!(on(&["x"], &dep("x", true)));
+        assert!(on(&["on"], &dep("y", true)));
+        assert!(!on(&["x"], &dep("y", true)));
+        assert!(on(&["sub"], &dep("z", true)));
+        assert!(!on(&["weak"], &dep("w", true)));
     }
 
     #[test]

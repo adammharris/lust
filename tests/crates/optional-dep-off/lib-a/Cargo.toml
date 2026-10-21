@@ -1,0 +1,12 @@
+[package]
+name = "lib-a"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lib-bad = { path = "../lib-bad", optional = true }
+lib-good = { path = "../lib-good", optional = true }
+
+[features]
+default = ["lib-bad"]
+extra = ["dep:lib-good"]
