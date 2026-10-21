@@ -1,12 +1,12 @@
 // `core::iter` overlay (docs/ARCH.md section 3.1; W-STD-C): the sources
-// `once`, `once_with`, `from_fn`, `successors` and their iterator types.
-// The other `core::iter` items (`repeat`, `empty`, `zip`, the adapters, the
+// `once`, `once_with`, `from_fn`, `successors`, `repeat` and their iterator
+// types. The other `core::iter` items (`empty`, `zip`, the adapters, the
 // iterator traits) stay compiler-known; `std::iter::X` and `core::iter::X`
 // walk into this module only for the names it defines (`STD_MODULES` in
 // src/stdmods.rs).
 //
 // Lust std source, adapted from rust-lang/rust 1.99
-// `core/src/iter/sources/{once,once_with,from_fn,successors}.rs`. Not
+// `core/src/iter/sources/{once,once_with,from_fn,successors,repeat}.rs`. Not
 // here: `FusedIterator` and `TrustedLen` (lust has no such traits, so a
 // bound on them rejects; lowering knows which of these types std marks
 // `TrustedLen`, src/lower/iter.rs `std_trusted_len`). `Once<T>` holds
@@ -186,5 +186,34 @@ where
 impl<T: core::fmt::Debug, F> core::fmt::Debug for Successors<T, F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Successors").field("next", &self.next).finish()
+    }
+}
+
+/// Creates an iterator that endlessly repeats a single element.
+pub fn repeat<T: Clone>(elt: T) -> Repeat<T> {
+    Repeat { element: elt }
+}
+
+/// An iterator that repeats an element endlessly (`repeat`).
+#[derive(Clone, Debug)]
+pub struct Repeat<A> {
+    element: A,
+}
+
+impl<A: Clone> Iterator for Repeat<A> {
+    type Item = A;
+
+    fn next(&mut self) -> Option<A> {
+        Some(self.element.clone())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (usize::MAX, None)
+    }
+}
+
+impl<A: Clone> DoubleEndedIterator for Repeat<A> {
+    fn next_back(&mut self) -> Option<A> {
+        Some(self.element.clone())
     }
 }
