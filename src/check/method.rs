@@ -144,6 +144,9 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         || (trait_def == lang.hash && cx.hash_trait_in_scope(trait_def, "Hash"))
         || (trait_def == lang.hasher && cx.hash_trait_in_scope(trait_def, "Hasher"))
         || (trait_def == lang.build_hasher && cx.hash_trait_in_scope(trait_def, "BuildHasher"))
+        // `fmt::Write` (a user writer, check/fmt.rs): its std path, a
+        // glob of `std::fmt`, or an instance's template bound.
+        || (trait_def == lang.fmt_write && (cx.std_trait_imported("fmt", "Write") || cx.std_glob("fmt") || in_template_env(cx, trait_def)))
     {
         return true;
     }

@@ -428,6 +428,11 @@ pub enum Builtin {
     /// `std::fmt::format(args)` (alloc): `args.to_string()`, the same
     /// code in std (`SpecToString for fmt::Arguments`).
     FmtFormat,
+    /// `core::fmt::write(out, args)`: the `Arguments` into a String, a
+    /// Formatter's sink, or a user writer, piece by piece (core's
+    /// `write`, which takes `&mut dyn Write`; lust takes `&mut W` of
+    /// those writers).
+    FmtWriteFn,
     /// `core::intrinsics::once_init(&slot, v)`: writes `Some(v)` into an
     /// `Option<T>` behind a shared reference. Std source only: the
     /// interior write of `OnceCell`/`OnceLock` (W-STD-C).
@@ -794,6 +799,10 @@ pub enum Builtin {
     FmtFinish,
     FmtFinishNonExhaustive,
     FmtWriteFmt,
+    /// `write_str`, `write_char`, or `write_fmt` on a concrete user
+    /// writer (a written `impl fmt::Write`; check/fmt.rs): the impl's
+    /// method, or core's default for one it leaves out (cgen/fmt.rs).
+    FmtWriteCall,
     FmtCallDisplay,
     FmtCallDebug,
     /// Conversion trait methods on builtin values (W-STD-B,
@@ -2091,6 +2100,8 @@ struct Ctx<'p> {
     deferred_array_repeat: Vec<(Ty, Span)>,
     /// `ptr::fn_addr_eq` operand types: each must be a fn pointer.
     deferred_fn_ptr: Vec<(Ty, Span)>,
+    /// `fmt::write` writer types: a String, a Formatter, or a user writer.
+    deferred_fmt_writer: Vec<(Ty, Span)>,
     /// `Range<{integer}>::len` and kin: the element must end as one of
     /// core's exact-size range integers (check/iter.rs `exact_size`).
     deferred_exact_range: Vec<(Ty, bool, Span)>,
@@ -2430,9 +2441,8 @@ fn use_item_trait_layers(p: &Program, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>
                     }
                 }
                 ast::UseTrait::Std(path) => {
-                    if let Some(last) = path.last()
-                        && let Some(d) = p.gx.lang.by_name(p.interner.get(*last))
-                    {
+                    let names: Vec<&str> = path.iter().map(|s| p.interner.get(*s)).collect();
+                    if let Some(d) = p.gx.lang.by_std_path(&names) {
                         defs.push(d);
                     }
                     paths.push(path.clone());
@@ -2658,6 +2668,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_repeat_n: Vec::new(),
         deferred_array_repeat: Vec::new(),
         deferred_fn_ptr: Vec::new(),
+        deferred_fmt_writer: Vec::new(),
         deferred_exact_range: Vec::new(),
         deferred_io_copy: Vec::new(),
         stmt_expr: None,
@@ -12745,6 +12756,7 @@ impl<'p> Ctx<'p> {
                 ("ptr", "eq") => Some(Builtin::PtrEqFn),
                 ("ptr", "addr_eq") => Some(Builtin::PtrAddrEqFn),
                 ("ptr", "fn_addr_eq") => Some(Builtin::PtrFnAddrEqFn),
+                ("fmt", "write") => Some(Builtin::FmtWriteFn),
                 _ => None,
             };
             if let Some(b) = b {
@@ -15540,6 +15552,16 @@ impl<'p> Ctx<'p> {
                         (vec![t], UNIT)
                     }
                     Builtin::FmtFormat => (vec![crate::ty::fmt::fmt_ty(&mut self.tys, crate::ty::fmt::FmtTy::Arguments)], STRING),
+                    // The writer must be a String, a Formatter, or a user
+                    // `impl fmt::Write` type, tested at body end.
+                    Builtin::FmtWriteFn => {
+                        let w = self.new_var(false);
+                        self.deferred_fmt_writer.push((w, span));
+                        let out = self.tys.mk_ref(true, w);
+                        let args = crate::ty::fmt::fmt_ty(&mut self.tys, crate::ty::fmt::FmtTy::Arguments);
+                        let ret = self.fmt_result_ty();
+                        (vec![out, args], ret)
+                    }
                     Builtin::DiscriminantValue | Builtin::DiscriminantKind => {
                         let t = self.new_var(false);
                         let r = self.tys.mk_ref(false, t);
@@ -17165,6 +17187,9 @@ impl<'p> Ctx<'p> {
         // `write!` (`write_fmt(format_args!(..))`), Formatter and builder
         // methods, and `fmt` on builtin values (check/fmt.rs, W-STD-B).
         if turbofish.is_empty() {
+            if let Some(ret) = self.user_fmt_write_method(e, recv, base, derefs, name, name_span, args) {
+                return ret;
+            }
             if self.p.interner.get(name) == "write_fmt"
                 && let Some(ret) = self.write_fmt_call(e, recv, base, derefs, name_span, args)
             {
@@ -24896,6 +24921,26 @@ impl<'p> Ctx<'p> {
                     format!("`fn_addr_eq` needs fn pointers, found `{tn}`"),
                     "Cast a fn item or closure to a fn pointer type first (`f as fn(u8) -> u8`).",
                 );
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_fmt_writer) {
+            let t = self.deep(t);
+            let builtin = self.tys.is_string_ty(t) || crate::ty::fmt::fmt_kind(&self.tys, t) == Some(crate::ty::fmt::FmtTy::Formatter);
+            let fw = self.p.gx.lang.fmt_write;
+            let implements = self.implements(fw, t);
+            let user = matches!(self.kind(t), TyKind::Adt(..)) && self.tys.builtin_of(t).is_none() && implements;
+            if !builtin && !user && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
+                let tn = self.tn(t);
+                if implements {
+                    self.err(
+                        "L0702",
+                        span,
+                        format!("`fmt::write` into `{tn}` is not supported yet"),
+                        "Pass `&mut` a String, a Formatter, or a value of a type with an `impl fmt::Write`.",
+                    );
+                } else {
+                    self.err("L0612", span, format!("the trait `fmt::Write` is not implemented for `{tn}`"), "Write into a String, or implement `fmt::Write` for the type.");
+                }
             }
         }
         for (t, span) in std::mem::take(&mut self.deferred_repeat_n) {

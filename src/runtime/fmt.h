@@ -34,12 +34,29 @@
 /* One fmt::Write destination. `write` appends n bytes (valid UTF-8 in
    whole chars) and returns 0 or 1. `direct` is the String a plain
    String sink appends to, so leaf code may append there in one step;
-   it is NULL for every other sink. */
+   it is NULL for every other sink. `write_char` is the destination's
+   own `write_char`, which core's Formatter calls for each fill, sign,
+   and quote char (NULL: the char's UTF-8 text goes to `write`), and
+   `keep_empty` makes `Formatter::write_str("")` reach `write`, as core
+   calls `write_str` with it: both are a user writer's (cgen/fmt.rs
+   `fmt_write_glue`), whose methods see every call. */
 typedef struct lust_sink lust_sink;
 struct lust_sink {
     int (*write)(lust_sink *self, const uint8_t *p, uint64_t n);
     lust_String *direct;
+    int (*write_char)(lust_sink *self, uint32_t c);
+    uint8_t keep_empty;
 };
+
+/* A sink over a user `impl fmt::Write` value `self` (its `write_fmt`
+   default): `write` and `write_char` call the writer's methods. */
+typedef struct {
+    lust_sink base;
+    void *self;
+} lust_user_sink;
+void lust_user_sink_init(lust_user_sink *k, void *self, int (*write)(lust_sink *, const uint8_t *, uint64_t), int (*write_char)(lust_sink *, uint32_t));
+/* The UTF-8 bytes of char `c` into `b` (4 bytes): their count. */
+int lust_utf8_char(uint32_t c, uint8_t *b);
 
 /* builders::PadAdapter: indents each line written through it by four
    spaces. `on_newline` is the PadAdapterState it shares. */

@@ -109,6 +109,9 @@ pub struct LangTraits {
     /// `core::hash::Hasher` and `BuildHasher` with its `Hasher` assoc
     /// (W-STD-B, the hashed collections).
     pub hasher: DefId,
+    /// `core::fmt::Write`: `write_str`, and the provided `write_char`
+    /// and `write_fmt` (a user writer; String and Formatter are builtin).
+    pub fmt_write: DefId,
     pub build_hasher: DefId,
     pub assoc_hasher: DefId,
     /// `Iterator::Item`.
@@ -216,6 +219,7 @@ impl LangTraits {
         let to_owned = lang_trait(&["alloc", "borrow"], "ToOwned");
         let to_string = to_string_defs().0;
         let hasher = lang_trait(&["core", "hash"], "Hasher");
+        let fmt_write = lang_trait(&["core", "fmt"], "Write");
         let build_hasher = lang_trait(&["core", "hash"], "BuildHasher");
         let from = lang_trait(&["core", "convert"], "From");
         let into = lang_trait(&["core", "convert"], "Into");
@@ -290,6 +294,7 @@ impl LangTraits {
             any,
             assoc_owned: lang_assoc(to_owned, "Owned"),
             hasher,
+            fmt_write,
             build_hasher,
             assoc_hasher: lang_assoc(build_hasher, "Hasher"),
             assoc_item: lang_assoc(iterator, "Item"),
@@ -336,6 +341,18 @@ impl LangTraits {
     /// True for `Fn`, `FnMut`, and `FnOnce`.
     pub fn is_fn_family(&self, trait_def: DefId) -> bool {
         trait_def == self.fn_ || trait_def == self.fn_mut || trait_def == self.fn_once
+    }
+
+    /// A lang trait by its written std path (`std::fmt::Write`): the
+    /// last segment's lang trait, except that a `Write` names
+    /// `fmt::Write` only through `fmt` (`std::io::Write` is the
+    /// platform crate's trait).
+    pub fn by_std_path(&self, path: &[&str]) -> Option<DefId> {
+        let (&last, rest) = path.split_last()?;
+        if last == "Write" && rest.last() != Some(&"fmt") {
+            return None;
+        }
+        self.by_name(last)
     }
 
     /// A lang trait by its Rust name, for bound resolution.
@@ -398,6 +415,10 @@ impl LangTraits {
             "ToOwned" => self.to_owned,
             "ToString" => self.to_string,
             "Hasher" => self.hasher,
+            // `fmt::Write` only: `io::Write` is the platform crate's
+            // trait, and a path names this one only through `fmt`
+            // (`resolve_trait_path`).
+            "Write" => self.fmt_write,
             "BuildHasher" => self.build_hasher,
             "From" => self.from,
             "Into" => self.into,
@@ -562,6 +583,7 @@ pub fn lang_trait_records(lang: &LangTraits, interner: &Interner, tys: &mut impl
         rec(lang.to_owned, "ToOwned", 0, vec![], vec![(lang.assoc_owned, "Owned")], &["to_owned", "clone_into"]),
         rec(lang.to_string, "ToString", 0, vec![], vec![], &["to_string"]),
         rec(lang.hasher, "Hasher", 0, vec![], vec![], &crate::check::hashmap::HASHER_METHODS),
+        rec(lang.fmt_write, "Write", 0, vec![], vec![], &crate::check::fmt::FMT_WRITE_METHODS),
         rec(lang.build_hasher, "BuildHasher", 0, vec![], vec![(lang.assoc_hasher, "Hasher")], &["build_hasher", "hash_one"]),
         rec(lang.from, "From", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["from"]),
         rec(lang.into, "Into", 1, vec![self_pred(tys, lang.sized, &[])], vec![], &["into"]),
@@ -1225,6 +1247,16 @@ pub fn lang_method_sigs(
                         None => continue,
                     };
                     LangMethodSig { self_kind: Some(RefMut), params: vec![m0, arg], ret: UNIT, ret_borrows_from: None }
+                }
+                // `fmt::Write`: `fn write_str(&mut self, s: &str) -> fmt::Result`,
+                // `write_char(&mut self, c: char)`, `write_fmt(&mut self, args: Arguments<'_>)`.
+                (d, n @ ("write_str" | "write_char" | "write_fmt")) if d == lang.fmt_write => {
+                    let arg = match n {
+                        "write_str" => REF_STR,
+                        "write_char" => CHAR,
+                        _ => crate::ty::fmt::fmt_ty(tys, crate::ty::fmt::FmtTy::Arguments),
+                    };
+                    LangMethodSig { self_kind: Some(RefMut), params: vec![m0, arg], ret: fmt_result_ty(tys), ret_borrows_from: None }
                 }
                 (d, "build_hasher") if d == lang.build_hasher => {
                     let h = proj(tys, lang.assoc_hasher, &[p0]);
@@ -3308,7 +3340,8 @@ pub(crate) fn trait_def_of_path(
     let found = if segs.len() == 1 {
         cx.trait_by_bare_name(interner, last.name)
     } else {
-        cx.lang.by_name(interner.get(last.name)).or_else(|| cx.trait_names.get(&last.name).copied())
+        let path: Vec<&str> = segs.iter().map(|s| interner.get(s.name)).collect();
+        cx.lang.by_std_path(&path).or_else(|| cx.trait_names.get(&last.name).copied())
     };
     found.ok_or_else(|| {
         let n = crate::intern::source_path(interner.get(last.name));
@@ -5785,6 +5818,11 @@ pub struct GenTables {
     /// instance with the impl's `Hasher` type (W-STD-B; iface: W-CGEN
     /// reads these for the hash glue).
     pub hasher_methods: crate::check::spec::Logged<(AdtId, u8), LocalDefId, { crate::check::spec::tab::HASHER_METHODS }>,
+    /// The user `fmt::Write` method instances of one concrete Adt, by
+    /// index into `check::fmt::FMT_WRITE_METHODS` (a method the impl
+    /// leaves out takes core's default in cgen: cgen/fmt.rs
+    /// `user_sink_glue`).
+    pub fmt_write_methods: crate::check::spec::Logged<(AdtId, u8), LocalDefId, { crate::check::spec::tab::FMT_WRITE_METHODS }>,
     pub build_hashers: crate::check::spec::Logged<AdtId, (LocalDefId, Ty), { crate::check::spec::tab::BUILD_HASHERS }>,
     /// The `Iterator` method instances of one concrete Adt whose impl
     /// is generic (`next`, `size_hint`, `next_back`, and the `Item`
@@ -5970,6 +6008,7 @@ impl Default for GenTables {
             fmt_methods: Default::default(),
             deferred_debug_fields: Vec::new(),
             hasher_methods: Default::default(),
+            fmt_write_methods: Default::default(),
             build_hashers: Default::default(),
             iter_methods: Default::default(),
             written_hash: Default::default(),
@@ -8231,6 +8270,7 @@ fn lang_provided(lang: &LangTraits, tr: DefId, name: &str) -> bool {
         "hash_one" => tr == lang.build_hasher,
         "hash_slice" => tr == lang.hash,
         "contains" => tr == lang.range_bounds,
+        "write_char" | "write_fmt" => tr == lang.fmt_write,
         n => tr == lang.hasher && n != "finish" && n != "write",
     }
 }
@@ -9152,6 +9192,17 @@ pub fn add_synthetic_impls(p: &mut Program) {
     // String and the generic builtin containers.
     for tr in [lang.clone, lang.debug, lang.eq, lang.hash, lang.default, lang.partial_eq, lang.partial_ord, lang.ord] {
         insert_synthetic(p, &mut ordinal, tr, STRING, &rhs_of(tr, STRING), g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
+    // `fmt::Write` for String and Formatter (their calls stay builtin,
+    // check/fmt.rs), and core's `impl<W: Write + ?Sized> Write for &mut W`.
+    {
+        let formatter = crate::ty::fmt::fmt_ty(&mut p.tys, crate::ty::fmt::FmtTy::Formatter);
+        for t in [STRING, formatter] {
+            insert_synthetic(p, &mut ordinal, lang.fmt_write, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        let mut g1 = one.clone();
+        g1.predicates = pred_on_p0(p, lang.fmt_write);
+        insert_synthetic(p, &mut ordinal, lang.fmt_write, mut_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
     }
     // Deref and DerefMut, as alloc and core have them: String to str,
     // Vec<T> to [T], &T to T, and &mut T to T (both). Calls of
@@ -11729,7 +11780,7 @@ fn ensure_hash_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
     if p.tys.flags(self_ty).contains_param() {
         return;
     }
-    for trait_def in [p.gx.lang.hasher, p.gx.lang.build_hasher] {
+    for trait_def in [p.gx.lang.hasher, p.gx.lang.build_hasher, p.gx.lang.fmt_write] {
         let args_id = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
         let tr = TraitRef { def: trait_def, args: args_id, bindings: EMPTY_BINDINGS };
         let sel = {
@@ -11739,7 +11790,14 @@ fn ensure_hash_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
         };
         let Selection::Impl { id, args: impl_args, .. } = sel else { continue };
         let record = p.gx.index.get(id).clone();
-        if record.synthetic != Synthetic::None || !prove_goal(p, &[], tr) {
+        // A writer's selected written impl is instantiated even when the
+        // pure solver cannot prove its bounds (`T: From<u8>` at `T = u16`
+        // is a builtin rule of body checking): a writer call reaches its
+        // glue only after the body proved `W: fmt::Write`, and an impl
+        // whose bounds really fail errs in its instance check, a reject
+        // rather than a glue with no method to call.
+        let holds = trait_def == p.gx.lang.fmt_write || prove_goal(p, &[], tr);
+        if record.synthetic != Synthetic::None || !holds {
             continue;
         }
         for d in record.items.clone() {
@@ -11755,7 +11813,11 @@ fn ensure_hash_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
             } else {
                 local
             };
-            if trait_def == p.gx.lang.hasher {
+            if trait_def == p.gx.lang.fmt_write {
+                if let Some(i) = crate::check::fmt::FMT_WRITE_METHODS.iter().position(|m| *m == name) {
+                    p.gx.fmt_write_methods.insert((adt, i as u8), f);
+                }
+            } else if trait_def == p.gx.lang.hasher {
                 if let Some(i) = crate::check::hashmap::HASHER_METHODS.iter().position(|m| *m == name) {
                     p.gx.hasher_methods.insert((adt, i as u8), f);
                 }

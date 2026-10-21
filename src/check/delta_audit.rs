@@ -167,6 +167,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         fmt_methods: _,           // same
         deferred_debug_fields: _, // same
         hasher_methods: _,        // same
+        fmt_write_methods: _,     // same
         build_hashers: _,         // same
         iter_methods: _,          // same
         written_hash: _,          // same

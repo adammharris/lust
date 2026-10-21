@@ -80,6 +80,7 @@ pub mod tab {
     pub const OPAQUE_HIDDEN: u8 = 46;
     pub const TEMPLATE_CHECKS: u8 = 47;
     pub const WRITTEN_PROJECTIONS: u8 = 48;
+    pub const FMT_WRITE_METHODS: u8 = 49;
     /// No table: an arena of a body overlay (`ty::Tys`).
     pub const NONE: u8 = u8::MAX;
 }

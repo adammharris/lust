@@ -608,6 +608,65 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut 
     }
 }
 
+/// The `fmt::Write` glue of a user writer type `t` (an Adt with a
+/// written impl, `gx.fmt_write_methods`): `fws_` (`write_str`), `fwc_`
+/// (`write_char`), and `fwf_` (`write_fmt`) over a `T*`, each the impl's
+/// method instance or core's default, and `fwk_` and `fwkc_`, the
+/// callbacks of a sink over the writer (`lust_user_sink`). Core's
+/// `write_char` writes the char's UTF-8 text with `write_str`, and its
+/// `write_fmt` is `fmt::write` into the writer: through the sink, each
+/// piece, pad, and char a Formatter writes is one call of the writer's
+/// own method, as in core. Each returns 0 (Ok) or 1 (Err).
+pub(super) fn fmt_write_glue(p: &Program, slots: &Slots, t: &CTy, protos: &mut String, defs: &mut String, types: &mut Vec<CTy>) {
+    let CTy::Adt(a) = t else { return };
+    let (m, ct) = (mangle(t), ctype(t));
+    let method = |i: usize| p.gx.fmt_write_methods.get(&(*a, i as u8)).copied();
+    let call = |f: LocalDefId, arg: &str, types: &mut Vec<CTy>| -> String {
+        let ret = cty(&p.tys, p.fn_info(f).ret);
+        let rt = ctype(&ret);
+        let callee = glue_callee(p, slots, f, types);
+        let mut pre = String::new();
+        let args = super::glue_args(p, f, &["self", arg], &mut pre);
+        let pre = pre.replace('\n', "");
+        let disc = disc_call(p, &ret, "(&r)");
+        if ret_is_large(p, f) {
+            format!("  {{{pre} {rt} r; {callee}(&r, {}, {}); return {disc} != 0; }}\n", args[0], args[1])
+        } else {
+            format!("  {{{pre} {rt} r = {callee}({}, {}); return {disc} != 0; }}\n", args[0], args[1])
+        }
+    };
+    let _ = writeln!(protos, "int fws_{m}({ct} *self, lust_str s);");
+    let _ = writeln!(protos, "int fwc_{m}({ct} *self, uint32_t c);");
+    let _ = writeln!(protos, "int fwf_{m}({ct} *self, const lust_Arguments *a);");
+    let _ = writeln!(protos, "int fwa_{m}({ct} *self, const lust_Arguments *a);");
+    let _ = writeln!(protos, "int fwk_{m}(lust_sink *k, const uint8_t *p, uint64_t n);");
+    let _ = writeln!(protos, "int fwkc_{m}(lust_sink *k, uint32_t c);");
+    let write_str = match method(0) {
+        Some(f) => call(f, "s", types),
+        None => "  (void)self; (void)s; abort();\n".to_string(),
+    };
+    let _ = writeln!(defs, "int fws_{m}({ct} *self, lust_str s) {{\n{write_str}}}\n");
+    let write_char = match method(1) {
+        Some(f) => call(f, "c", types),
+        None => format!("  uint8_t b[4]; lust_str s = {{ b, (uint64_t)lust_utf8_char(c, b) }};\n  return fws_{m}(self, s);\n"),
+    };
+    let _ = writeln!(defs, "int fwc_{m}({ct} *self, uint32_t c) {{\n{write_char}}}\n");
+    let write_fmt = match method(2) {
+        Some(f) => call(f, "(*a)", types),
+        None => format!("  return fwa_{m}(self, a);\n"),
+    };
+    let _ = writeln!(
+        defs,
+        "int fwa_{m}({ct} *self, const lust_Arguments *a) {{\n  lust_user_sink k; lust_user_sink_init(&k, self, fwk_{m}, fwkc_{m});\n  return lust_args_write(a, &k.base);\n}}\n"
+    );
+    let _ = writeln!(defs, "int fwf_{m}({ct} *self, const lust_Arguments *a) {{\n{write_fmt}}}\n");
+    let _ = writeln!(
+        defs,
+        "int fwk_{m}(lust_sink *k, const uint8_t *p, uint64_t n) {{\n  return fws_{m}(({ct} *)((lust_user_sink *)k)->self, (lust_str){{ (uint8_t *)p, n }});\n}}\n"
+    );
+    let _ = writeln!(defs, "int fwkc_{m}(lust_sink *k, uint32_t c) {{\n  return fwc_{m}(({ct} *)((lust_user_sink *)k)->self, c);\n}}\n");
+}
+
 /// The call of a user fmt impl's method instance for Adt `a`, as a C
 /// statement that returns 0 or 1, when the program has one. `this` is
 /// the `&self` argument: the glue's `p`, or `*p` for an unsized
@@ -1020,6 +1079,11 @@ fn fmt_result_cty(p: &Program) -> CTy {
 
 impl FnGen<'_, '_> {
     /// The `fmt::Result` value of a runtime result int.
+    /// `fmt_result_of` for code outside this module.
+    pub(super) fn fmt_result_value(&mut self, e: &str) -> String {
+        self.fmt_result_of(e)
+    }
+
     fn fmt_result_of(&mut self, e: &str) -> String {
         let t = fmt_result_cty(self.p);
         let err_ty = match &t {
@@ -1079,6 +1143,27 @@ impl FnGen<'_, '_> {
         };
         let on_string = matches!(tys.first(), Some(CTy::Ref(inner)) if **inner == CTy::String);
         let out = match b {
+            // A user writer's `fmt::Write` method (check/fmt.rs
+            // `user_fmt_write_method`), through its glue: the method
+            // by the argument's type.
+            B::FmtWriteCall => {
+                let w = match tys.first() {
+                    Some(CTy::Ref(w)) => (**w).clone(),
+                    _ => return Some(self.fmt_result_of("1")),
+                };
+                let m = mangle(&w);
+                want.push((Glue::FmtWrite, w));
+                let e = match tys.get(1) {
+                    Some(CTy::Char) => format!("fwc_{m}({}, {})", vals[0], vals[1]),
+                    Some(CTy::Fmt(F::Arguments)) => {
+                        let a = self.tmp();
+                        let _ = writeln!(self.out, "    lust_Arguments {a} = {};", vals[1]);
+                        format!("fwf_{m}({}, &{a})", vals[0])
+                    }
+                    _ => format!("fws_{m}({}, {})", vals[0], vals[1]),
+                };
+                self.fmt_result_of(&e)
+            }
             // `<String as fmt::Write>`: append, always Ok.
             B::FmtWriteStr if on_string => self.fmt_result_of(&format!("(lust_string_push_str({}, {}), 0)", vals[0], vals[1])),
             B::FmtWriteChar if on_string => self.fmt_result_of(&format!("(lust_string_push_char({}, {}), 0)", vals[0], vals[1])),

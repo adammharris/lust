@@ -206,6 +206,9 @@ pub enum Glue {
     Default,
     /// Display of a type with a user `impl Display` (cgen/fmt.rs).
     Display,
+    /// A user `impl fmt::Write` writer's methods and its sink callbacks
+    /// (cgen/fmt.rs `fmt_write_glue`).
+    FmtWrite,
     /// The slow path of a `thread_local!` access, keyed by the cell
     /// type `(u8, T)` (state byte, value; runtime/thread.c):
     /// `C *tlsinit_C(C *c, void *init)` makes the value with `init` (an
@@ -6350,6 +6353,7 @@ impl FnGen<'_, '_> {
             | B::FmtFinish
             | B::FmtFinishNonExhaustive
             | B::FmtWriteFmt
+            | B::FmtWriteCall
             | B::FmtCallDisplay
             | B::FmtCallDebug
             | B::ConvIdent
@@ -6364,6 +6368,25 @@ impl FnGen<'_, '_> {
             | B::CowDeref => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
             // The operand was moved into the call: no drop ever runs.
             B::MemForget => "((lust_Unit){})".into(),
+            // `fmt::write(out, args)`: core's `write` into the writer.
+            B::FmtWriteFn => {
+                let a = self.tmp();
+                let ct = CTy::Fmt(crate::ty::fmt::FmtTy::Arguments);
+                let _ = writeln!(self.out, "    {} {a} = {};", ctype(&ct), vals[1]);
+                let e = match &tys[0] {
+                    CTy::Ref(w) if **w == CTy::String => {
+                        let _ = writeln!(self.out, "    lust_sink {a}k; lust_sink_string(&{a}k, {});", vals[0]);
+                        format!("lust_args_write(&{a}, &{a}k)")
+                    }
+                    CTy::Ref(w) if matches!(**w, CTy::Adt(_)) => {
+                        let w = (**w).clone();
+                        self.want(Glue::FmtWrite, &w);
+                        format!("fwa_{}({}, &{a})", mangle(&w), vals[0])
+                    }
+                    _ => format!("lust_args_write(&{a}, ({})->buf)", vals[0]),
+                };
+                self.fmt_result_value(&e)
+            }
             // `fmt::format(args)`: the value `args.to_string()` formats.
             B::FmtFormat => {
                 let tmp = self.tmp();
@@ -13191,6 +13214,10 @@ fn glue_def_value(
         own::dyn_guard_drop(t, protos, defs);
         return;
     }
+    if matches!(g, Glue::FmtWrite) {
+        fmt::fmt_write_glue(p, slots, t, protos, defs, types);
+        return;
+    }
     // The sync types' glue (cgen/sync.rs).
     if let CTy::Sync(k, e) = t {
         sync::sync_glue_def(p, *g, *k, e, protos, defs, &mut need, types);
@@ -14049,6 +14076,7 @@ fn glue_def_value(
             let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{body}}}\n");
         }
         Glue::TlsInit | Glue::TlsDtor => tls_glue(p, g, t, protos, defs, &mut need),
+        Glue::FmtWrite => unreachable!("fmt::Write glue returns above"),
         Glue::Debug => {
             let _ = writeln!(protos, "int dbg_{m}(lust_Formatter *f, {ct} *p);");
             let body = fmt::debug_glue_body(p, t, slots, &mut need, types);

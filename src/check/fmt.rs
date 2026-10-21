@@ -13,6 +13,10 @@
 use super::*;
 use crate::ty::fmt::{FmtTy, fmt_kind, fmt_ty};
 
+/// The methods of `core::fmt::Write`, in record order: the required
+/// `write_str`, then the provided `write_char` and `write_fmt`.
+pub const FMT_WRITE_METHODS: [&str; 3] = ["write_str", "write_char", "write_fmt"];
+
 /// Formatter and builder methods Rust declares that lust does not
 /// implement yet: a call rejects with L0640 naming the method.
 const DECLARED_ONLY: &[&str] = &["align", "flags", "options", "with_options", "sign", "field_with", "entry_with", "key_with", "value_with"];
@@ -469,6 +473,37 @@ impl<'p> Ctx<'p> {
             }
             _ => false,
         }
+    }
+
+    /// A `fmt::Write` method on a concrete user writer: a struct or enum
+    /// with a written `impl fmt::Write` (maybe generic), the trait in
+    /// scope as rustc asks. `write!` is `write_fmt(format_args!(..))`
+    /// here too, its `Arguments` value an ordinary argument. cgen calls
+    /// the impl's instance (`gx.fmt_write_methods`), or core's default
+    /// for a method the impl leaves out: `write_char` writes the char's
+    /// UTF-8 text with `write_str`, and `write_fmt` formats through a
+    /// sink whose writes call the writer's own methods, piece by piece
+    /// as core's `fmt::write` does. A generic writer (`W: fmt::Write`)
+    /// takes the lang method stubs, and its instances come here.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn user_fmt_write_method(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        let i = FMT_WRITE_METHODS.iter().position(|m| *m == self.p.interner.get(name))?;
+        let fw = self.p.gx.lang.fmt_write;
+        if !matches!(self.kind(base), TyKind::Adt(..)) || self.tys.builtin_of(base).is_some() || self.tys.flags(base).contains_param() {
+            return None;
+        }
+        if !method::trait_in_scope_at(self, fw, base) || !self.implements(fw, base) {
+            return None;
+        }
+        let arg = match i {
+            0 => REF_STR,
+            1 => CHAR,
+            _ => fmt_ty(&mut self.tys, FmtTy::Arguments),
+        };
+        self.check_packed_borrow(recv, name_span);
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::FmtWriteCall, derefs, autoref: Autoref::RefMut });
+        self.check_args(&[arg], args, name_span);
+        Some(self.fmt_result_ty())
     }
 
     /// `dst.write_fmt(format_args!(..))`, the `write!` shape: on a

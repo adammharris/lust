@@ -14,6 +14,16 @@ static int lust_string_sink_write(lust_sink *k, const uint8_t *p, uint64_t n) {
 void lust_sink_string(lust_sink *k, lust_String *s) {
     k->write = lust_string_sink_write;
     k->direct = s;
+    k->write_char = NULL;
+    k->keep_empty = 0;
+}
+
+void lust_user_sink_init(lust_user_sink *k, void *self, int (*write)(lust_sink *, const uint8_t *, uint64_t), int (*write_char)(lust_sink *, uint32_t)) {
+    k->base.write = write;
+    k->base.direct = NULL;
+    k->base.write_char = write_char;
+    k->base.keep_empty = 1;
+    k->self = self;
 }
 
 /* The sinks of `print!` and `eprint!`: std formats straight into its
@@ -36,6 +46,8 @@ void lust_print_begin(lust_sink *k, int to_stderr) {
     flockfile(to_stderr ? stderr : stdout);
     k->write = to_stderr ? lust_stderr_sink_write : lust_stdout_sink_write;
     k->direct = NULL;
+    k->write_char = NULL;
+    k->keep_empty = 0;
 }
 
 void lust_print_end(int to_stderr) { funlockfile(to_stderr ? stderr : stdout); }
@@ -80,6 +92,8 @@ void lust_io_begin(lust_io_sink *k, int to_stderr) {
     flockfile(to_stderr ? stderr : stdout);
     k->base.write = to_stderr ? lust_io_stderr_write : lust_io_stdout_write;
     k->base.direct = NULL;
+    k->base.write_char = NULL;
+    k->base.keep_empty = 0;
     k->err = 0;
 }
 
@@ -100,9 +114,21 @@ static int lust_pad_sink_write(lust_sink *k, const uint8_t *p, uint64_t n) {
     return 0;
 }
 
+/* PadAdapter::write_char: the indent at a line start, then the char
+   through the inner sink's own `write_char` (only a sink with one
+   gets this callback). */
+static int lust_pad_sink_write_char(lust_sink *k, uint32_t c) {
+    lust_pad_sink *s = (lust_pad_sink *)k;
+    if (*s->on_newline && s->inner->write(s->inner, (const uint8_t *)"    ", 4)) return 1;
+    *s->on_newline = c == '\n';
+    return s->inner->write_char(s->inner, c);
+}
+
+/* fmt::write: literal-only text is one write_str, also an empty one
+   (a sink that keeps empty writes sees it, as a user writer does). */
 int lust_args_write(const lust_Arguments *a, lust_sink *k) {
     if (a->fmt) return a->fmt(a->env, k);
-    return a->len ? k->write(k, (const uint8_t *)a->text, a->len) : 0;
+    return a->len || k->keep_empty ? k->write(k, (const uint8_t *)a->text, a->len) : 0;
 }
 
 int lust_f_args(lust_Formatter *f, const lust_Arguments *a) {
@@ -139,6 +165,8 @@ void lust_f_set(lust_Formatter *f, uint32_t fill, uint32_t align, uint32_t flags
 static lust_Formatter *lust_f_wrap_pad(lust_Formatter *f, lust_fmt_slot *s, uint8_t *state) {
     s->pad.base.write = lust_pad_sink_write;
     s->pad.base.direct = 0;
+    s->pad.base.write_char = f->buf->write_char ? lust_pad_sink_write_char : NULL;
+    s->pad.base.keep_empty = 0;
     s->pad.inner = f->buf;
     s->pad.on_newline = state;
     s->f = *f;
@@ -147,7 +175,7 @@ static lust_Formatter *lust_f_wrap_pad(lust_Formatter *f, lust_fmt_slot *s, uint
 }
 
 int lust_f_write(lust_Formatter *f, const void *p, uint64_t n) {
-    if (!n) return 0;
+    if (!n && !f->buf->keep_empty) return 0;
     return f->buf->write(f->buf, (const uint8_t *)p, n);
 }
 
@@ -161,7 +189,10 @@ static int lust_utf8_encode(uint32_t c, uint8_t *b) {
     return 4;
 }
 
+int lust_utf8_char(uint32_t c, uint8_t *b) { return lust_utf8_encode(c, b); }
+
 int lust_f_write_char(lust_Formatter *f, uint32_t c) {
+    if (f->buf->write_char) return f->buf->write_char(f->buf, c);
     uint8_t b[4];
     int n = lust_utf8_encode(c, b);
     return f->buf->write(f->buf, b, (uint64_t)n);
@@ -573,11 +604,15 @@ static uint64_t lust_f_escape(uint32_t c, uint32_t quote, uint8_t *buf, uint64_t
     return n;
 }
 
-/* char Debug: quote, the escape (one write), quote. No padding. */
+/* char Debug: quote, the escape, quote. No padding. An escape that is
+   the char itself is one write_char (EscapeDebug's Display of its
+   `Char` form), any other one write. */
 int lust_f_dbg_char(lust_Formatter *f, uint32_t c) {
-    uint8_t buf[16];
+    uint8_t buf[16], one[4];
     uint64_t n = lust_f_escape(c, '\'', buf, sizeof buf);
-    return lust_f_write_char(f, '\'') || lust_f_write(f, buf, n) || lust_f_write_char(f, '\'');
+    int one_n = lust_utf8_encode(c, one);
+    int same = n == (uint64_t)one_n && memcmp(buf, one, n) == 0;
+    return lust_f_write_char(f, '\'') || (same ? lust_f_write_char(f, c) : lust_f_write(f, buf, n)) || lust_f_write_char(f, '\'');
 }
 
 /* str Debug: runs of chars that need no escape are written whole,
