@@ -1006,8 +1006,11 @@ pub fn select_unit(
         .unwrap_or_else(|| pkg.resolved_features.clone());
     // Dependency tree: direct dependencies whose kind and target select
     // them for this unit, recursively. Dev-dependencies join only the
-    // selected test crate itself, never its dependencies.
-    let mut stack = vec![pkg.id_repr.clone()];
+    // selected test crate itself, never its dependencies. A test crate is
+    // not its package's lib unit: a dev-dependency that depends back on
+    // the package (twig-html's twig-markdown) reaches that lib, with its
+    // own dependencies, as in Cargo, so the walk does not start on it.
+    let mut stack = if test_crate { Vec::new() } else { vec![pkg.id_repr.clone()] };
     let mut deps = build_deps(graph, pkg, &features, env, interner, test_crate, &check_map, &mut stack);
     // A bin, test, example, or bench target of a package with a lib
     // target depends on that lib implicitly (Cargo adds it as an

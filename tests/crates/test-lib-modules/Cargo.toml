@@ -6,10 +6,14 @@ edition = "2024"
 [features]
 extra = []
 
+[dependencies]
+kit = { path = "kit" }
+
 # The helper depends on this lib, as twig-kit's dev-dependencies do: the
-# lib compiles twice, as the test crate and as the helper's dependency.
+# lib compiles twice, as the test crate and as the helper's dependency,
+# each with its own dependencies.
 [dev-dependencies]
 helper = { path = "helper" }
 
 [workspace]
-members = ["helper"]
+members = ["helper", "kit"]

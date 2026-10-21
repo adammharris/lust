@@ -1,6 +1,8 @@
 // A module file with its own tests module.
+use kit::bytes::is_digit;
+
 pub fn digits(s: &str) -> usize {
-    s.bytes().filter(u8::is_ascii_digit).count()
+    s.bytes().filter(is_digit).count()
 }
 
 #[cfg(test)]
