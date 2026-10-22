@@ -5318,12 +5318,20 @@ impl<'p> Lower<'p> {
         let lt = self.ty(lhs);
         let base = self.peel(lt, ld);
         if self.ck.is_seq_cmp(e) {
+            let rbase = {
+                let rt = self.ty(rhs);
+                self.peel(rt, rd)
+            };
+            let elem = self.seq_elem(base);
+            if self.cross_str_elems(elem, self.seq_elem(rbase)) {
+                // Elements of two string types: compared one by one.
+                let pa = Self::derefs(self.place(lhs), ld);
+                let pb = Self::derefs(self.place(rhs), rd);
+                self.cross_str_seq_eq(pa, base, pb, rbase, op == BinOp::Ne, out, span);
+                return;
+            }
             // A comparison across sequence forms (check/slice.rs):
             // both sides as fat slices, compared as `[T]`.
-            let elem = match self.kind(base) {
-                TyKind::Slice(el) | TyKind::Array(el, _) => el,
-                _ => self.body.tys.vec_elem(base).unwrap_or(ERROR),
-            };
             let sty = self.body.tys.intern(TyKind::Slice(elem));
             let rt = self.ref_ty(false, sty);
             let fat = |this: &mut Self, side: ExprId, d: u8| -> Operand {
@@ -6592,6 +6600,91 @@ impl<'p> Lower<'p> {
         }
     }
 
+    /// The element type of a sequence base (slice, array, or Vec).
+    fn seq_elem(&self, base: Ty) -> Ty {
+        match self.kind(base) {
+            TyKind::Slice(el) | TyKind::Array(el, _) => el,
+            _ => self.body.tys.vec_elem(base).unwrap_or(ERROR),
+        }
+    }
+
+    /// True when sequence elements `a` and `b` are two different string
+    /// types under their references (`&str` and `String`): the pairs
+    /// check/slice.rs `seq_cmp` lets through without unifying them.
+    fn cross_str_elems(&self, a: Ty, b: Ty) -> bool {
+        let base = |mut t: Ty| {
+            while let TyKind::Ref(_, _, inner) = self.kind(t) {
+                t = inner;
+            }
+            let s = self.kind(t) == TyKind::Str
+                || self.body.tys.is_string_ty(t)
+                || crate::check::collect::cow_arg(&self.body.tys, t).is_some_and(|b| self.kind(b) == TyKind::Str);
+            s.then_some(t)
+        };
+        let str_kind = |t: Ty| if self.kind(t) == TyKind::Str { 0 } else if self.body.tys.is_string_ty(t) { 1 } else { 2 };
+        matches!((base(a), base(b)), (Some(x), Some(y)) if str_kind(x) != str_kind(y))
+    }
+
+    /// `a == b` (`!=` with `ne`) into `out` for two sequences whose
+    /// elements are different string types (`["a"] == &[String]`,
+    /// check/slice.rs `seq_cmp`): the lengths, then each pair of elements
+    /// as strings, as core's `T: PartialEq<U>` sequence impls compare.
+    /// `pa` and `pb` are places of the sequence bases `ta` and `tb`.
+    #[allow(clippy::too_many_arguments)]
+    fn cross_str_seq_eq(&mut self, pa: Place, ta: Ty, pb: Place, tb: Ty, ne: bool, out: Place, span: Span) {
+        let side = |this: &mut Self, p: Place, t: Ty| {
+            let el = this.seq_elem(t);
+            let sty = this.body.tys.intern(TyKind::Slice(el));
+            let rt = this.ref_ty(false, sty);
+            let s = this.temp(rt);
+            this.assign(Place::local(s), Rvalue::SliceOf(p), span);
+            let len = this.temp(USIZE);
+            this.assign(Place::local(len), Rvalue::LenOf(Place::local(s).deref()), span);
+            (s, el, len)
+        };
+        let (sa, ea, la) = side(self, pa, ta);
+        let (sb, eb, lb) = side(self, pb, tb);
+        let (head, body, next, equal, unequal, end) =
+            (self.new_block(), self.new_block(), self.new_block(), self.new_block(), self.new_block(), self.new_block());
+        let branch = |this: &mut Self, rv: Rvalue, yes: Bb, no: Bb| {
+            let c = this.temp(BOOL);
+            this.assign(Place::local(c), rv, span);
+            let b = &mut this.body.blocks[this.cur.0 as usize];
+            b.term = Terminator::If(Operand::Copy(Place::local(c)), yes, no);
+            b.term_span = span;
+        };
+        let i = self.const_usize(0, span);
+        branch(self, Rvalue::Bin(BinOp::Eq, Operand::Copy(Place::local(la)), Operand::Copy(Place::local(lb))), head, unequal);
+        self.cur = head;
+        branch(self, Rvalue::Bin(BinOp::Lt, Operand::Copy(Place::local(i)), Operand::Copy(Place::local(la))), body, equal);
+        self.cur = body;
+        let refs = |this: &Self, mut t: Ty| {
+            let mut n = 0;
+            while let TyKind::Ref(_, _, inner) = this.kind(t) {
+                t = inner;
+                n += 1;
+            }
+            n
+        };
+        let (na, nb) = (refs(self, ea), refs(self, eb));
+        let x = self.str_view_at(Place::local(sa).deref().project(Proj::Index(i)), ea, na, span);
+        let y = self.str_view_at(Place::local(sb).deref().project(Proj::Index(i)), eb, nb, span);
+        branch(self, Rvalue::StrCmp(BinOp::Eq, x, y), next, unequal);
+        self.cur = next;
+        self.assign(
+            Place::local(i),
+            Rvalue::Bin(BinOp::Add, Operand::Copy(Place::local(i)), Operand::Const(Const::Int(1, IntTy::Usize))),
+            span,
+        );
+        self.goto(head, span);
+        for (b, v) in [(equal, !ne), (unequal, ne)] {
+            self.cur = b;
+            self.assign(out.clone(), Rvalue::Use(Operand::Const(Const::Bool(v))), span);
+            self.goto(end, span);
+        }
+        self.cur = end;
+    }
+
     /// A usize local holding a constant, for slice pattern indexes.
     fn const_usize(&mut self, v: u64, span: Span) -> Local {
         let t = self.temp(USIZE);
@@ -7628,14 +7721,26 @@ impl<'p> Lower<'p> {
                 let (b, tb) = self.borrow_of(args[1], 0);
                 let c = self.temp(BOOL);
                 let cmp = match self.ck.res(e) {
+                    Res::Bin { ld, rd } if self.ck.is_seq_cmp(e) && {
+                        let (lb, rb) = (self.peel(t, ld), self.peel(tb, rd));
+                        self.cross_str_elems(self.seq_elem(lb), self.seq_elem(rb))
+                    } =>
+                    {
+                        // Elements of two string types: compared one by one.
+                        let place_of = |o: &Operand, d: u8| match o {
+                            Operand::Copy(p) | Operand::Move(p) => Self::derefs(p.clone().deref(), d),
+                            _ => unreachable!("borrow_of gives a place operand"),
+                        };
+                        let (lb, rb) = (self.peel(t, ld), self.peel(tb, rd));
+                        let r = self.temp(BOOL);
+                        self.cross_str_seq_eq(place_of(&a, ld), lb, place_of(&b, rd), rb, ne, Place::local(r), span);
+                        Rvalue::Use(Operand::Copy(Place::local(r)))
+                    }
                     Res::Bin { ld, rd } if self.ck.is_seq_cmp(e) => {
                         // Across sequence forms (check/slice.rs): both
                         // borrowed sides as fat slices, compared as `[T]`.
                         let base = self.peel(t, ld);
-                        let elem = match self.kind(base) {
-                            TyKind::Slice(el) | TyKind::Array(el, _) => el,
-                            _ => self.body.tys.vec_elem(base).unwrap_or(ERROR),
-                        };
+                        let elem = self.seq_elem(base);
                         let sty = self.body.tys.intern(TyKind::Slice(elem));
                         let rt = self.ref_ty(false, sty);
                         let mut fat = |o: &Operand, d: u8| -> Operand {

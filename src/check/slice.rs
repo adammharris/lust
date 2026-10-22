@@ -806,7 +806,21 @@ impl<'p> Ctx<'p> {
         let snap = self.snapshot_vars();
         if !self.unify(le, re) {
             self.rollback_vars(snap);
-            return None;
+            // Elements of two string types (`["a"] == &[String]`): core's
+            // sequence impls take `T: PartialEq<U>`, and the string pairs
+            // are the ones `==` takes. Lowering compares them one by one.
+            let (eld, elb) = self.autoderef(le);
+            let (erd, erb) = self.autoderef(re);
+            let strings = match (self.str_kind(elb, true), self.str_kind(erb, true)) {
+                (Some(a), Some(b)) => elb != erb && string_eq_ok(eld, a, erd, b),
+                _ => false,
+            };
+            if !eq_op || !strings {
+                return None;
+            }
+            self.out.seq_cmps.push(e);
+            self.set_res(e, Res::Bin { ld, rd });
+            return Some(BOOL);
         }
         let lbd = self.deep(lb);
         let ok = if eq_op {
