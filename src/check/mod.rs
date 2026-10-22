@@ -9028,11 +9028,23 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    fn explicit_call_args(&mut self, callee: ExprId) -> Vec<Option<GenericArg>> {
+    fn explicit_call_args(&mut self, callee: ExprId, f: LocalDefId) -> Vec<Option<GenericArg>> {
         let p = self.p;
         let ast::Expr::Path(segs) = p.ast.expr(callee) else { return Vec::new() };
         let Some(seg) = segs.last() else { return Vec::new() };
-        self.explicit_seg_args(seg)
+        let free = self.unused_params(f, 0);
+        self.explicit_seg_args(seg, &free)
+    }
+
+    /// For each of `f`'s generic params from `offset` on: true when no
+    /// param or return type of its signature uses it, so a turbofish type
+    /// written for it carries no value (`Scope::static_ok`).
+    fn unused_params(&self, f: LocalDefId, offset: usize) -> Vec<bool> {
+        let p = self.p;
+        let Some(Some(t)) = p.gx.fn_templates.get(f.0 as usize) else { return Vec::new() };
+        let info = p.fn_info(f);
+        let uses = |idx: u32| info.params.iter().chain(std::iter::once(&info.ret)).any(|&t| generics::ty_uses_param(&self.tys, t, idx));
+        (offset..t.generics.params.len()).map(|i| !uses(i as u32)).collect()
     }
 
     /// How many leading template params belong to the parent impl
@@ -9096,22 +9108,24 @@ impl<'p> Ctx<'p> {
     /// For a plain fn this is `explicit_call_args`.
     fn explicit_path_args(&mut self, callee: ExprId, f: LocalDefId) -> Vec<Option<GenericArg>> {
         let p = self.p;
-        let Some((_, impl_g)) = p.gx.inherent_self_pats.get(&f) else { return self.explicit_call_args(callee) };
+        let Some((_, impl_g)) = p.gx.inherent_self_pats.get(&f) else { return self.explicit_call_args(callee, f) };
         let parent_n = impl_g.params.len();
         if parent_n == 0 {
-            return self.explicit_call_args(callee);
+            return self.explicit_call_args(callee, f);
         }
-        let ast::Expr::Path(segs) = p.ast.expr(callee) else { return self.explicit_call_args(callee) };
+        let ast::Expr::Path(segs) = p.ast.expr(callee) else { return self.explicit_call_args(callee, f) };
         if segs.len() < 2 {
-            return self.explicit_call_args(callee);
+            return self.explicit_call_args(callee, f);
         }
         let mut out: Vec<Option<GenericArg>> = vec![None; parent_n];
-        for (i, a) in self.explicit_seg_args(&segs[segs.len() - 2]).into_iter().enumerate() {
+        let free = self.unused_params(f, 0);
+        for (i, a) in self.explicit_seg_args(&segs[segs.len() - 2], &free).into_iter().enumerate() {
             if let Some(slot) = out.get_mut(i) {
                 *slot = a;
             }
         }
-        out.extend(self.explicit_seg_args(&segs[segs.len() - 1]));
+        let free = self.unused_params(f, parent_n);
+        out.extend(self.explicit_seg_args(&segs[segs.len() - 1], &free));
         out
     }
 
@@ -9180,13 +9194,21 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    fn explicit_seg_args(&mut self, seg: &ast::PathSeg) -> Vec<Option<GenericArg>> {
+    /// `free[i]`: the param the `i`th written arg fills is unused in the
+    /// callee's signature (`unused_params`).
+    fn explicit_seg_args(&mut self, seg: &ast::PathSeg, free: &[bool]) -> Vec<Option<GenericArg>> {
         let p = self.p;
         let ast::GenericArgs::Angle(written) = &seg.args else { return Vec::new() };
         let mut out = Vec::new();
-        for a in written {
+        for (i, a) in written.iter().enumerate() {
             out.push(match a {
-                ast::GenericArg::Type(t) => self.written_type_arg(*t),
+                ast::GenericArg::Type(t) => {
+                    let saved = self.body_scope.static_ok;
+                    self.body_scope.static_ok = free.get(i).copied().unwrap_or(false);
+                    let r = self.written_type_arg(*t);
+                    self.body_scope.static_ok = saved;
+                    r
+                }
                 ast::GenericArg::Lifetime(_) => None,
                 ast::GenericArg::Const(e) => Some(self.const_call_arg(*e)),
                 ast::GenericArg::Binding { span, .. } => {

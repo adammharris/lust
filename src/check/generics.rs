@@ -1406,6 +1406,11 @@ pub struct Scope {
     /// A `let` annotation in a body whose regions the checker records for
     /// the borrow checker: explicit lifetimes are allowed there (W-BORROW).
     pub annotation: bool,
+    /// A turbofish type for a parameter the callee's signature never uses
+    /// (`assert_debug::<View<'static>>()`): `'static` may be written and is
+    /// erased, since no value carries it and every outlives bound holds
+    /// for it. Other named lifetimes stay rejected.
+    pub static_ok: bool,
     /// W-BORROW, `RegionMode::Keep` only: the default object lifetime of
     /// a `dyn` type right under a reference (`&'a dyn Tr` is
     /// `&'a (dyn Tr + 'a)`); none means `'static` (`Box<dyn Tr>`).
@@ -1761,7 +1766,11 @@ pub(crate) fn scope_region(interner: &Interner, scope: &Scope, lt: Option<ast::L
     let named = lt.and_then(|lt| scope.lifetimes.iter().find(|(n, _)| *n == lt.name).map(|&(_, i)| i));
     match &scope.regions {
         RegionMode::Erase => {
-            if (name == Some("static") || named.is_some()) && scope.infer_cell.is_some() && !scope.annotation {
+            if (name == Some("static") || named.is_some())
+                && scope.infer_cell.is_some()
+                && !scope.annotation
+                && !(scope.static_ok && name == Some("static"))
+            {
                 return Err(Diag::new(
                     "L0203",
                     lt.map_or(span, |l| l.span),
@@ -4458,7 +4467,7 @@ pub(crate) fn resolve_path_ty(
         }
         if scope.infer_cell.is_some()
             && !scope.annotation
-            && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_")
+            && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_" && !(scope.static_ok && interner.get(lt.name) == "static"))
         {
             return Err(Diag::new(
                 "L0203",
@@ -4718,7 +4727,7 @@ pub(crate) fn resolve_path_ty(
         };
         if scope.infer_cell.is_some()
             && !scope.annotation
-            && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_")
+            && let Some(lt) = written.iter().find(|lt| interner.get(lt.name) != "_" && !(scope.static_ok && interner.get(lt.name) == "static"))
         {
             return Err(Diag::new(
                 "L0203",
