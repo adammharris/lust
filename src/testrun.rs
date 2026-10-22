@@ -28,24 +28,53 @@ use std::time::{Duration, Instant};
 
 mod krate;
 
-const USAGE: &str = "usage: lust test <file.rs> [filter] [--json] [--list] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [--package <name>] [--features <a,b>] [--no-default-features] [--all-features] [filter] [--json] [--list] [--timeout SECONDS]";
+const USAGE: &str = "usage: lust test <file.rs> [filter...] [--json] [--list] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [--package <name>] [--features <a,b>] [--no-default-features] [--all-features] [filter...] [--exact] [--skip FILTER] [--ignored | --include-ignored] [--test-threads N] [--json] [--list] [--timeout SECONDS]";
 
 struct Opts {
     file: PathBuf,
-    filter: Option<String>,
+    /// libtest's filters: a test runs when its name contains one of them
+    /// (all run when there are none), or equals one under `--exact`.
+    filters: Vec<String>,
+    /// `--skip`: a test whose name contains one (equals one under `--exact`) does not run.
+    skip: Vec<String>,
+    exact: bool,
+    /// `--ignored` runs only the `#[ignore]` tests, `--include-ignored` runs them too.
+    ignored: bool,
+    include_ignored: bool,
+    /// `--test-threads N` (Cargo-target mode): else `RUST_TEST_THREADS`, else the core count.
+    threads: Option<usize>,
     json: bool,
     list: bool,
     timeout: Duration,
     max_errors: usize,
 }
 
+impl Opts {
+    /// True when libtest's filters select the test `name`.
+    fn selects(&self, name: &str) -> bool {
+        let hit = |f: &String| if self.exact { name == f } else { name.contains(f.as_str()) };
+        (self.filters.is_empty() || self.filters.iter().any(hit)) && !self.skip.iter().any(hit)
+    }
+}
+
 /// Parses `lust test` arguments (without the word `test`).
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
-    let (mut file, mut filter, mut json, mut list) = (None, None, false, false);
+    let (mut file, mut filters, mut json, mut list) = (None, Vec::new(), false, false);
     let (mut timeout, mut max_errors) = (Duration::from_secs(10), diag::DEFAULT_MAX_ERRORS);
+    let (mut skip, mut exact, mut ignored, mut include_ignored, mut threads) = (Vec::new(), false, false, false, None);
+    let threads_of = |v: &str| v.parse().ok().filter(|&n: &usize| n > 0).ok_or_else(|| USAGE.to_string());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            // libtest's own flags, as `cargo test -- <flags>` passes them.
+            "--" | "--nocapture" | "--show-output" => {}
+            "--exact" => exact = true,
+            "--ignored" => ignored = true,
+            "--include-ignored" => include_ignored = true,
+            "--skip" => skip.push(it.next().ok_or(USAGE)?.clone()),
+            "--test-threads" => threads = Some(threads_of(it.next().ok_or(USAGE)?)?),
+            _ if a.starts_with("--test-threads=") => threads = Some(threads_of(&a["--test-threads=".len()..])?),
+            _ if a.starts_with("--skip=") => skip.push(a["--skip=".len()..].to_string()),
             "--json" => json = true,
             "--list" => list = true,
             "--timeout" => timeout = parse_secs(it.next().ok_or(USAGE)?)?,
@@ -54,11 +83,10 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             _ if a.starts_with("--max-errors=") => max_errors = a["--max-errors=".len()..].parse().map_err(|_| USAGE.to_string())?,
             _ if a.starts_with("--") => return Err(USAGE.into()),
             _ if file.is_none() => file = Some(PathBuf::from(a)),
-            _ if filter.is_none() => filter = Some(a.clone()),
-            _ => return Err(USAGE.into()),
+            _ => filters.push(a.clone()),
         }
     }
-    Ok(Opts { file: file.ok_or(USAGE)?, filter, json, list, timeout, max_errors })
+    Ok(Opts { file: file.ok_or(USAGE)?, filters, skip, exact, ignored, include_ignored, threads, json, list, timeout, max_errors })
 }
 
 fn parse_secs(s: &String) -> Result<Duration, String> {
@@ -402,10 +430,7 @@ pub fn run(args: &[String]) -> i32 {
     if !bad.is_empty() {
         return fail_build(diag::render(&mut bad, &map, &src, opts.json, opts.max_errors), 0);
     }
-    let selected: Vec<TestCase> = match &opts.filter {
-        Some(f) => tests.iter().filter(|t| t.name.contains(f.as_str())).cloned().collect(),
-        None => tests.clone(),
-    };
+    let selected: Vec<TestCase> = tests.iter().filter(|t| opts.selects(&t.name)).cloned().collect();
     let filtered_out = tests.len() - selected.len();
     if opts.list {
         if opts.json {

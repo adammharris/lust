@@ -1,0 +1,6 @@
+# `lust test --lib` runs the tests as libtest does: one process, sorted by
+# name, each on a thread named by the test, so a later test sees what an
+# earlier one left in process state (twig-doc's language registry), and a
+# panic fails only its own test. Also libtest's should_panic notes, a
+# `Result` test's `Err`, an ignored test, and a non-string payload.
+test=lib

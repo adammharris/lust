@@ -149,7 +149,13 @@ Terms:
   dependencies (also the package's own lib, under an integration
   test or a dev-dependency) build as in any other session. The
   harness shims go into in-memory copies of the crate's files
-  (`driver::set_source_overlay`, src/testrun/krate.rs). Ts-rust's baseline runner is such a target with
+  (`driver::set_source_overlay`, src/testrun/krate.rs). The test
+  binary runs its tests as libtest does: one process, the main
+  thread starting them sorted by name on threads named by the
+  test (`--test-threads`), each under `catch_unwind`, so tests
+  share process state as under `cargo test`. Its results go to a
+  file line by line, so the runner can rerun the tests a dead or
+  hung process did not finish. Ts-rust's baseline runner is such a target with
   `test = false` in `crates/ts_goport/Cargo.toml`, so target
   handling must not assume `cargo test` semantics.
 

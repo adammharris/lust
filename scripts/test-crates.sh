@@ -182,7 +182,7 @@ for dir in "$fixtures"/*/; do
     results() { grep -E '^test .* \.\.\. (ok|FAILED|ignored|TIMEOUT)' "$1" | sed -E 's/ \([0-9.]+ms\)$//' | sort; }
     (cd "$proj" && timeout 120 cargo test --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}" --target-dir "$case_dir/cargo-target" -- --test-threads 1) >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"
     cst=$?
-    (cd "$proj" && lust_cc "$lust" test "$proj/$root_file" --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}") >"$case_dir/lust.out" 2>"$case_dir/lust.err"
+    (cd "$proj" && lust_cc "$lust" test "$proj/$root_file" --manifest-path "$proj/$manifest" "${sel[@]}" "${feat[@]}" --test-threads 1) >"$case_dir/lust.out" 2>"$case_dir/lust.err"
     st=$?
     if is_timeout "$st"; then
       report bad "$name" "HANG lust test timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"

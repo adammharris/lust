@@ -10,10 +10,13 @@
 // also carries the `cfg` predicates of its test and of the modules below it, so a test that is
 // configured out (`#[cfg(feature = "x")]`) is no build error: the binary lists the tests it
 // holds (`LUST_TEST_LIST`), and only those count, as `cargo test` lists only compiled tests.
-// Each test runs in the package dir with Cargo's runtime env (`CARGO_MANIFEST_DIR`, ...), as
-// under `cargo test`. Shims go before a closing `}` or at the end of a file, with no newline
-// before the end, so lines (and panic locations) still match the files.
-use super::{Opts, TestCase, USAGE, attr_str, harness_attrs, summary_json};
+// The binary runs in the package dir with Cargo's runtime env (`CARGO_MANIFEST_DIR`, ...), as
+// under `cargo test`, and as libtest runs one: all the tests in one process, on worker threads
+// (`--test-threads`, else `RUST_TEST_THREADS`, else the core count), sorted by name, each on a
+// thread named by the test whose panic fails that test only (`RUNNER`). So tests share process
+// state as they do under `cargo test`. Shims go before a closing `}` or at the end of a file,
+// with no newline before the end, so lines (and panic locations) still match the files.
+use super::{Opts, Outcome, TestCase, USAGE, attr_str, harness_attrs, summary_json};
 use crate::ast::{Ast, Attr, Item, ItemKind, TyExpr};
 use crate::diag::{self, Diag, FileId, SourceMap};
 use crate::driver::{self, Cmd};
@@ -21,9 +24,10 @@ use crate::intern::{Interner, Known};
 use crate::lexer::Tok;
 use crate::{lexer, parser};
 use std::collections::{HashMap, HashSet};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// One test of a Cargo target, found by following the module tree.
 struct CrateTest {
@@ -445,14 +449,74 @@ fn cfg_all(preds: &[String]) -> String {
 }
 
 /// The call that runs a test fn in its own module: a `Result` test fails on `Err`, as rustc's
-/// harness reports it (`Error: <Debug>`).
+/// harness reports it (`Error: <Debug>`). The `Err` ends the test's thread as a panic does,
+/// with the report as the payload and no panic hook.
 fn direct_call(t: &CrateTest) -> String {
     if t.returns {
-        format!("if let Err(e) = self::{}() {{ eprintln!(\"Error: {{e:?}}\"); std::process::exit(101) }}", t.case.fn_name)
+        format!("if let Err(e) = self::{}() {{ std::panic::resume_unwind(Box::new(format!(\"Error: {{e:?}}\"))) }}", t.case.fn_name)
     } else {
         format!("self::{}()", t.case.fn_name)
     }
 }
+
+/// The test binary's runner, as libtest runs a test binary: one process, and the main thread
+/// starts the tests `LUST_TEST_RUN` lists, in that order, keeping `LUST_TEST_THREADS` of them
+/// running. Each test runs on a thread of its own named by the test, under `catch_unwind`, so
+/// its panic fails that test only, and sends its end back. The main thread appends one line
+/// per event to `LUST_TEST_RESULTS`, flushed as it happens, so the parent knows which tests
+/// started and ended even when the process dies: `S i` when test `i` starts, then `P i`,
+/// `F i s <message>` (a string payload, `\` and newlines escaped), or `F i n` (another
+/// payload). A test thread's stack is `RUST_MIN_STACK` bytes, else 8 MiB: the main thread's
+/// size, as lust's C frames are larger than rustc's, not std's 2 MiB thread default.
+const RUNNER: &str = r#"#[cfg(test)] fn __lust_harness_run() {
+    use std::io::Write as _;
+    let run: Vec<usize> = std::env::var("LUST_TEST_RUN").unwrap_or_default().split(',').filter_map(|s| s.parse().ok()).collect();
+    let threads: usize = std::env::var("LUST_TEST_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let stack: usize = std::env::var("RUST_MIN_STACK").ok().and_then(|s| s.parse().ok()).unwrap_or(8 << 20);
+    let path = std::env::var("LUST_TEST_RESULTS").unwrap_or_default();
+    let mut out = std::fs::OpenOptions::new().append(true).create(true).open(path).expect("lust test: the results file");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (mut next, mut running) = (0, 0);
+    loop {
+        while running < threads && next < run.len() {
+            let i = run[next];
+            next += 1;
+            let _ = writeln!(out, "S {i}");
+            let _ = out.flush();
+            let tx = tx.clone();
+            let spawned = std::thread::Builder::new().name(__lust_name(i).to_string()).stack_size(stack).spawn(move || {
+                let line = match std::panic::catch_unwind(|| __lust_dispatch(i)) {
+                    Ok(()) => format!("P {i}"),
+                    Err(p) => {
+                        if let Some(s) = p.downcast_ref::<&str>() {
+                            format!("F {i} s {}", s.replace('\\', "\\\\").replace('\n', "\\n"))
+                        } else if let Some(s) = p.downcast_ref::<String>() {
+                            format!("F {i} s {}", s.replace('\\', "\\\\").replace('\n', "\\n"))
+                        } else {
+                            format!("F {i} n")
+                        }
+                    }
+                };
+                let _ = tx.send(line);
+            });
+            match spawned {
+                Ok(_) => running += 1,
+                Err(e) => {
+                    let _ = writeln!(out, "F {i} s cannot start the test thread: {e}");
+                    let _ = out.flush();
+                }
+            }
+        }
+        if running == 0 {
+            break;
+        }
+        let Ok(line) = rx.recv() else { break };
+        running -= 1;
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    }
+}
+"#;
 
 /// The overlay texts: each file with its shims, the root with the dispatcher.
 fn overlay(d: &Discovery, root: &Path) -> HashMap<String, String> {
@@ -492,20 +556,23 @@ fn overlay(d: &Discovery, root: &Path) -> HashMap<String, String> {
         ));
     }
     let flags: Vec<String> = (0..d.tests.len()).map(|i| format!("__LUST_ON_{i}")).collect();
+    text.push_str("#[cfg(test)] fn __lust_dispatch(i: usize) {\n    match i {\n");
+    for i in 0..d.tests.len() {
+        text.push_str(&format!("        {i} => __lust_run_{i}(),\n"));
+    }
+    text.push_str("        _ => {}\n    }\n}\n#[cfg(test)] fn __lust_name(i: usize) -> &'static str {\n    match i {\n");
+    for (i, t) in d.tests.iter().enumerate() {
+        text.push_str(&format!("        {i} => {:?},\n", t.case.name));
+    }
+    text.push_str("        _ => \"\",\n    }\n}\n");
     text.push_str(&format!(
         "#[cfg(test)] fn main() {{\n    if std::env::var_os(\"LUST_TEST_LIST\").is_some() {{\n        let on: [bool; {}] = [{}];\n        \
          for (i, b) in on.iter().enumerate() {{\n            if *b {{\n                println!(\"{{i}}\");\n            }}\n        }}\n        \
-         return;\n    }}\n    let n = std::env::args().count();\n    if n == 1 {{\n",
+         return;\n    }}\n    __lust_harness_run();\n}}\n",
         flags.len(),
         flags.join(", ")
     ));
-    for (i, _) in d.tests.iter().enumerate().filter(|(_, t)| !t.case.ignored) {
-        text.push_str(&format!("        __lust_run_{i}();\n"));
-    }
-    for i in 0..d.tests.len() {
-        text.push_str(&format!("    }} else if n == {} {{\n        __lust_run_{i}();\n", i + 2));
-    }
-    text.push_str("    }\n}\n");
+    text.push_str(RUNNER);
     adds.push((root.to_path_buf(), usize::MAX, text));
     let mut out = HashMap::new();
     for (file, src) in &d.texts {
@@ -620,21 +687,270 @@ pub(super) fn run(o: &Opts, crate_args: &[String]) -> i32 {
             return fail("error: the test binary did not list its tests\n");
         }
     };
+    // libtest's selection: the filters, then `--ignored` (only the ignored tests, which then
+    // run) or `--include-ignored` (all run), then the tests sorted by name.
     let compiled: Vec<(usize, &CrateTest)> = d.tests.iter().enumerate().filter(|(i, _)| on.contains(i)).collect();
-    let selected: Vec<(usize, &CrateTest)> =
-        compiled.iter().copied().filter(|(_, t)| o.filter.as_ref().is_none_or(|f| t.case.name.contains(f.as_str()))).collect();
-    let filtered_out = compiled.len() - selected.len();
+    let mut cases: Vec<(usize, TestCase)> = compiled
+        .iter()
+        .filter(|(_, t)| o.selects(&t.case.name) && (!o.ignored || t.case.ignored))
+        .map(|(i, t)| {
+            let mut c = t.case.clone();
+            c.ignored &= !(o.ignored || o.include_ignored);
+            (*i, c)
+        })
+        .collect();
+    cases.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    let filtered_out = compiled.len() - cases.len();
     if o.list {
-        for (_, t) in &selected {
-            println!("{}: test", t.case.name);
+        for (_, t) in &cases {
+            println!("{}: test", t.name);
         }
-        println!("\n{} tests", selected.len());
+        println!("\n{} tests", cases.len());
         remove_dir(&dir);
         return 0;
     }
-    let cases: Vec<(usize, TestCase)> = selected.iter().map(|(i, t)| (*i, t.case.clone())).collect();
-    let run = super::Run { bin: &bin, path: &path, hash: "", cwd: Some(&cwd), env: &env, rename: None };
-    let code = super::run_cases(&run, &cases, o, filtered_out, start);
+    let threads = o
+        .threads
+        .or_else(|| std::env::var("RUST_TEST_THREADS").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let run = InProcess { bin: &bin, dir: &dir, cwd: &cwd, env: &env, threads, timeout: o.timeout };
+    let code = report(&run, &cases, o, &path, filtered_out, start);
     remove_dir(&dir);
     code
+}
+
+/// One test binary run the libtest way (`RUNNER`).
+struct InProcess<'a> {
+    bin: &'a Path,
+    dir: &'a Path,
+    cwd: &'a Path,
+    env: &'a [(String, String)],
+    threads: usize,
+    timeout: Duration,
+}
+
+/// How one test ended, as the runner reports it.
+enum End {
+    Pass,
+    /// A panic (or an `Err`) with a string payload, or `None` for another payload.
+    Panic(Option<String>),
+    /// No end line: the process died or was stopped while the test ran.
+    Died(String),
+    Timeout,
+}
+
+impl InProcess<'_> {
+    /// Runs `order` (test indices) and returns each test's end, in finishing order. A test
+    /// running past the timeout stops the process: it times out, and the tests not yet done
+    /// run again in a new process. When the process dies, the tests it was running fail and
+    /// the rest run in a new one, so one crash fails one test (or the few beside it) as a
+    /// libtest crash would fail them all.
+    fn run(&self, order: &[usize], mut on_end: impl FnMut(usize, End, f64)) {
+        let mut left: Vec<usize> = order.to_vec();
+        // The tests a dying process was running beside others: each runs again alone, so the
+        // one that ends the process fails and the others get their own result.
+        let mut solo: Vec<usize> = Vec::new();
+        let mut round = 0;
+        while !left.is_empty() || !solo.is_empty() {
+            round += 1;
+            let results = self.dir.join(format!("results-{round}"));
+            let _ = std::fs::remove_file(&results);
+            let (batch, threads, alone) = match solo.is_empty() {
+                true => (left.clone(), self.threads, false),
+                false => (vec![solo.remove(0)], 1, true),
+            };
+            let list: Vec<String> = batch.iter().map(|i| i.to_string()).collect();
+            // The tests' own output is not captured: it goes to stderr, as under
+            // `--nocapture`, and stdout keeps libtest's report.
+            let err = || std::io::stderr().as_fd().try_clone_to_owned().map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+            let mut cmd = Command::new(self.bin);
+            cmd.current_dir(self.cwd).envs(self.env.iter().cloned()).stdin(Stdio::null()).stdout(err()).stderr(err());
+            cmd.env("LUST_TEST_RUN", list.join(",")).env("LUST_TEST_THREADS", threads.to_string()).env("LUST_TEST_RESULTS", &results);
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    for i in left.drain(..).chain(solo.drain(..)).chain(alone.then_some(batch[0])) {
+                        on_end(i, End::Died(format!("cannot run the test binary: {e}")), 0.0);
+                    }
+                    return;
+                }
+            };
+            let (mut read, mut pending, mut moved) = (0usize, String::new(), false);
+            let mut started: Vec<(usize, Instant)> = Vec::new();
+            let mut done: HashSet<usize> = HashSet::new();
+            let feed = |pending: &mut String, read: &mut usize, started: &mut Vec<(usize, Instant)>, done: &mut HashSet<usize>, on_end: &mut dyn FnMut(usize, End, f64)| {
+                let Ok(text) = std::fs::read(&results) else { return };
+                if text.len() <= *read {
+                    return;
+                }
+                pending.push_str(&String::from_utf8_lossy(&text[*read..]));
+                *read = text.len();
+                while let Some(nl) = pending.find('\n') {
+                    let line: String = pending.drain(..=nl).collect();
+                    let mut parts = line.trim_end_matches('\n').splitn(4, ' ');
+                    let (Some(kind), Some(Ok(i))) = (parts.next(), parts.next().map(str::parse::<usize>)) else { continue };
+                    if kind == "S" {
+                        started.push((i, Instant::now()));
+                        continue;
+                    }
+                    let ms = started.iter().find(|(s, _)| *s == i).map_or(0.0, |(_, t)| super::millis(*t));
+                    started.retain(|(s, _)| *s != i);
+                    done.insert(i);
+                    let end = match (kind, parts.next(), parts.next()) {
+                        ("P", _, _) => End::Pass,
+                        (_, Some("s"), m) => End::Panic(Some(unescape(m.unwrap_or("")))),
+                        _ => End::Panic(None),
+                    };
+                    on_end(i, end, ms);
+                }
+            };
+            let status = loop {
+                feed(&mut pending, &mut read, &mut started, &mut done, &mut on_end);
+                if let Some(&(late, t)) = started.iter().find(|(_, t)| t.elapsed() > self.timeout) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    on_end(late, End::Timeout, super::millis(t));
+                    done.insert(late);
+                    // The others running beside it were stopped, not failed: they run again.
+                    break None;
+                }
+                match child.try_wait() {
+                    Ok(Some(s)) => break Some(s),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Err(_) => break child.wait().ok(),
+                }
+            };
+            if let Some(s) = status {
+                feed(&mut pending, &mut read, &mut started, &mut done, &mut on_end);
+                let why = match s.code() {
+                    Some(c) => format!("the test process exited with code {c} while this test ran"),
+                    None => format!("the test process was killed ({s}) while this test ran"),
+                };
+                if alone || started.len() == 1 {
+                    for (i, t) in started.drain(..) {
+                        on_end(i, End::Died(why.clone()), super::millis(t));
+                        done.insert(i);
+                    }
+                } else {
+                    moved = true;
+                    solo.extend(started.drain(..).map(|(i, _)| i));
+                }
+            }
+            let progressed = !done.is_empty() || moved;
+            left.retain(|i| !done.contains(i) && !solo.contains(i));
+            if !progressed {
+                // A process that ends before it starts a test would end so again.
+                let never = if alone { batch } else { std::mem::take(&mut left) };
+                for i in never {
+                    on_end(i, End::Died("the test process ended before this test started".into()), 0.0);
+                }
+            }
+        }
+    }
+}
+
+/// Undoes the runner's escapes (`\\` and `\n`).
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (c, c == '\\') {
+            (_, true) => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Runs `cases` (sorted by name) and prints libtest's report: `running N tests`, one
+/// `test <name> ... ok|FAILED|ignored` line per test as it ends, the failures, and the
+/// `test result:` line. Returns 0, or 101 when a test failed.
+fn report(run: &InProcess, cases: &[(usize, TestCase)], o: &Opts, path: &str, filtered_out: usize, start: Instant) -> i32 {
+    if !o.json {
+        println!("\nrunning {} test{}", cases.len(), if cases.len() == 1 { "" } else { "s" });
+    }
+    let mut outcomes: Vec<Outcome> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let print = |o: &Opts, case: &TestCase, out: &Outcome| {
+        if o.json {
+            println!(
+                "{{\"schema\":{},\"kind\":\"test\",\"name\":{},\"status\":\"{}\",\"duration_ms\":{:.3},\"exit_code\":null,\"stdout\":\"\",\"stderr\":{}}}",
+                diag::SCHEMA,
+                diag::json_str(&out.name),
+                out.status,
+                out.duration_ms,
+                diag::json_str(&out.stderr)
+            );
+        } else {
+            let word = match out.status {
+                "pass" => "ok",
+                "ignored" => "ignored",
+                _ => "FAILED",
+            };
+            let mark = if case.should_panic.is_some() { " - should panic" } else { "" };
+            println!("test {}{mark} ... {word}", out.name);
+        }
+    };
+    for (_, c) in cases.iter().filter(|(_, c)| c.ignored) {
+        let out = Outcome { name: c.name.clone(), status: "ignored", duration_ms: 0.0, exit_code: None, stdout: String::new(), stderr: String::new() };
+        print(o, c, &out);
+        outcomes.push(out);
+    }
+    let order: Vec<usize> = cases.iter().filter(|(_, c)| !c.ignored).map(|(i, _)| *i).collect();
+    run.run(&order, |i, end, ms| {
+        let Some((_, c)) = cases.iter().find(|(j, _)| *j == i) else { return };
+        // libtest's verdict, with its notes for a `should_panic` miss.
+        let (status, detail) = match (&c.should_panic, end) {
+            (_, End::Timeout) => ("timeout", format!("the test ran past the {:?} timeout (`--timeout`)", run.timeout)),
+            (_, End::Died(why)) => ("fail", why),
+            (None, End::Pass) => ("pass", String::new()),
+            (None, End::Panic(m)) => ("fail", m.unwrap_or_else(|| "Box<dyn Any>".into())),
+            (Some(_), End::Pass) => ("fail", "note: test did not panic as expected".into()),
+            (Some(None), End::Panic(_)) => ("pass", String::new()),
+            (Some(Some(want)), End::Panic(Some(m))) if m.contains(want.as_str()) => ("pass", String::new()),
+            (Some(Some(want)), End::Panic(Some(m))) => {
+                ("fail", format!("note: panic did not contain expected string\n      panic message: {m:?}\n expected substring: {want:?}"))
+            }
+            (Some(Some(want)), End::Panic(None)) => {
+                ("fail", format!("note: expected panic with string value,\n found non-string value\n     expected substring: {want:?}"))
+            }
+        };
+        let out = Outcome { name: c.name.clone(), status, duration_ms: ms, exit_code: None, stdout: String::new(), stderr: detail.clone() };
+        print(o, c, &out);
+        if status != "pass" {
+            failures.push((c.name.clone(), detail));
+        }
+        outcomes.push(out);
+    });
+    let failed = outcomes.iter().filter(|x| matches!(x.status, "fail" | "timeout")).count();
+    if o.json {
+        println!("{}", summary_json(path, "", "ok", &outcomes, filtered_out, start));
+    } else {
+        if !failures.is_empty() {
+            failures.sort();
+            println!("\nfailures:\n");
+            for (name, detail) in &failures {
+                println!("---- {name} stdout ----\n{detail}\n");
+            }
+            println!("\nfailures:");
+            for (name, _) in &failures {
+                println!("    {name}");
+            }
+        }
+        let count = |s: &str| outcomes.iter().filter(|x| x.status == s).count();
+        println!(
+            "\ntest result: {}. {} passed; {} failed; {} ignored; 0 measured; {} filtered out; finished in {:.2}s\n",
+            if failed == 0 { "ok" } else { "FAILED" },
+            count("pass"),
+            failed,
+            count("ignored"),
+            filtered_out,
+            start.elapsed().as_secs_f64()
+        );
+    }
+    if failed == 0 { 0 } else { 101 }
 }
