@@ -161,6 +161,9 @@ unsafe extern "C" {
     fn setpriority(which: c_int, who: u32, prio: c_int) -> c_int;
     fn sched_setscheduler(pid: c_int, policy: c_int, param: *const c_int) -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
+    fn getppid() -> c_int;
+    fn poll(fds: *mut PollFd, n: std::ffi::c_ulong, timeout: c_int) -> c_int;
+    fn close(fd: c_int) -> c_int;
     fn _exit(code: c_int) -> !;
     fn mi_manage_os_memory_ex(
         start: *mut c_void,
@@ -748,6 +751,144 @@ fn head_check(lens: &[u8], inner: &[u8], table: &[u8]) -> u64 {
     h.finish()
 }
 
+/// `poll`'s descriptor record.
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+/// How many threads a background save's child runs its parallel parts on (`pack`,
+/// `changed_runs`) while the build process lives. Clang and the link share the box with it, and
+/// at idle priority its 16 threads still slow them: 16 vCPUs are 8 cores, and a save thread on
+/// one half of a core shares it with the other (rel-opt, tsgo's replay: the cc step +0.2-0.9 s on
+/// light merges). The other threads join when the build exits (`SaveGate`): 4 threads to the end
+/// would end a base save later (m12: 2.3-2.4 s past the build, against 1.8 s).
+/// `LUST_FRONT_SAVE_EARLY=<n>` sets the count (16 or more: every thread at once, as before).
+const SAVE_EARLY: usize = 4;
+const SAVE_EARLY_ENV: &str = "LUST_FRONT_SAVE_EARLY";
+
+/// The build process a background save's child shares the box with (`watch_build`): `gone` turns
+/// true when it exits, or when watching it fails, so no thread waits on a wait that cannot end.
+struct BuildWatch {
+    early: usize,
+    gone: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+    /// When the watch started (right after the fork), and how many ms later it ended.
+    since: std::time::Instant,
+    ended: std::sync::OnceLock<f64>,
+}
+
+impl BuildWatch {
+    fn new(early: usize) -> BuildWatch {
+        let (gone, cv, ended) = Default::default();
+        BuildWatch { early, gone, cv, since: std::time::Instant::now(), ended }
+    }
+
+    fn end(&self) {
+        let _ = self.ended.set(self.since.elapsed().as_secs_f64() * 1e3);
+        *self.gone.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cv.notify_all();
+    }
+
+    /// For the save line: how long the save ran on `early` threads.
+    fn note(&self) -> String {
+        match self.ended.get() {
+            Some(ms) => format!(", {} threads until the build exited {ms:.0} ms after the fork", self.early),
+            None => format!(", {} threads (the build outlived the save)", self.early),
+        }
+    }
+}
+
+/// Set only in a background save's child, while its build process lives.
+static BUILD_WATCH: std::sync::OnceLock<BuildWatch> = std::sync::OnceLock::new();
+
+/// In a background save's child: watches the build process `pid` (its parent) through a pidfd on
+/// a thread of its own, which ends the watch when the build exits. No watch (every thread works
+/// at once) when the build has exited already, when the count is the workers' or more, or when a
+/// call fails. Linux only.
+fn watch_build(pid: u32) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+    #[cfg(target_os = "linux")]
+    {
+        let early = std::env::var(SAVE_EARLY_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(SAVE_EARLY);
+        if early >= workers() {
+            return;
+        }
+        const SYS_PIDFD_OPEN: std::ffi::c_long = 434;
+        // SAFETY: pidfd_open(pid, 0) makes a new descriptor or returns -1.
+        let fd = unsafe { syscall(SYS_PIDFD_OPEN, pid as std::ffi::c_long, 0 as std::ffi::c_long) } as c_int;
+        if fd < 0 {
+            return;
+        }
+        // The pid names the build only while it lives: still this child's parent after the
+        // open, so the descriptor is the build's.
+        // SAFETY: getppid takes nothing and cannot fail.
+        if unsafe { getppid() } as u32 != pid {
+            // SAFETY: the descriptor just made, used nowhere else.
+            unsafe { close(fd) };
+            return;
+        }
+        let watch = BUILD_WATCH.get_or_init(|| BuildWatch::new(early));
+        let spawned = std::thread::Builder::new().name("lust-save-watch".into()).spawn(move || {
+            const POLLIN: i16 = 1;
+            let mut p = PollFd { fd, events: POLLIN, revents: 0 };
+            // A pidfd turns readable when its process exits; a failed poll ends the watch too.
+            // SAFETY: one valid record for one descriptor.
+            while unsafe { poll(&mut p, 1, -1) } < 0 && std::io::Error::last_os_error().raw_os_error() == Some(EINTR) {}
+            watch.end();
+        });
+        if spawned.is_err() {
+            watch.end();
+        }
+    }
+}
+
+/// One parallel part of a background save (`pack`, `changed_runs`): its first `BuildWatch::early`
+/// workers start at once; while the build lives, each later one waits in `enter` until the build
+/// exits, or until the part's work runs out (`Leave`), so a part never waits for the build.
+struct SaveGate<'a> {
+    watch: Option<&'a BuildWatch>,
+    tickets: AtomicUsize,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> SaveGate<'a> {
+    fn new(watch: Option<&'a BuildWatch>) -> SaveGate<'a> {
+        SaveGate { watch, tickets: AtomicUsize::new(0), done: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    /// Lets a worker in; false when the part's work ran out while it waited. Its `Leave`
+    /// (returned either way) tells the waiting workers when it stops.
+    fn enter(&self) -> (bool, Leave<'_, 'a>) {
+        let leave = Leave(self);
+        let Some(w) = self.watch.filter(|w| self.tickets.fetch_add(1, Ordering::Relaxed) >= w.early) else {
+            return (true, leave);
+        };
+        let mut gone = w.gone.lock().unwrap_or_else(|e| e.into_inner());
+        while !*gone && !self.done.load(Ordering::Relaxed) {
+            gone = w.cv.wait(gone).unwrap_or_else(|e| e.into_inner());
+        }
+        (!self.done.load(Ordering::Relaxed), leave)
+    }
+}
+
+/// A worker of a `SaveGate` part; when it stops, the part's work is all taken (or failed), so the
+/// workers still waiting leave.
+struct Leave<'g, 'a>(&'g SaveGate<'a>);
+
+impl Drop for Leave<'_, '_> {
+    fn drop(&mut self) {
+        self.0.done.store(true, Ordering::Relaxed);
+        if let Some(w) = self.0.watch {
+            let _held = w.gone.lock().unwrap_or_else(|e| e.into_inner());
+            w.cv.notify_all();
+        }
+    }
+}
+
 /// The threads that pack or unpack a layer's sections.
 fn workers() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16)
@@ -832,9 +973,14 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
     let parts: Vec<std::sync::Mutex<Option<Vec<u8>>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let failed = std::sync::atomic::AtomicBool::new(false);
+    let gate = SaveGate::new(BUILD_WATCH.get());
     std::thread::scope(|s| {
         for _ in 0..workers().min(n.max(1)) {
             s.spawn(|| {
+                let (go, _leave) = gate.enter();
+                if !go {
+                    return;
+                }
                 let mut rbuf = vec![0u8; SECTION];
                 let mut ebuf: Vec<u8> = Vec::with_capacity(UNPACKED_MAX);
                 loop {
@@ -1287,9 +1433,14 @@ fn changed_runs(runs: &[(usize, usize)], hashes: &[AtomicU64]) -> Result<Vec<(us
     let found: Vec<std::sync::Mutex<Vec<(usize, usize)>>> = chunks.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let next = AtomicUsize::new(0);
     let failed = std::sync::atomic::AtomicBool::new(false);
+    let gate = SaveGate::new(BUILD_WATCH.get());
     std::thread::scope(|s| {
         for _ in 0..workers().min(chunks.len().max(1)) {
             s.spawn(|| {
+                let (go, _leave) = gate.enter();
+                if !go {
+                    return;
+                }
                 let Ok(pagemap) = std::fs::File::open("/proc/self/pagemap") else {
                     failed.store(true, Ordering::Relaxed);
                     return;
@@ -2210,7 +2361,8 @@ fn quiesce() {
 /// waiting (a base save takes 10-18 s on tsgo). A release build's cc step
 /// runs after the fork, in the parent (`driver::defer_cc`), so the save
 /// overlaps clang; the child drops it first and saves at idle priority
-/// (`save_idle`), so clang and the link go first. The child is this
+/// (`save_idle`) and, while the build lives, on 4 threads (`SaveGate`), so
+/// clang and the link go first. The child is this
 /// process's memory at the fork with this thread alone; it detaches (its
 /// own session, standard streams on /dev/null, so no pipe of the caller
 /// waits for it), holds the state lock until it exits (`lock`), and
@@ -2243,6 +2395,7 @@ pub fn save_background(dir: &Path, mut roots: Box<Roots>) -> Result<String, Stri
             });
         }
         save_idle();
+        watch_build(build_pid);
         // The parent runs a parked cc step after the fork (`driver::defer_cc`): its unit
         // texts are freed here, so they are not live blocks of the image. So are the kept
         // programs no later build reuses, which the parent left to this child.
@@ -2606,7 +2759,7 @@ fn write_image(dir: &Path, mut roots: Box<Roots>) -> Result<String, String> {
         k += 1;
     }
     Ok(format!(
-        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}{}, {:.0} ms, {} MB live ({} MB of restored blocks freed){}",
+        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}{}, {:.0} ms, {} MB live ({} MB of restored blocks freed){}{}",
         h.generation,
         if layer == 0 { "base".to_string() } else { format!("delta {layer}") },
         w.blocks,
@@ -2617,7 +2770,8 @@ fn write_image(dir: &Path, mut roots: Box<Roots>) -> Result<String, String> {
         t.elapsed().as_secs_f64() * 1e3,
         live >> 20,
         OLD_FREED.load(Ordering::Relaxed) >> 20,
-        packed_len.map_or_else(|| format!(", {}", raw_why().unwrap_or("raw")), |n| format!(", packed to {} MB", n >> 20))
+        packed_len.map_or_else(|| format!(", {}", raw_why().unwrap_or("raw")), |n| format!(", packed to {} MB", n >> 20)),
+        BUILD_WATCH.get().map_or_else(String::new, BuildWatch::note)
     ))
 }
 
@@ -2825,6 +2979,34 @@ mod tests {
         write_layer(&layer_path(&dir, 0), &header(10, 5));
         assert!(read_chain(&dir).is_err(), "a base must have no parent");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save part's first workers start at once; while the build lives the others wait, and
+    /// leave when the work runs out first (a part never waits for the build), or join when it
+    /// exits.
+    #[test]
+    fn save_gate_waits_for_the_build_or_the_work() {
+        let watch = BuildWatch::new(1);
+        let run = |gate: &SaveGate, ran: &AtomicUsize, all_in: bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let (go, _leave) = gate.enter();
+            if go {
+                ran.fetch_add(1, Ordering::Relaxed);
+                // The early worker of the second part works until the others join.
+                while all_in && ran.load(Ordering::Relaxed) < 4 && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+            }
+        };
+        let (gate, ran) = (SaveGate::new(Some(&watch)), AtomicUsize::new(0));
+        std::thread::scope(|s| (0..4).for_each(|_| drop(s.spawn(|| run(&gate, &ran, false)))));
+        assert_eq!(ran.load(Ordering::Relaxed), 1, "the build lives: one worker, the others leave with the work done");
+        let (gate, ran) = (SaveGate::new(Some(&watch)), AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            (0..4).for_each(|_| drop(s.spawn(|| run(&gate, &ran, true))));
+            watch.end();
+        });
+        assert_eq!(ran.load(Ordering::Relaxed), 4, "the build exited: every worker joins");
     }
 
     #[test]
