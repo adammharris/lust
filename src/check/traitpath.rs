@@ -82,10 +82,10 @@ impl<'p> Ctx<'p> {
             if crate::ty::lang::std_path_kind(&path) != Some(crate::ty::lang::StdPathKind::Trait) {
                 return None;
             }
-            // A full canonical path names its trait whether or not the
-            // trait is in the prelude (`std::borrow::Borrow`), as
-            // `trait_def_of_path` reads it: by name, not by bare name.
-            p.gx.resolve_cx(&p.type_names, &p.aliases).trait_by_name(&p.interner, segs[last - 1].name)?
+            // A full canonical path names std's trait whether or not the
+            // trait is in the prelude (`std::borrow::Borrow`), and never a
+            // user trait of the same name (a root `trait From`).
+            p.gx.lang.by_name(self.name(segs[last - 1].name))?
         };
         Some(tdef)
     }

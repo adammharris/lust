@@ -1545,10 +1545,6 @@ fn put_anon_want(sink: &AnonWants, e: u32, want: Option<ConstScalar>) {
 }
 
 impl ResolveCx<'_> {
-    /// A trait def by its written name: user traits, then lang.
-    pub fn trait_by_name(&self, interner: &Interner, name: Sym) -> Option<DefId> {
-        self.trait_names.get(&name).copied().or_else(|| self.lang.by_name(interner.get(name)))
-    }
     /// A trait by a bare (one-segment) name: a local trait, or a lang
     /// trait of the Rust 2024 prelude. A non-prelude std trait needs a
     /// `use`, which the resolver's rewrite turns into its full std path
