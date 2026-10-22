@@ -1794,6 +1794,10 @@ pub struct Checked<'g> {
     /// (`record_cast_annotation`), by cast expr: lowering puts the cast's
     /// value in a temporary annotated with it.
     pub cast_annotations: Vec<(ExprId, Ty)>,
+    /// `let _: T = init` with a `T` that names a lifetime: the regioned
+    /// `T` the initializer's value takes (lowering puts it through an
+    /// annotated temporary, as a cast's).
+    pub wild_annotations: Vec<(ExprId, Ty)>,
     /// Obligations taken from this body's queue, once per take (each
     /// run round takes them all; `Obligations::work`). A work count for
     /// tests that guard against selection blow-ups.
@@ -2603,6 +2607,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             poisoned: false,
             annotations: Vec::new(),
             cast_annotations: Vec::new(),
+            wild_annotations: Vec::new(),
             queue_work: 0,
             opaque_hidden: Vec::new(),
             opaque_holds: Vec::new(),
@@ -8400,7 +8405,7 @@ impl<'p> Ctx<'p> {
                         }
                     }
                     if let Some(t) = annotated {
-                        self.record_annotation(*pat, t);
+                        self.record_annotation(*pat, t, *init);
                     } else if let Some(&t) = ty_ann.as_ref()
                         && generics::qpath_names_lifetime(&self.p.ast, &self.p.interner, t)
                     {
@@ -8452,10 +8457,11 @@ impl<'p> Ctx<'p> {
     /// Records the regioned form of `let` annotation `t` for each binding
     /// pattern `pat` covers (W-BORROW): `'static` and the fn's named
     /// lifetimes keep their regions, elided ones are free. A pattern
-    /// shape this cannot follow (by-ref bindings, `_`, nested patterns
-    /// other than tuples) would drop the annotation's constraints, so it is
-    /// a reject (L0203).
-    fn record_annotation(&mut self, pat: ast::PatId, t: ast::TyId) {
+    /// shape this cannot follow (by-ref bindings, nested patterns other
+    /// than tuples) would drop the annotation's constraints, so it is a
+    /// reject (L0203). A `_` gives the regions to the initializer's value
+    /// instead (`wild_annotations`).
+    fn record_annotation(&mut self, pat: ast::PatId, t: ast::TyId, init: Option<ExprId>) {
         let p = self.p;
         let Some(r) = self.regioned_annotation(t, Region::Erased, true) else { return };
         // The annotation must be well-formed under the fn's implied
@@ -8465,6 +8471,12 @@ impl<'p> Ctx<'p> {
             && let Some(d) = crate::check::outlives::check_body_ty(p, &mut self.tys, sig, env, r, p.ast.ty_span(t))
         {
             self.errs.push(d);
+        }
+        if matches!(p.ast.pat(pat), Pat::Wild) {
+            if let Some(i) = init {
+                self.out.wild_annotations.push((i, r));
+            }
+            return;
         }
         if !self.annotate_pat(pat, r) {
             let s = p.ast.pat_span(pat);

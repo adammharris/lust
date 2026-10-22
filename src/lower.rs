@@ -3536,7 +3536,27 @@ impl<'p> Lower<'p> {
                 // moved, but its root is live here; an index in it still
                 // runs, through a shared borrow. A value goes into a
                 // statement temporary that is mentioned the same way.
-                if self.ck.coerce(init) == Coerce::None && self.is_place_expr(init) {
+                let place = self.ck.coerce(init) == Coerce::None && self.is_place_expr(init);
+                // An annotation that names a lifetime (`let _: fn() -> &'static str = f;`):
+                // the value goes through a temporary whose regions are the written
+                // ones (W-BORROW). A place is never read here, so it has no value to
+                // hold them.
+                if let Some(&(_, r)) = self.ck.wild_annotations.iter().find(|(i, _)| *i == init) {
+                    if place {
+                        self.body.lower_errs.push(crate::diag::Diag::new(
+                            "L0203",
+                            p.ast.pat_span(pat),
+                            "an explicit lifetime in the annotation of `_` over a place is not supported yet",
+                            "Bind a plain name (`let x: T = ..`).",
+                        ));
+                    } else {
+                        let ty = self.coerced_ty(init);
+                        let t = self.temp(ty);
+                        self.expr_into(init, Some(&Place::local(t)));
+                        self.body.annotations.push((t, r));
+                        self.push(StmtKind::FakeRead(t), span);
+                    }
+                } else if place {
                     let pl = self.place(init);
                     if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
                         let rt = self.ref_ty(false, self.ty(init));
