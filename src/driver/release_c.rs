@@ -47,21 +47,25 @@ fn hash64(s: &str) -> u64 {
 /// The stable names of `program`'s release C: each slot's fn by a hash of its
 /// `DiskDefId`, each Adt by its def hash (`d`) or instance key hash (`i`).
 pub fn names(program: &Program, fn_slot: &[u32], n_slots: usize, inst_adts: &[(u32, u64)]) -> Arc<cgen::names::Names> {
+    // The names are made on the pool (7 ms on one thread for tsgo's 78k fns).
+    let fn_ids: Vec<u32> = (0..fn_slot.len().min(program.fns.len()) as u32).collect();
+    let made = crate::pool::par_map(&fn_ids, |&i| {
+        let d = program.disk_id(LocalDefId(i));
+        format!("{:016x}", hash64(&format!("{:016x}{:016x}", d.krate.0, d.hash.0)))
+    });
     let mut fns = vec![None; n_slots];
-    for (i, &slot) in fn_slot.iter().enumerate().take(program.fns.len()) {
-        let d = program.disk_id(LocalDefId(i as u32));
-        if let Some(x) = fns.get_mut(slot as usize) {
-            *x = Some(format!("{:016x}", hash64(&format!("{:016x}{:016x}", d.krate.0, d.hash.0))));
+    for (i, name) in made.into_iter().enumerate() {
+        if let Some(x) = fns.get_mut(fn_slot[i] as usize) {
+            *x = Some(name);
         }
     }
     let inst: crate::intern::FxMap<u32, u64> = inst_adts.iter().copied().collect();
-    let adts = (0..program.adts.len())
-        .map(|a| match (inst.get(&(a as u32)), program.defs.def_of_adt(crate::ty::AdtId(a as u32))) {
-            (Some(k), _) => format!("i{k:016x}"),
-            (None, Some(d)) => format!("d{:016x}", d.hash.0),
-            (None, None) => format!("x{a}"),
-        })
-        .collect();
+    let adt_ids: Vec<u32> = (0..program.adts.len() as u32).collect();
+    let adts = crate::pool::par_map(&adt_ids, |&a| match (inst.get(&a), program.defs.def_of_adt(crate::ty::AdtId(a))) {
+        (Some(k), _) => format!("i{k:016x}"),
+        (None, Some(d)) => format!("d{:016x}", d.hash.0),
+        (None, None) => format!("x{a}"),
+    });
     Arc::new(cgen::names::Names { fns, adts, by_id: Default::default() })
 }
 

@@ -9634,6 +9634,11 @@ pub fn group_fns_by_bytes(sizes: &[usize], target: usize) -> Vec<std::ops::Range
 pub struct GlueSet {
     pub protos: crate::intern::FxMap<(Glue, CTy), String>,
     defs: String,
+    /// `defs` is not kept up to date: its one reader, the glue unit with no shared set
+    /// (`glue_unit`), makes it from `def_map` then. A set keeps `defs` only until a shared set
+    /// is picked (the first build), as a refresh that changed a definition rebuilt it for
+    /// nothing after that (7 ms for tsgo).
+    defs_stale: bool,
     /// Each key's definition on its own, so units can carry static copies of just what they reach.
     def_map: crate::intern::FxMap<(Glue, CTy), String>,
     /// The glue keys each key's definition calls.
@@ -9701,9 +9706,10 @@ impl GlueSet {
     /// the set only where an entry changed (a refresh walks about 0.5 M roots and 23k keys for
     /// tsgo, and made all of them on one thread, 0.2-0.3 s).
     fn regen(&mut self, p: &Program, slots: &[u32], roots: &[&(Glue, CTy)], all: bool) -> (bool, bool) {
-        let Plan { keys, index, roots, mut made } = self.plan(p, slots, roots, all);
+        let mut plan = self.plan(p, slots, roots, all);
+        let (mut made, mut pending) = (std::mem::take(&mut plan.made), std::mem::take(&mut plan.roots));
+        let keys = &plan.keys;
         let mut seen = vec![false; keys.len()];
-        let mut pending = roots;
         let (mut shared_changed, mut regenerated) = (false, false);
         while let Some(i) = pending.pop() {
             let i = i as usize;
@@ -9725,7 +9731,7 @@ impl GlueSet {
                 regenerated |= !m.is_new;
                 shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(g));
                 if m.is_new {
-                    self.defs.push_str(&m.def);
+                    self.push_def(&m.def);
                 }
                 self.def_map.insert(g.clone(), m.def);
                 self.deps.insert(g.clone(), m.more);
@@ -9734,15 +9740,35 @@ impl GlueSet {
             }
             pending.extend(m.more_ids);
         }
-        if regenerated {
+        if regenerated && !self.defs_stale() {
             // `defs` is the pre-hybrid concatenation; rebuild it from the
             // per-key map. Order does not matter: prototypes precede it.
             self.defs = self.def_map.values().cloned().collect();
         }
         if all {
-            self.stale = self.protos.keys().filter(|k| index.get(*k).is_none_or(|&i| !seen[i as usize])).cloned().collect();
+            // The stored keys the walk did not reach, found on the pool.
+            let have: Vec<&(Glue, CTy)> = self.protos.keys().collect();
+            let gone = crate::pool::par_map(&have, |k| plan.get(k).is_none_or(|i| !seen[i as usize]));
+            let stale = have.into_iter().zip(gone).filter(|&(_, gone)| gone).map(|(k, _)| k.clone()).collect();
+            self.stale = stale;
         }
         (shared_changed, regenerated)
+    }
+
+    /// True when `defs` is not kept (`defs_stale`): a shared set is picked. It frees `defs` then.
+    fn defs_stale(&mut self) -> bool {
+        if !self.defs_stale && self.shared.is_some() {
+            self.defs_stale = true;
+            self.defs = String::new();
+        }
+        self.defs_stale
+    }
+
+    /// Adds a new key's definition to `defs` while the set keeps it.
+    fn push_def(&mut self, def: &str) {
+        if !self.defs_stale() {
+            self.defs.push_str(def);
+        }
     }
 
     /// `regen`'s keys, numbered: the roots in order and every key the walk reaches (a made key's
@@ -9751,15 +9777,9 @@ impl GlueSet {
     /// caller's release names and in one layout phase (the program is frozen meanwhile).
     fn plan(&self, p: &Program, slots: &[u32], roots: &[&(Glue, CTy)], all: bool) -> Plan {
         let makes = |g: &(Glue, CTy)| all || !self.protos.contains_key(g) || self.stale.contains(g);
-        let mut plan = Plan { keys: Vec::new(), index: crate::intern::FxMap::default(), roots: Vec::with_capacity(roots.len()), made: Vec::new() };
-        let mut level: Vec<u32> = Vec::new();
-        for g in roots {
-            let (i, new) = plan.id(g);
-            plan.roots.push(i);
-            if new && makes(g) {
-                level.push(i);
-            }
-        }
+        let mut plan = Plan::of_roots(roots);
+        // The roots' keys are new to the plan: those to make, in the order they first appear.
+        let mut level: Vec<u32> = (0..plan.keys.len() as u32).filter(|&i| makes(&plan.keys[i as usize])).collect();
         let (names, tag) = (names::current(), layout_phase());
         while !level.is_empty() {
             let make = |&i: &u32| in_layout_phase(tag, || names::with(names.as_ref(), || Made::of(p, slots, &plan.keys[i as usize], self)));
@@ -9902,22 +9922,88 @@ impl GlueSet {
 struct Plan {
     /// Every key the walk reaches, by index.
     keys: Vec<(Glue, CTy)>,
-    index: crate::intern::FxMap<(Glue, CTy), u32>,
+    /// Each key's index, in shards by the key's hash (`key_hash`), so the roots' shards fill
+    /// on the pool.
+    index: Vec<crate::intern::FxMap<(Glue, CTy), u32>>,
     /// The roots' indices, in order.
     roots: Vec<u32>,
     /// By index: the key's new definition, when the walk makes it.
     made: Vec<Option<Made>>,
 }
 
+/// A glue key's FxHash, which `Plan` shards its index by.
+fn key_hash(g: &(Glue, CTy)) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::intern::FxHasher::default();
+    g.hash(&mut h);
+    h.finish()
+}
+
+/// A root's key with its hash, made once (`Plan::of_roots`): a map of them hashes only that.
+struct Hashed<'a>(u64, &'a (Glue, CTy));
+
+impl std::hash::Hash for Hashed<'_> {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        h.write_u64(self.0);
+    }
+}
+
+impl PartialEq for Hashed<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1
+    }
+}
+
+impl Eq for Hashed<'_> {}
+
 impl Plan {
+    /// The plan of `roots` alone: their keys numbered in the order they first appear, and
+    /// each root's key index, as numbering the roots in turn (`id`) gives. A refresh numbers
+    /// 126k roots of 18.6k keys for tsgo (19 ms on one thread): here the roots hash on the
+    /// pool, each shard of their hashes finds its keys' first places there, and the index
+    /// fills a shard per task.
+    fn of_roots(roots: &[&(Glue, CTy)]) -> Plan {
+        let n_shards = (crate::pool::threads() * 4).max(1);
+        let shard = |h: u64| (h % n_shards as u64) as usize;
+        let hashes: Vec<u64> = crate::pool::par_map(roots, |g| key_hash(g));
+        let mut by_shard: Vec<Vec<u32>> = vec![Vec::new(); n_shards];
+        hashes.iter().enumerate().for_each(|(at, &h)| by_shard[shard(h)].push(at as u32));
+        // Each root's place and its key's first place, a shard per task.
+        let firsts: Vec<Vec<(u32, u32)>> = crate::pool::par_map(&by_shard, |ats| {
+            let mut first: std::collections::HashMap<Hashed, u32, std::hash::BuildHasherDefault<crate::intern::FxHasher>> = Default::default();
+            ats.iter().map(|&at| (at, *first.entry(Hashed(hashes[at as usize], roots[at as usize])).or_insert(at))).collect()
+        });
+        let mut first = vec![0u32; roots.len()];
+        firsts.iter().flatten().for_each(|&(at, f)| first[at as usize] = f);
+        // The keys by their first places, in order.
+        let places: Vec<u32> = (0..roots.len() as u32).filter(|&at| first[at as usize] == at).collect();
+        let mut id_at = vec![0u32; roots.len()];
+        places.iter().enumerate().for_each(|(i, &at)| id_at[at as usize] = i as u32);
+        let keys: Vec<(Glue, CTy)> = crate::pool::par_map(&places, |&at| roots[at as usize].clone());
+        let mut of_shard: Vec<Vec<u32>> = vec![Vec::new(); n_shards];
+        places.iter().enumerate().for_each(|(i, &at)| of_shard[shard(hashes[at as usize])].push(i as u32));
+        let index = crate::pool::par_map(&of_shard, |is| is.iter().map(|&i| (keys[i as usize].clone(), i)).collect());
+        Plan { roots: first.iter().map(|&f| id_at[f as usize]).collect(), keys, index, made: Vec::new() }
+    }
+
+    fn shard(&self, g: &(Glue, CTy)) -> usize {
+        (key_hash(g) % self.index.len() as u64) as usize
+    }
+
+    /// The index of key `g`, when the plan has it.
+    fn get(&self, g: &(Glue, CTy)) -> Option<u32> {
+        self.index[self.shard(g)].get(g).copied()
+    }
+
     /// The index of key `g`, and whether it is new.
     fn id(&mut self, g: &(Glue, CTy)) -> (u32, bool) {
-        if let Some(&i) = self.index.get(g) {
+        let s = self.shard(g);
+        if let Some(&i) = self.index[s].get(g) {
             return (i, false);
         }
         let i = self.keys.len() as u32;
         self.keys.push(g.clone());
-        self.index.insert(g.clone(), i);
+        self.index[s].insert(g.clone(), i);
         (i, true)
     }
 }
@@ -10535,7 +10621,11 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
     for proto in protos {
         c.push_str(proto);
     }
-    c.push_str(&g.defs);
+    if g.defs_stale {
+        g.def_map.values().for_each(|d| c.push_str(d));
+    } else {
+        c.push_str(&g.defs);
+    }
     c.push_str(&static_defs(p, &g.slots));
     c
 }

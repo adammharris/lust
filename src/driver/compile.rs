@@ -4438,22 +4438,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // C stays right when its source text moves. An instance's base is
     // its source fn's line (`GenReuse::source`): the template's, a
     // closure's host fn's, or a trait default method's own first line.
-    let line_bases: Vec<u32> = (0..program.fns.len())
-        .map(|i| match caches.gen_reuse.source(&program, LocalDefId(i as u32)) {
-            Some(s) if (s.0 as usize) < fn_count => scan_of(front, s.0 as usize).1,
-            Some(s) => map.line_col(map.call_site(program.fn_def(s).name_span)).0,
-            None => 0,
-        })
-        .collect();
+    // Each fn's source file too (W-PANIC): a panic in a module file names that file. An
+    // instance takes its source fn's file, as it takes its line. Both on the pool.
+    let fn_ids: Vec<u32> = (0..program.fns.len() as u32).collect();
+    let (line_bases, fn_files): (Vec<u32>, Vec<u32>) = par_map(&fn_ids, |&i| match caches.gen_reuse.source(&program, LocalDefId(i)) {
+        Some(s) if (s.0 as usize) < fn_count => (scan_of(front, s.0 as usize).1, map.call_site(program.fn_def(s).name_span).file.0),
+        Some(s) => {
+            let at = map.call_site(program.fn_def(s).name_span);
+            (map.line_col(at).0, at.file.0)
+        }
+        None => (0, ROOT_FILE.0),
+    })
+    .into_iter()
+    .unzip();
     let line_base_of = |_: &Front, i: usize| -> u32 { line_bases.get(i).copied().unwrap_or(0) };
-    // Each fn's source file (W-PANIC): a panic in a module file names that
-    // file. An instance takes its source fn's file, as it takes its line.
-    let fn_files: Vec<u32> = (0..program.fns.len())
-        .map(|i| match caches.gen_reuse.source(&program, LocalDefId(i as u32)) {
-            Some(s) => map.call_site(program.fn_def(s).name_span).file.0,
-            None => ROOT_FILE.0,
-        })
-        .collect();
     // Release C (driver/release_c.rs): content-addressed names, set as cgen's naming
     // context around every step that prints C.
     let rnames = release.then(|| super::release_c::names(&program, &front.fn_slot, front.slot_of.len().max(caches.out.len()), &inst_adt_ids(&program)));
@@ -4633,9 +4631,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // static copies reassemble too. The statics compare against the
     // fingerprint last built into the glue unit, so a value edit
     // consumed by an earlier check request still rebuilds it here.
-    let statics_fp = crate::driver::graph::statics_fingerprint(&program);
-    let statics_changed = caches.statics_fp != statics_fp;
-    caches.statics_fp = statics_fp;
+    // Release C has a statics unit of its own, made every build, and no glue unit: it skips the
+    // fingerprint (10 ms for tsgo), which then stays the glue unit's last one.
+    let statics_changed = !release && {
+        let statics_fp = crate::driver::graph::statics_fingerprint(&program);
+        std::mem::replace(&mut caches.statics_fp, statics_fp) != statics_fp
+    };
     // Glue an earlier refresh did not reach (no live body used it then)
     // is stale in the set; `add` regenerates it when a body reaches it
     // again, with the same fresh-base rule.
