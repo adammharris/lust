@@ -113,6 +113,8 @@ const PACKED_TOP: usize = 40;
 /// Saves write packed layers when libzstd loads; `LUST_FRONT_ZSTD=0` keeps
 /// them raw.
 const PACK_ENV: &str = "LUST_FRONT_ZSTD";
+/// How many threads read a packed restore's sections (`fill`; default half the workers).
+const READERS_ENV: &str = "LUST_FRONT_READERS";
 /// Packed layers unpack into anonymous memory (`fill`);
 /// `LUST_FRONT_RESTORE=memfd` unpacks them into memfds instead (`unpack`).
 const RESTORE_ENV: &str = "LUST_FRONT_RESTORE";
@@ -1026,8 +1028,11 @@ fn fill(
     let threads = workers().min(jobs.len().max(1));
     // Readers keep reads in flight while the workers unpack and place: a
     // worker that read its own sections left its CPU idle while it waited
-    // (CI, merge 12's chain: restore 1302-1415 -> 1238-1291 ms).
-    let readers = (threads / 2).clamp(1, jobs.len().max(1));
+    // (CI, merge 12's chain: restore 1302-1415 -> 1238-1291 ms). Half the
+    // workers by default; `LUST_FRONT_READERS=<n>` sets the count (a CI
+    // restore waits on the disk: its 8 readers read for ~8x the fill's wall
+    // time, so none is ever idle).
+    let readers = std::env::var(READERS_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(threads / 2).clamp(1, jobs.len().max(1));
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(64);
     let rx = std::sync::Mutex::new(rx);
     // The packed bytes of job `i`, or None on a read error.
