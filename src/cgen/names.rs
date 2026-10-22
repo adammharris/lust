@@ -464,6 +464,123 @@ fn statics_types(p: &Program, statics: impl Iterator<Item = usize>) -> (HashSet<
     (held, pointed)
 }
 
+/// What B1 reads of the release statics (`record::Read::Statics`): what `statics_outs` makes
+/// each static's C from, in its order. A static's symbol and C type, its `thread_local!` native
+/// cell, and the value the pass emits (a key's slot word as the pass numbers it, not the value
+/// collect gave it). A value names a str by its bytes, a static by its symbol (and path), a fn
+/// pointer by its trampoline and the prototype it calls, never by an index a merge or a rebuilt
+/// session moves. The layouts are the pass's Type reads. Hashed in ranges of statics on all cores.
+pub(crate) fn statics_content_fp(p: &Program, slots: &[u32]) -> (u64, u64) {
+    use crate::ty::consteval::ConstValue as CV;
+    fn value(p: &Program, v: &CV, slots: &[u32], out: &mut Vec<u8>) {
+        let len = |out: &mut Vec<u8>, n: usize| out.extend_from_slice(&(n as u64).to_le_bytes());
+        match v {
+            CV::Int(i) => {
+                out.push(1);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            CV::Float(bits, ft) => {
+                out.push(2);
+                out.extend_from_slice(&bits.to_le_bytes());
+                out.extend_from_slice(format!("{ft:?}").as_bytes());
+            }
+            CV::Bool(b) => out.extend_from_slice(&[3, *b as u8]),
+            CV::Char(c) => {
+                out.push(4);
+                out.extend_from_slice(&(*c as u32).to_le_bytes());
+            }
+            CV::Str(i) => {
+                let s = p.ast.strings[*i as usize].as_bytes();
+                out.push(5);
+                len(out, s.len());
+                out.extend_from_slice(s);
+            }
+            CV::StrBytes(b) | CV::Bytes(b) => {
+                out.push(if matches!(v, CV::StrBytes(_)) { 6 } else { 7 });
+                len(out, b.as_slice().len());
+                out.extend_from_slice(b.as_slice());
+            }
+            CV::Unit => out.push(8),
+            CV::Aggregate(vs) => {
+                out.push(9);
+                len(out, vs.len());
+                vs.iter().for_each(|x| value(p, x, slots, out));
+            }
+            CV::Variant(k, vs) => {
+                out.push(10);
+                out.extend_from_slice(&k.to_le_bytes());
+                len(out, vs.len());
+                vs.iter().for_each(|x| value(p, x, slots, out));
+            }
+            CV::Repeat(x, n) => {
+                out.push(11);
+                out.extend_from_slice(&n.to_le_bytes());
+                value(p, x, slots, out);
+            }
+            CV::Ref(x) => {
+                out.push(12);
+                value(p, x, slots, out);
+            }
+            CV::StaticRef(i) => {
+                out.push(13);
+                out.extend_from_slice(static_sym(p, *i).as_bytes());
+                out.push(0);
+            }
+            CV::StaticPlace(i, path) => {
+                out.push(14);
+                out.extend_from_slice(static_sym(p, *i).as_bytes());
+                out.extend_from_slice(format!("{path:?}").as_bytes());
+                out.push(0);
+            }
+            CV::FnPtr(f) => {
+                out.push(15);
+                if let Some(&slot) = slots.get(*f as usize) {
+                    out.extend_from_slice(fn_sig(p, LocalDefId(*f), slot).as_bytes());
+                    out.extend_from_slice(trampoline(p, LocalDefId(*f), slot).as_bytes());
+                }
+                out.push(0);
+            }
+        }
+    }
+    let order = super::statics_in_order(p);
+    let tls_word: HashMap<usize, CV> =
+        order.iter().filter(|&&i| p.statics[i].tls.is_some()).enumerate().map(|(n, &i)| (i, CV::Int(n as i128 + 1))).collect();
+    let ranges: Vec<std::ops::Range<usize>> = (0..order.len()).step_by(64).map(|a| a..(a + 64).min(order.len())).collect();
+    let (names, tag) = (current(), super::layout_phase());
+    let hashes = crate::pool::par_map(&ranges, |r| {
+        super::in_layout_phase(tag, || {
+            with(names.as_ref(), || {
+                let mut out = Vec::new();
+                for &i in &order[r.clone()] {
+                    let st = &p.statics[i];
+                    out.extend_from_slice(static_sym(p, i as u32).as_bytes());
+                    out.push(0);
+                    out.extend_from_slice(mangle(&cty(&p.tys, st.ty)).as_bytes());
+                    out.push(0);
+                    match super::native_tls_cell(p, i) {
+                        Some(cell) => {
+                            out.push(1);
+                            out.extend_from_slice(mangle(&cell).as_bytes());
+                        }
+                        None => {
+                            out.push(0);
+                            value(p, tls_word.get(&i).unwrap_or(&st.value), slots, &mut out);
+                        }
+                    }
+                }
+                crate::driver::cache::hash128(&[&out], 41)
+            })
+        })
+    });
+    let all: Vec<u8> = hashes.iter().flat_map(|(a, b)| a.to_le_bytes().into_iter().chain(b.to_le_bytes())).collect();
+    crate::driver::cache::hash128(&[&(order.len() as u64).to_le_bytes(), &all], 42)
+}
+
+/// The B1 record of a statics pass (`statics_parts` with `rec`): one hash of the pieces of its
+/// index and its parts, in order, and every read of the pass (the union of theirs, with
+/// `Read::Statics`). None when a text of the pass came from no piece.
+pub type StaticsRecord = Option<((u64, u64), Vec<record::Read>)>;
+
 /// Release C statics in parts (`LUST_RELEASE_STATICS_KB`): the statics in emission order, cut
 /// where a static's own bytes say (`cut_after` at odds bytes / `target`; a static of `target`
 /// bytes or more alone), so a merge that changes one static recompiles its part only, and a
@@ -472,8 +589,9 @@ fn statics_types(p: &Program, statics: impl Iterator<Item = usize>) -> (HashSet<
 /// the part of the static whose value made it first, and equal content keeps one address
 /// across parts as in one unit. A part declares each such name it uses (its own too: a static's
 /// data can point into a later one's). Returns the index (unit 1), which registers every
-/// pointee in the pass's order (`lust_kstatics_init`), and the parts.
-pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<String>) {
+/// pointee in the pass's order (`lust_kstatics_init`), the parts, and with `rec` the pass's B1
+/// record (every byte of the index and the parts a piece).
+pub fn statics_parts(p: &Program, g: &GlueSet, target: usize, rec: bool) -> (String, Vec<String>, StaticsRecord) {
     let (outs, cx) = statics_outs(p, &g.slots);
     let target = target.max(1);
     let mut cuts: Vec<Vec<usize>> = Vec::new();
@@ -514,6 +632,9 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
     let parts = crate::pool::par_map(&cuts, |ks| {
         super::in_layout_phase(tag, || {
             with(names.as_ref(), || super::with_decl_cache(&decls, || {
+                if rec {
+                    record::open();
+                }
                 let body: String = ks.iter().map(|&k| outs[k].made.as_str()).chain(ks.iter().map(|&k| outs[k].data.as_str())).collect();
                 // The names it uses, and the names the alias macros among them use.
                 let mut used = names_found(&body, &wanted);
@@ -538,6 +659,7 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
                 let mut protos: Vec<&String> = Vec::new();
                 for n in names_found(&body, &glue_names) {
                     for &(k, proto) in &glue[n] {
+                        record::read(record::Read::Glue(k.0, k.1.clone()));
                         collect_types(&k.1, &mut pointed);
                         protos.push(proto);
                     }
@@ -545,23 +667,38 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
                 protos.sort();
                 pointed.retain(|t| !types.contains(t));
                 let mut c = unit_header();
+                record::piece(record::Kind::Fixed, 0, &c);
                 // No blocks: an initializer names the fields of every type its value holds.
                 type_decls_with(p, &mut c, &types, &pointed, Decls::ByValue { blocks: false }, &HashSet::new());
-                protos.into_iter().for_each(|x| c.push_str(x));
+                for x in protos {
+                    c.push_str(x);
+                    record::piece(record::Kind::GlueProto, record::key(x), x);
+                }
                 let named: HashSet<usize> = used.iter().filter_map(|n| by_sym.get(n)).map(|&k| outs[k].idx).collect();
+                let at = c.len();
                 c.push_str(&static_decls_for(p, &named));
+                record::piece(record::Kind::Statics, 0, &c[at..]);
                 // The declarations, in the pass's order: externs and prototypes, then the macros.
                 let mut decls: Vec<(usize, &str)> = used.iter().filter_map(|n| decl_of.get(n)).map(|&(d, at, _)| (at, d)).collect();
                 decls.sort_unstable();
+                let at = c.len();
                 decls.iter().filter(|(_, d)| !d.starts_with("#define")).for_each(|(_, d)| c.push_str(d));
                 decls.iter().filter(|(_, d)| d.starts_with("#define")).for_each(|(_, d)| c.push_str(d));
+                record::piece(record::Kind::Externs, 0, &c[at..]);
                 c.push_str(&body);
-                c
+                record::piece(record::Kind::Data, 0, &body);
+                let r = if rec { record::close(&c) } else { None };
+                (c, r)
             }))
         })
     });
+    let (parts, part_recs): (Vec<String>, Vec<_>) = parts.into_iter().unzip();
     // The index: every pointee, declared, then registered in the pass's order.
+    if rec {
+        record::open();
+    }
     let mut index = unit_header();
+    record::piece(record::Kind::Fixed, 0, &index);
     let regs: Vec<&str> = kconst::kstatics_regs(&cx).collect();
     let type_of: HashMap<&str, &CTy> = cx.decls.iter().filter_map(|(n, _, t)| Some((n.as_str(), t.as_ref()?))).collect();
     let mut named = HashSet::new();
@@ -571,13 +708,29 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
         }
     }
     type_decls_with(p, &mut index, &HashSet::new(), &named, Decls::ByValue { blocks: false }, &HashSet::new());
+    let at = index.len();
     for r in &regs {
         if let Some((d, _, _)) = decl_of.get(r) {
             index.push_str(d);
         }
     }
+    record::piece(record::Kind::Externs, 0, &index[at..]);
+    let at = index.len();
     index.push_str(&kconst::kstatics_init(&cx));
-    (index, parts)
+    record::piece(record::Kind::Register, 0, &index[at..]);
+    // One record of the whole pass: its texts' pieces in order, and all their reads.
+    let record = if rec { record::close(&index) } else { None }.and_then(|first| {
+        let mut hashes = Vec::with_capacity(16 * (1 + part_recs.len()));
+        let mut reads: HashSet<record::Read> = HashSet::new();
+        for (h, rs) in std::iter::once(Some(first)).chain(part_recs).collect::<Option<Vec<_>>>()? {
+            hashes.extend_from_slice(&h.0.to_le_bytes());
+            hashes.extend_from_slice(&h.1.to_le_bytes());
+            reads.extend(rs);
+        }
+        reads.insert(record::Read::Statics);
+        Some((crate::driver::cache::hash128(&[&hashes], 18), reads.into_iter().collect()))
+    });
+    (index, parts, record)
 }
 
 /// The fn a glue prototype declares: the last name before its parameter list.

@@ -327,8 +327,12 @@ pub(crate) struct Caches {
     /// by a check request still rebuilds the unit in the next build.
     pub(crate) loc_fp: u64,
     /// B1 (`cgen::record`, LUST_B1_OBSERVE=1): what each release C fn unit was made of and
-    /// read in the last build, by registration name.
+    /// read in the last build, by registration name (a glue shard by its keys' identity, the
+    /// release statics pass by one name for its index and parts).
     pub(crate) unit_records: crate::intern::FxMap<String, crate::cgen::record::UnitRecord>,
+    /// How many parts the statics pass of `unit_records` made: its units are the index and
+    /// these (`compile::statics_unit_fp`).
+    pub(crate) statics_parts: usize,
     /// `release_c::codegen_key` of the last build: a build under another key makes
     /// every slot's C again (release C and classic C share the slot cache).
     pub(crate) codegen_key: u64,
@@ -539,6 +543,7 @@ impl Session {
                 statics_fp: 0,
                 loc_fp: 0,
                 unit_records: Default::default(),
+                statics_parts: 0,
                 codegen_key: 0,
                 held_slots: Vec::new(),
                 glue_slots_fp: 0,

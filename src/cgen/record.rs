@@ -30,8 +30,10 @@ pub enum Kind {
     Body,
     /// The termination entry of a `main` returning `ExitCode` or `Result`.
     Entry,
-    /// The registration function.
+    /// The registration function (a fn unit's), or the statics index's `lust_kstatics_init`.
     Register,
+    /// A statics part's data: its statics' definitions, after what their values made first.
+    Data,
 }
 
 /// One recorded piece: its kind, its item (a hash of the item's identity), and a hash and
@@ -71,6 +73,10 @@ pub enum Read {
     Static(String),
     /// The main fn and its return type.
     Main,
+    /// The release statics as their pass emits them (`names::statics_content_fp`): every live
+    /// static in the pass's order with its symbol, C type and value. Only the statics pass's
+    /// record reads it.
+    Statics,
 }
 
 /// Every read the unit records of a session name, each once (the driver's

@@ -743,6 +743,23 @@ impl<T> Drop for Joined<T> {
     }
 }
 
+/// B1's record of the release statics pass (`cgen::names::statics_parts`): one for the index
+/// (unit 1) and every part.
+const STATICS_RECORD: &str = "release statics";
+
+/// The cc fingerprint of unit `k` of a statics pass whose record has fingerprint `fp`: the
+/// index for 0, part `k - 1` after. The record's reads make every text of the pass, so its
+/// fingerprint stands for each of them.
+fn statics_unit_fp(fp: u128, k: usize) -> u128 {
+    let (a, b) = crate::driver::cache::hash128(&[&fp.to_le_bytes(), &(k as u64).to_le_bytes()], 19);
+    (a as u128) << 64 | b as u128
+}
+
+/// The memo pre-check's name of unit `k` of the statics pass (`statics_unit_fp`).
+fn statics_unit_name(k: usize) -> String {
+    format!("{STATICS_RECORD} {k}")
+}
+
 /// B1: the last build's fingerprint of the unit recorded as `reg`, when its record has the
 /// identity `id` and every read it holds kept its fingerprint (`now`, by read index).
 fn b1_clean_by(records: &FxMap<String, cgen::record::UnitRecord>, now: &[Option<(u64, u64)>], reg: &str, id: (u64, u64)) -> Option<u128> {
@@ -4860,11 +4877,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // box with the page cache dropped, more on a CI job's cold disk, and the fn units waited
     // for it. It starts here on a thread of its own, beside both cuts and B1's fingerprints,
     // for every unit the last build recorded (which of them are clean is known only then), by
-    // its record name (fn units and glue shards get their unit numbers from the cuts).
+    // its record name (fn units and glue shards get their unit numbers from the cuts); the
+    // statics record's units by `statics_unit_name`.
     let mut b1_memo = Joined(match rnames {
         Some(_) if b1_skip && !caches.unit_records.is_empty() => {
-            let bare: Vec<crate::cc::UnitIn> =
-                caches.unit_records.iter().map(|(reg, r)| crate::cc::UnitIn { name: reg.clone(), fp: Some(r.fp), text: None }).collect();
+            let bare: Vec<crate::cc::UnitIn> = caches
+                .unit_records
+                .iter()
+                .flat_map(|(reg, r)| {
+                    let units: Vec<(String, u128)> = if reg == STATICS_RECORD {
+                        (0..=caches.statics_parts).map(|k| (statics_unit_name(k), statics_unit_fp(r.fp, k))).collect()
+                    } else {
+                        vec![(reg.clone(), r.fp)]
+                    };
+                    units.into_iter().map(|(name, fp)| crate::cc::UnitIn { name, fp: Some(fp), text: None })
+                })
+                .collect();
             let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple().to_string() } else { req.session.target_triple.clone() };
             let (file, debug, work) = (req.file.clone(), req.debug, dir.join("cc"));
             Some(std::thread::spawn(move || -> std::collections::HashSet<String> {
@@ -4927,6 +4955,54 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let b1_shards = crate::pool::threads().max(1) * 4;
             // With LUST_ASM_PARTS=1 (or B1 observed), each C unit's time (units 0 to 4).
             let c_unit_ms: [std::sync::atomic::AtomicU64; 5] = Default::default();
+            // B1 for the release statics in parts (C units only): one record for the whole pass
+            // (`cgen::names::statics_parts`), its index (unit 1) and every part, kept here when the
+            // pass is made.
+            let statics_b1 = b1_record && !llvm_on && super::release_c::statics_bytes() > 0;
+            let statics_rec: std::sync::Mutex<cgen::names::StaticsRecord> = Default::default();
+            // The switches every unit reads: every LUST_* knob but paths (the sources' ready file
+            // too), B1's own, the cc stream's (`cc::Stream` changes no unit's text) and the front
+            // image's (LUST_FRONT_*: image mechanics, never codegen, and new ones must stay so; the
+            // image's compaction rebuild runs with other ones, and its records must hold for the
+            // next build), and `cgen::unit_switches`. Fn units and glue shards add the copies
+            // profile (`b1_switches`).
+            let b1_base = b1_record.then(|| {
+                let mut vars: Vec<(String, String)> = std::env::vars()
+                    .filter(|(k, _)| {
+                        k.starts_with("LUST_")
+                            && !k.starts_with("LUST_FRONT_")
+                            && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP", "CC_STREAM", "SOURCES_READY"].iter().any(|x| k.contains(x))
+                    })
+                    .collect();
+                vars.sort();
+                let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!("{}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)))
+            });
+            // The statics pass's identity: its record name, those switches and the compiler build.
+            let statics_id =
+                crate::driver::cache::hash128(&[STATICS_RECORD.as_bytes(), b1_base.as_deref().unwrap_or("").as_bytes(), env!("LUST_BUILD_HASH").as_bytes()], 18);
+            // A read of the statics record now (`cgen::read_fp`; the record reads no copies set).
+            let statics_read_fp =
+                |r: &cgen::record::Read| cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &b1_statics, None, r)));
+            // The last build's record of the pass, when it has this identity: its fingerprint and its
+            // reads with theirs, owned (the statics thread runs beside the jobs that change B1's
+            // records).
+            let statics_old: Option<(u128, Vec<(cgen::record::Read, (u64, u64))>)> = statics_b1
+                .then(|| caches.unit_records.get(STATICS_RECORD).filter(|r| r.id == statics_id))
+                .flatten()
+                .map(|r| (r.fp, r.reads.iter().map(|&(i, f)| (caches.unit_reads.get(i).clone(), f)).collect()));
+            // Its fingerprint, which stands for every unit of the pass, when its reads kept theirs:
+            // the statics' content (`content`, now) first, which ends the test when it moved, then
+            // the rest on all cores.
+            let statics_clean = |content: (u64, u64)| -> Option<u128> {
+                let (fp, reads) = statics_old.as_ref()?;
+                if !reads.iter().any(|(r, f)| *r == cgen::record::Read::Statics && *f == content) {
+                    return None;
+                }
+                let rest: Vec<&(cgen::record::Read, (u64, u64))> = reads.iter().filter(|(r, _)| *r != cgen::record::Read::Statics).collect();
+                let chunks: Vec<&[&(cgen::record::Read, (u64, u64))]> = rest.chunks(64).collect();
+                par_map(&chunks, |c| c.iter().all(|(r, f)| statics_read_fp(r) == *f)).into_iter().all(|same| same).then_some(*fp)
+            };
             // One unit's C, added to the cc stream. Only fn units read the copies set (`copy_hot`).
             let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>, copy_hot: Option<&cgen::CopyHot>| {
                 let t = Instant::now();
@@ -4935,7 +5011,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     1 => match super::release_c::statics_bytes() {
                         0 => (adapt(cgen::names::statics_unit(&program, &caches.glue), &Default::default()), String::new()),
                         target => {
-                            let (index, parts) = cgen::names::statics_parts(&program, &caches.glue, target);
+                            let (index, parts, rec) = cgen::names::statics_parts(&program, &caches.glue, target, statics_b1);
+                            *statics_rec.lock().unwrap_or_else(|e| e.into_inner()) = rec;
                             let parts: Vec<String> = parts.into_iter().map(|t| adapt(t, &Default::default())).collect();
                             if let Some(s) = &stream
                                 && let Ok(first) = first_rx.lock().unwrap_or_else(|e| e.into_inner()).recv()
@@ -5007,7 +5084,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 // Moved in: should a cut panic, the sender drops as this unwinds, and the statics
                 // thread's wait ends (with no number) before the scope waits for that thread.
                 let first_tx = first_tx;
-                let statics = late_statics.then(|| sc.spawn(|| assemble(1, &[], None, None)));
+                // B1: a statics pass still clean by its record is not made here (the unit memo may
+                // still have lost an object of it: below); the pass, the fingerprint of its record
+                // when clean, and the statics' content now.
+                let statics = late_statics.then(|| {
+                    sc.spawn(|| {
+                        let content = statics_b1.then(|| statics_read_fp(&cgen::record::Read::Statics));
+                        let clean = content.and_then(statics_clean);
+                        ((clean.is_none() || !b1_skip).then(|| assemble(1, &[], None, None)), clean, content)
+                    })
+                });
                 // With it, the jobs that need neither the copies set nor B1's reads: the two cuts
                 // and, with C units only, main, runtime and locations (the table unit names fn units,
                 // so it waits for their cut).
@@ -5039,18 +5125,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     None => None,
                 };
                 // A unit's identity: its registration name, fns and main slot, the switches every
-                // unit reads, every LUST_* knob but paths (the sources' ready file too), B1's own and
-                // the cc stream's (`cc::Stream` changes no unit's text), the copies profile's hot set
-                // (the copy choice reads it), and the compiler build.
-                let b1_switches = b1_record.then(|| {
-                    let mut vars: Vec<(String, String)> = std::env::vars()
-                        .filter(|(k, _)| {
-                            k.starts_with("LUST_")
-                                && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP", "CC_STREAM", "SOURCES_READY"].iter().any(|x| k.contains(x))
-                        })
-                        .collect();
-                    vars.sort();
-                    let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                // unit reads (`b1_base`), the copies profile's hot set (the copy choice reads it),
+                // and the compiler build.
+                let b1_switches = b1_base.as_ref().map(|base| {
                     // Both id sets; the big ADTs are in each pick's read (`cgen::read_fp`).
                     let copies = copy_hot.as_ref().map(|h| {
                         let bytes = |s: &std::collections::HashSet<u64>| {
@@ -5060,7 +5137,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         };
                         crate::driver::cache::hash128(&[&bytes(&h.hot), &bytes(&h.frames)], 14)
                     });
-                    format!("{}\n{}\ncopies={copies:?}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)), env!("LUST_BUILD_HASH"))
+                    format!("{base}\ncopies={copies:?}\n{}", env!("LUST_BUILD_HASH"))
                 });
                 // One read's fingerprint now (`cgen::read_fp`), in the assembly's layout phase.
                 let read_fp = |r: &cgen::record::Read| {
@@ -5073,7 +5150,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                             R::SlotOf(_) => 1,
                             R::Glue(..) => 2,
                             R::Type(..) | R::TypeFwd(..) => 3,
-                            R::Static(_) => 4,
+                            R::Static(_) | R::Statics => 4,
                             R::Main => 5,
                             R::Pick(..) | R::PickHot(_) => 6,
                         };
@@ -5085,12 +5162,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 // The last build's records name their reads by index in the session's table: the
                 // passes below fingerprint each distinct one once (many units read one type).
                 let t_old = Instant::now();
+                // (The statics' content is the statics thread's own read.)
                 let old_ids: Vec<u32> = if !b1_record || caches.unit_records.is_empty() {
                     Vec::new()
                 } else {
                     let mut used = vec![false; caches.unit_reads.len()];
                     caches.unit_records.values().flat_map(|u| &u.reads).for_each(|&(i, _)| used[i as usize] = true);
-                    (0..caches.unit_reads.len() as u32).filter(|&i| used[i as usize]).collect()
+                    let content = caches.unit_reads.find(&cgen::record::Read::Statics);
+                    (0..caches.unit_reads.len() as u32).filter(|&i| used[i as usize] && Some(i) != content).collect()
                 };
                 // B1's fingerprints of the last build's reads, in two passes of their own (`par_map`
                 // hands out a pass's jobs in batches, so behind thousands of cheap jobs a few workers
@@ -5190,8 +5269,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     let (reg, slots) = &rg[g];
                     crate::driver::cache::hash128(&[reg.as_bytes(), format!("{slots:?} {main_slot}").as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()], 13)
                 };
-                let reg_of = |g: usize| if g < rg.len() { rg[g].0.as_str() } else { shard_reg[g - rg.len()].as_str() };
-                let id_of = |g: usize| if g < rg.len() { unit_id(g) } else { shard_ids[g - rg.len()] };
+                // The statics pass's B1 entries come after the shards' (at `rg.len() + n_shards`).
+                let reg_of = |g: usize| match g.checked_sub(rg.len()) {
+                    None => rg[g].0.as_str(),
+                    Some(j) if j < n_shards => shard_reg[j].as_str(),
+                    Some(_) => STATICS_RECORD,
+                };
+                let id_of = |g: usize| match g.checked_sub(rg.len()) {
+                    None => unit_id(g),
+                    Some(j) if j < n_shards => shard_ids[j],
+                    Some(_) => statics_id,
+                };
                 let mut made = Vec::with_capacity(5 + rg.len());
                 made.extend(early_made);
                 let mut inl: Vec<Vec<usize>> = Vec::with_capacity(rg.len());
@@ -5273,32 +5361,60 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     true => (base_obj(u), String::new(), String::new()),
                     false => assemble(u, &inl, c_refs.as_ref(), copy_hot.as_ref()),
                 }));
-                // The units keep their order: the statics unit is unit 1.
+                // The units keep their order: the statics unit is unit 1. A statics pass clean by its
+                // record is not made when the unit memo holds every object of it (the index and the
+                // parts cc then takes by fingerprint, `statics_unit_fp`); else it is made now. Its
+                // B1 entries follow the shards' (`b1_clean`, `b1_skipped`).
+                let mut statics_content = None;
                 if let Some(h) = statics {
-                    made.insert(1, h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+                    let (made_now, clean, content) = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                    let all_held = lost.as_ref().is_some_and(|l| (0..=caches.statics_parts).all(|k| !l.contains(&statics_unit_name(k))));
+                    let skipped = made_now.is_none() && all_held;
+                    let unit = match made_now {
+                        Some(m) => m,
+                        None if skipped => {
+                            *statics_out.lock().unwrap_or_else(|e| e.into_inner()) = vec![String::new(); caches.statics_parts];
+                            (base_obj(1), String::new(), String::new())
+                        }
+                        None => assemble(1, &[], None, None),
+                    };
+                    made.insert(1, unit);
+                    b1_clean.push(clean);
+                    b1_skipped.push(skipped);
+                    statics_content = content;
                 }
                 asm_ms[4] = t_asm.elapsed().as_secs_f64() * 1e3;
                 if b1_record {
                     use cgen::record::{Read, UnitRecord};
                     let mut recs = std::mem::take(&mut *b1_records.lock().unwrap_or_else(|e| e.into_inner()));
                     recs.sort_unstable_by_key(|(g, _)| *g);
-                    // The glue shards made now, after the fn units (`reg_of`, `id_of`).
+                    // The glue shards made now, after the fn units (`reg_of`, `id_of`), then the statics
+                    // pass when it was made with a record.
                     recs.extend(shard_made.into_iter().enumerate().filter(|(_, (_, skipped))| !skipped).map(|(j, (rec, _))| (rg.len() + j, rec)));
+                    let g_statics = rg.len() + n_shards;
+                    if statics_b1 && !b1_skipped.get(g_statics).copied().unwrap_or(true) {
+                        recs.push((g_statics, statics_rec.lock().unwrap_or_else(|e| e.into_inner()).take()));
+                    }
                     // The reads of the units assembled now that no old record holds.
                     let t_more = Instant::now();
                     // (Each step that looks a read up runs on every thread: a glue shard's record holds
                     // about a thousand reads, each a type tree to hash.)
                     let at: Vec<usize> = (0..recs.len()).collect();
+                    // (The statics' content is the statics thread's read: on all cores itself, so not
+                    // from a pool job here.)
                     let missing: Vec<Read> = {
                         let per: Vec<Vec<&Read>> = par_map(&at, |&k| recs[k].1.iter().flat_map(|(_, reads)| reads).filter(|r| fp_now(r).is_none()).collect());
                         let mut m: FxMap<&Read, ()> = FxMap::default();
-                        per.into_iter().flatten().for_each(|r| {
+                        per.into_iter().flatten().filter(|r| **r != Read::Statics).for_each(|r| {
                             m.insert(r, ());
                         });
                         m.into_keys().cloned().collect()
                     };
                     let fps = par_map(&missing, |r| read_fp(r));
-                    let more: FxMap<Read, (u64, u64)> = missing.into_iter().zip(fps).collect();
+                    let mut more: FxMap<Read, (u64, u64)> = missing.into_iter().zip(fps).collect();
+                    if recs.iter().any(|(g, _)| *g == g_statics) {
+                        more.insert(Read::Statics, statics_content.unwrap_or_else(|| statics_read_fp(&Read::Statics)));
+                    }
                     let read_fps: Vec<Vec<(u64, u64)>> = par_map(&at, |&k| {
                         recs[k].1.iter().flat_map(|(_, reads)| reads).map(|r| fp_now(r).or_else(|| more.get(r).copied()).unwrap_or((u64::MAX, u64::MAX))).collect()
                     });
@@ -5339,7 +5455,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                                                 Read::SlotOf(_) => 1,
                                                 Read::Glue(..) => 2,
                                                 Read::Type(..) | Read::TypeFwd(..) => 3,
-                                                Read::Static(_) => 4,
+                                                Read::Static(_) | Read::Statics => 4,
                                                 Read::Main => 5,
                                                 Read::Pick(..) | Read::PickHot(_) => 6,
                                             }] += 1;
@@ -5377,24 +5493,41 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     let fresh: Vec<(usize, UnitRecord)> =
                         par_map(&fresh, |(g, pieces, reads)| (*g, UnitRecord::new(id_of(*g), *pieces, reads.clone(), table)));
                     if b1_check && unsound > 0 {
-                        panic!("LUST_CHECK_UNIT_FP: {unsound} C fn units or glue shards are clean by their recorded reads, but their text changed: {}", unsound_names.join(", "));
+                        panic!("LUST_CHECK_UNIT_FP: {unsound} C fn units, glue shards or statics passes are clean by their recorded reads, but their text changed: {}", unsound_names.join(", "));
                     }
                     // The next build's records: a skipped unit keeps its own, an assembled one takes
                     // its new one. cc takes each recorded unit's fingerprint; the oracle gives a unit
                     // clean by its reads its old one with its new text, so cc's memo fails a key
                     // that moved.
+                    // The statics pass's units are unit 1 and its parts after the shards, each with its
+                    // fingerprint from the record's (`statics_unit_fp`).
+                    let first_statics = FIRST_FN_UNIT + g_statics;
+                    let put = |b1_units: &mut FxMap<String, (u128, bool)>, g: usize, fp: u128, n_parts: usize, bare: bool| {
+                        if g != g_statics {
+                            b1_units.insert(format!("u{}", g + FIRST_FN_UNIT), (fp, bare));
+                            return;
+                        }
+                        b1_units.insert("u1".to_string(), (statics_unit_fp(fp, 0), bare));
+                        for j in 0..n_parts {
+                            b1_units.insert(format!("u{}", first_statics + j), (statics_unit_fp(fp, j + 1), bare));
+                        }
+                    };
                     let mut old = std::mem::take(&mut caches.unit_records);
                     let mut next: FxMap<String, UnitRecord> = FxMap::default();
                     for (g, &skipped) in b1_skipped.iter().enumerate() {
                         if skipped && let Some(r) = old.remove(reg_of(g)) {
-                            b1_units.insert(format!("u{}", g + FIRST_FN_UNIT), (r.fp, true));
+                            put(&mut b1_units, g, r.fp, caches.statics_parts, true);
                             next.insert(reg_of(g).to_string(), r);
                         }
                     }
+                    let parts_now = statics_out.lock().unwrap_or_else(|e| e.into_inner()).len();
                     for (g, r) in fresh {
                         if b1_check || b1_skip {
                             let fp = if b1_check { b1_clean[g].unwrap_or(r.fp) } else { r.fp };
-                            b1_units.insert(format!("u{}", g + FIRST_FN_UNIT), (fp, false));
+                            put(&mut b1_units, g, fp, parts_now, false);
+                        }
+                        if g == g_statics {
+                            caches.statics_parts = parts_now;
                         }
                         next.insert(reg_of(g).to_string(), r);
                     }
@@ -5416,8 +5549,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         }
                     }
                     b1_ms[5] = t_more.elapsed().as_secs_f64() * 1e3 - b1_ms[4];
+                    let statics_state = match (b1_skipped.get(g_statics), b1_clean.get(g_statics)) {
+                        _ if !statics_b1 => "unrecorded",
+                        (Some(true), _) => "not made",
+                        (Some(false), Some(Some(_))) => "clean by its reads, made",
+                        _ => "made",
+                    };
                     let line = format!(
-                        "{} C fn units and {n_shards} glue shards, {same} the same pieces as the last build, {new} new, {unrecorded} unrecorded; by reads {} clean, {unsound} of them with changed pieces (unsound{}), {missed} unchanged units the reads miss; {} not assembled; {n_reads} reads; B1 {fp_ms:.0} ms",
+                        "{} C fn units, {n_shards} glue shards and the statics pass ({statics_state}), {same} the same pieces as the last build, {new} new, {unrecorded} unrecorded; by reads {} clean, {unsound} of them with changed pieces (unsound{}), {missed} unchanged units the reads miss; {} not assembled; {n_reads} reads; B1 {fp_ms:.0} ms",
                         rg.len(),
                         b1_clean.iter().filter(|c| c.is_some()).count(),
                         if unsound_names.is_empty() { String::new() } else { format!(": {}", unsound_names.join(", ")) },

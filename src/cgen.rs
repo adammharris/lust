@@ -12847,6 +12847,8 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
             let ret = p.main.map(|m| mangle(&cty(&p.tys, p.fn_info(m).ret))).unwrap_or_default();
             h(&[format!("{} {} {}", p.main.is_some(), p.unwind, p.unwind_tables).as_bytes(), ret.as_bytes()])
         }
+        // On all cores: read it where the pool is free to run it (not from a pool job).
+        Read::Statics => names::statics_content_fp(p, &g.slots),
     }
 }
 
@@ -14815,7 +14817,9 @@ mod tests {
     /// Release C statics in parts, one static a part (a 1-byte target): a merge that changes one
     /// static's value changes its part and nothing else (the index keeps every registration),
     /// though the statics share pointees across parts (one "hello", one trampoline), and every
-    /// part and the index compile on their own declarations.
+    /// part and the index compile on their own declarations. B1's record of the pass leaves its
+    /// texts as they are, takes every byte as a piece, and reads the statics' content
+    /// (`names::statics_content_fp`), which moves with a static's value and only then.
     #[test]
     fn statics_parts_change_only_where_the_static_is() {
         let src = |a: i64| {
@@ -14825,7 +14829,8 @@ mod tests {
                  static H: &[&str] = &[\"x\", \"hello\"];\nfn f() -> i64 {{ 7 }}\nfn main() {{}}\n"
             )
         };
-        let parts_of = |a: i64| -> (String, Vec<String>) {
+        type Pass = (String, Vec<String>, names::StaticsRecord, (u64, u64));
+        let parts_of = |a: i64| -> Pass {
             let src = src(a);
             let interner = std::sync::Arc::new(Interner::default());
             let known = std::sync::Arc::new(Known::new(&interner));
@@ -14852,10 +14857,19 @@ mod tests {
                     .collect();
                 let mut glue = GlueSet::default();
                 glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
-                names::statics_parts(&program, &glue, 1)
+                let (index, parts, rec) = names::statics_parts(&program, &glue, 1, true);
+                let plain = names::statics_parts(&program, &glue, 1, false);
+                assert_eq!((&plain.0, &plain.1, &plain.2), (&index, &parts, &None), "a record leaves the texts as they are");
+                (index, parts, rec, names::statics_content_fp(&program, &glue.slots))
             })
         };
-        let ((index, parts), (index2, parts2)) = (parts_of(5), parts_of(6));
+        let ((index, parts, rec, fp), (index2, parts2, rec2, fp2)) = (parts_of(5), parts_of(6));
+        let (pieces, reads) = rec.expect("every byte of the pass is a piece");
+        assert!(reads.contains(&record::Read::Statics), "the pass reads the statics' content");
+        assert!(reads.iter().any(|r| matches!(r, record::Read::Type(..))), "and the types it declares");
+        assert_ne!(Some(pieces), rec2.map(|(p, _)| p), "a static's value moves the pieces");
+        assert_ne!(fp, fp2, "and the content read");
+        assert_eq!(fp, parts_of(5).3, "the same program, the same content read");
         assert_eq!(parts.len(), 8, "a part per static");
         assert_eq!(index, index2, "the same registrations");
         let changed: Vec<usize> = (0..parts.len()).filter(|&j| parts[j] != parts2[j]).collect();
