@@ -452,7 +452,8 @@ impl<'p> Lower<'p> {
             return false;
         }
         match self.p.ast.expr(e) {
-            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::Unit => true,
+            // A byte string is the array under the parser's `&` (`&[b"a"]`).
+            Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) | Expr::ByteStr(_) | Expr::Unit => true,
             Expr::Unary { op: crate::ast::UnOp::Neg, expr } => matches!(self.p.ast.expr(*expr), Expr::Int(..) | Expr::Float(_)),
             // Arithmetic over promotable operands. As in rustc, a division
             // needs a divisor known to be nonzero (here: a nonzero literal),
