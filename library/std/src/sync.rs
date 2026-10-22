@@ -110,14 +110,31 @@ impl Once {
             if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
                 panic!("Once instance has previously been poisoned"); //@ gap
             }
-            self.poisoned.store(true, std::sync::atomic::Ordering::Release);
+            // Poisoned only when `f` unwinds: a caller that comes while
+            // `f` runs waits in `get_or_init`, as std's `Once` waits.
+            let mut guard = PoisonOnUnwind { poisoned: &self.poisoned, done: false };
             f();
-            self.poisoned.store(false, std::sync::atomic::Ordering::Release);
+            guard.done = true;
         });
     }
 
     pub fn is_completed(&self) -> bool {
         self.done.get().is_some()
+    }
+}
+
+/// Sets a `Once`'s poison flag when its run ends without finishing (`f`
+/// panicked and this drops in the unwind).
+struct PoisonOnUnwind<'a> {
+    poisoned: &'a std::sync::atomic::AtomicBool,
+    done: bool,
+}
+
+impl Drop for PoisonOnUnwind<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.poisoned.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
