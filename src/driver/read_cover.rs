@@ -35,6 +35,13 @@ pub(crate) enum Access {
     TraitInModule(ModuleId, DefId),
     /// A module's std import (`std_import_answer`); `name` `*` for a glob.
     StdImport(ModuleId, Sym, Sym),
+    /// One impl record the impl index handed out (`ImplIndex::get`): the
+    /// impl's def and its trait.
+    Impl(DefId, DefId),
+    /// The impl list of one trait (`impls_of_trait`, a bucket).
+    ImplsOf(DefId),
+    /// A scan of every impl (`all_impls`).
+    AllImpls,
 }
 
 /// True when `LUST_CHECK_READS` is set (and not `0`).
@@ -156,12 +163,29 @@ pub(crate) fn uncovered(p: &Program, reads: &Reads, log: &[Access]) -> Vec<Acces
                 let mk = p.mod_key(m);
                 has(&|k| matches!(k, ReadKey::StdImport(km, a, b) if *km == mk && *a == sm && *b == n))
             }
+            // An impl record is part of the trait-system key, whose change
+            // drops every stored result (gen_reuse.rs `trait_key`), except a
+            // written impl of a user trait (`impls_read_covered`): its trait's
+            // `ImplSet` reads replace the key for it. Synthetic impls (derived:
+            // the derive notes; std's builtins) and foreign ones are fixed, and
+            // `get` notes the `LangImpls` read of a lang-keyed impl itself.
+            Access::Impl(i, t) => !user_impl(p, i, t) || has(&|k| matches!(k, ReadKey::ImplSet(s) if s.trait_ == t)),
+            Access::ImplsOf(t) => !p.impls_read_covered(t) || has(&|k| matches!(k, ReadKey::ImplSet(s) if s.trait_ == t)),
+            // Every impl: covered while no user trait has a written impl.
+            Access::AllImpls => muted(|| p.gx.index.all_impls().all(|(_, r)| !user_impl(p, r.def, r.trait_def))),
         };
         if !ok {
             out.push(a);
         }
     }
     out
+}
+
+/// True for a written impl of this crate whose trait's impls stay out of the
+/// trait-system key (`Program::impls_read_covered`).
+fn user_impl(p: &Program, impl_def: DefId, trait_: DefId) -> bool {
+    p.impls_read_covered(trait_)
+        && p.gx.index.peek_def(impl_def).is_some_and(|r| r.local && r.synthetic == crate::traits::index::Synthetic::None)
 }
 
 /// Primitive type names (a scope layer under every module's items).
@@ -208,6 +232,9 @@ pub(crate) fn report(p: &Program, name: &str, missing: &[Access]) {
             Access::Binding(m, ns, s) => format!("binding {ns:?} {} in module {}", p.interner.get(s), m.0),
             Access::TraitInModule(m, t) => format!("trait in scope {:?} in module {}", t, m.0),
             Access::StdImport(m, sm, n) => format!("std import {}::{} in module {}", p.interner.get(sm), p.interner.get(n), m.0),
+            Access::Impl(i, t) => format!("impl {i:?} of trait {t:?}"),
+            Access::ImplsOf(t) => format!("impls of trait {t:?}"),
+            Access::AllImpls => "every impl".to_string(),
         };
         text.push_str(&format!("readcover: {name}: {desc}\n"));
         if let Some(bt) = BT.with(|b| b.borrow().get(a).cloned()) {

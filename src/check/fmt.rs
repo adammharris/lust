@@ -122,7 +122,9 @@ impl<'p> Ctx<'p> {
         let mut def = Some(p.def_id(f));
         for _ in 0..64 {
             let d = def?;
-            if let Some((_, rec)) = p.gx.index.by_def(d) {
+            // The body's own impl, covered by its def (`LUST_CHECK_READS`): an
+            // impl's path is its header, so a header edit makes new defs.
+            if let Some((_, rec)) = crate::driver::read_cover::muted(|| p.gx.index.by_def(d)) {
                 return Some(rec.trait_def);
             }
             if matches!(p.defs.kind_of(d), Some(crate::ty::defs::DefKind::Impl)) {

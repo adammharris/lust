@@ -3176,7 +3176,11 @@ impl<'p> Ctx<'p> {
             }
             TyKind::Adt(def, args) => {
                 let lang = &p.gx.lang;
-                let written = p.gx.index.all_impls().any(|(_, r)| {
+                // Written std trait impls of a user Adt are `LangImpls` reads
+                // (out of the trait-system key): the scan reads them by
+                // record, so note the read here.
+                crate::check::derive_delta::note_def(def, crate::check::derive_delta::bit::LANG);
+                let written = crate::driver::read_cover::muted(|| p.gx.index.all_impls()).any(|(_, r)| {
                     r.synthetic == crate::traits::index::Synthetic::None
                         && r.head == crate::traits::index::SelfHead::Adt(def)
                         && (r.trait_def == lang.partial_eq || r.trait_def == lang.partial_ord || r.trait_def == lang.ord)

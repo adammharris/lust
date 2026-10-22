@@ -442,6 +442,7 @@ impl ImplIndex {
         if let Some(adts) = self.names.get(id.0 as usize) {
             crate::check::derive_delta::note_defs(adts, crate::check::derive_delta::bit::LANG);
         }
+        crate::driver::read_cover::note(crate::driver::read_cover::Access::Impl(rec.def, rec.trait_def));
         rec
     }
 
@@ -467,16 +468,19 @@ impl ImplIndex {
 
     /// Every impl record, in insert order.
     pub fn all_impls(&self) -> impl Iterator<Item = (ImplId, &ImplRecord)> {
+        crate::driver::read_cover::note(crate::driver::read_cover::Access::AllImpls);
         self.impls.iter().enumerate().filter(|&(i, _)| !self.dead[i]).map(|(i, r)| (ImplId(i as u32), r))
     }
 
     /// Every impl of one trait, in insert order.
     pub fn impls_of_trait(&self, trait_def: DefId) -> &[ImplId] {
+        crate::driver::read_cover::note(crate::driver::read_cover::Access::ImplsOf(trait_def));
         self.by_trait.get(&trait_def).map_or(&[], |v| v)
     }
 
     /// The impls in one bucket, for `ImplSet` reads and error lists.
     pub fn bucket(&self, trait_def: DefId, head: SelfHead) -> &[ImplId] {
+        crate::driver::read_cover::note(crate::driver::read_cover::Access::ImplsOf(trait_def));
         self.buckets.get(&(trait_def, head)).map_or(&[], |v| v)
     }
 

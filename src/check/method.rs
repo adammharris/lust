@@ -1556,7 +1556,10 @@ fn param_env_hit(cx: &mut Ctx, method_def: DefId, tr: TraitRef) -> Option<(Local
 /// generics, not trait generics.
 fn local_is_impl_method(p: &Program, local: LocalDefId, _name: Sym) -> bool {
     let def = p.def_id(local);
-    p.gx.index.all_impls().any(|(_, rec)| rec.items.contains(&def))
+    // Covered by the def (`LUST_CHECK_READS`): a method's path is its impl's
+    // header (def.rs `method_path`), so whether it is an impl item is fixed
+    // while the def exists.
+    crate::driver::read_cover::muted(|| p.gx.index.all_impls().any(|(_, rec)| rec.items.contains(&def)))
 }
 
 /// The plain inherent probe of one variant, through the

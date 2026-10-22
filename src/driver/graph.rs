@@ -2658,7 +2658,8 @@ impl<'a> Program {
     /// selection (section 8.2; `traits::solve` step 2 calls it through
     /// `SolveCx::record_impl_set`). See `ImplSet` for which buckets fill.
     pub fn impl_set(&self, reads: &mut Reads, trait_: DefId, head: Head) -> ImplSet {
-        let set = self.impl_bucket(trait_, head);
+        // The bucket is this read's answer (its derive notes still go out).
+        let set = super::read_cover::muted(|| self.impl_bucket(trait_, head));
         let key = ImplSetKey { trait_, head };
         reads.record_with(ReadKey::ImplSet(key), set.impls.is_empty(), || impl_set_fingerprint(self, &key, &set));
         // Only a derivable trait's answer reads the derive list (its
