@@ -1097,45 +1097,50 @@ pub fn build_with(
             });
         }
     });
-    // One size-cap eviction after the stores (it keeps this build's objects).
-    if let Some(c) = cache {
-        c.evict_objects();
-    }
-    let errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
-    if !errors.is_empty() {
-        return Err(CcError::Failed(format!("the C compiler failed for target {}:\n{errors}", spec.triple)));
-    }
-    let mut lost = lost.into_inner().unwrap_or_else(|e| e.into_inner());
-    if !lost.is_empty() {
-        let ll: Vec<String> = lost.iter().flat_map(|n| [format!("{n}.ll"), format!("{n}.hc")]).filter(|p| textless_parts.contains(p.as_str())).collect();
-        lost.extend(ll);
-        lost.sort();
-        return Err(CcError::NeedText(lost));
-    }
-    if let Some(saving) = memo_saved {
-        saving.join().map_err(|_| "the unit memo's writer panicked".to_string())??;
-    }
-    let compile_s = t_compile.elapsed().as_secs_f64();
-    let prefetch_s = prefetch.map(|h| h.join().unwrap_or(0.0));
-    let t_link = std::time::Instant::now();
-    // A build with a C++ unit links with the C++ driver (its runtime and personality).
-    let link = if units.iter().any(|u| is_cxx(&u.name)) { &spec.cxx } else { &spec.cmd };
-    let mut cmd = cc_command(&link[0]);
-    cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
-    match cmd.output() {
-        Ok(o) if o.status.success() => Ok(format!(
-            "{} units ({} from cache, clang {:.2}s, {}link {:.2}s{}), linked {}",
-            units.len(),
-            hits.load(std::sync::atomic::Ordering::Relaxed),
-            compile_s,
-            prefetch_s.map(|p| format!("prefetch {p:.2}s, ")).unwrap_or_default(),
-            t_link.elapsed().as_secs_f64(),
-            pgo.as_ref().map(|m| format!(", {}", m.describe())).unwrap_or_default(),
-            out.display()
-        )),
-        Ok(o) => Err(CcError::Failed(format!("link failed for target {} ({})\n{}", spec.triple, o.status, String::from_utf8_lossy(&o.stderr)))),
-        Err(e) => Err(CcError::Failed(format!("cannot run {}: {e}", link.join(" ")))),
-    }
+    // One size-cap eviction after the stores (it keeps this build's objects). It stats every
+    // file in the cache dir (~6000 in a warm tsgo chain, more on a long-lived CI disk), so it
+    // runs beside the link: the link reads only the work dir's links, and the eviction removes
+    // only cache files this build did not use. The scope joins it.
+    std::thread::scope(|scope| {
+        if let Some(c) = cache {
+            scope.spawn(move || c.evict_objects());
+        }
+        let errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
+        if !errors.is_empty() {
+            return Err(CcError::Failed(format!("the C compiler failed for target {}:\n{errors}", spec.triple)));
+        }
+        let mut lost = lost.into_inner().unwrap_or_else(|e| e.into_inner());
+        if !lost.is_empty() {
+            let ll: Vec<String> = lost.iter().flat_map(|n| [format!("{n}.ll"), format!("{n}.hc")]).filter(|p| textless_parts.contains(p.as_str())).collect();
+            lost.extend(ll);
+            lost.sort();
+            return Err(CcError::NeedText(lost));
+        }
+        if let Some(saving) = memo_saved {
+            saving.join().map_err(|_| "the unit memo's writer panicked".to_string())??;
+        }
+        let compile_s = t_compile.elapsed().as_secs_f64();
+        let prefetch_s = prefetch.map(|h| h.join().unwrap_or(0.0));
+        let t_link = std::time::Instant::now();
+        // A build with a C++ unit links with the C++ driver (its runtime and personality).
+        let link = if units.iter().any(|u| is_cxx(&u.name)) { &spec.cxx } else { &spec.cmd };
+        let mut cmd = cc_command(&link[0]);
+        cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
+        match cmd.output() {
+            Ok(o) if o.status.success() => Ok(format!(
+                "{} units ({} from cache, clang {:.2}s, {}link {:.2}s{}), linked {}",
+                units.len(),
+                hits.load(std::sync::atomic::Ordering::Relaxed),
+                compile_s,
+                prefetch_s.map(|p| format!("prefetch {p:.2}s, ")).unwrap_or_default(),
+                t_link.elapsed().as_secs_f64(),
+                pgo.as_ref().map(|m| format!(", {}", m.describe())).unwrap_or_default(),
+                out.display()
+            )),
+            Ok(o) => Err(CcError::Failed(format!("link failed for target {} ({})\n{}", spec.triple, o.status, String::from_utf8_lossy(&o.stderr)))),
+            Err(e) => Err(CcError::Failed(format!("cannot run {}: {e}", link.join(" ")))),
+        }
+    })
 }
 
 #[cfg(test)]
