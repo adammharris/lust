@@ -18335,12 +18335,13 @@ impl<'p> Ctx<'p> {
         None
     }
 
-    /// For `String == &str` style comparisons between different string types: the deref counts
-    /// that reach each side's `String` or `str`. None if the types are not a valid mixed pair.
+    /// For `String == &str` style comparisons between different string types (String, str,
+    /// `Cow<str>`, as `==` takes them): the deref counts that reach each side's string. None if
+    /// the types are not a valid mixed pair.
     fn mixed_string_eq(&self, a: Ty, b: Ty) -> Option<(u8, u8)> {
         let (ld, lb) = self.autoderef(a);
         let (rd, rb) = self.autoderef(b);
-        let (Some(lk), Some(rk)) = (self.str_kind(lb, false), self.str_kind(rb, false)) else { return None };
+        let (Some(lk), Some(rk)) = (self.str_kind(lb, true), self.str_kind(rb, true)) else { return None };
         if lb == rb {
             return None;
         }
@@ -19234,7 +19235,7 @@ impl<'p> Ctx<'p> {
     }
 
     /// `assert_eq!`/`assert_ne!` operand types `a` and `b`: one type with
-    /// PartialEq and Debug, or a String against a `&str`.
+    /// PartialEq and Debug, or two string types (`String`, `&str`, `Cow<str>`).
     fn assert_eq_types(&mut self, e: ExprId, a: Ty, b: Ty, span: Span, s: Span) {
         let ((ld, lb), (rd, rb)) = (self.autoderef(a), self.autoderef(b));
         if let Some((ld, rd)) = self.mixed_string_eq(a, b) {
