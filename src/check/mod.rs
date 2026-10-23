@@ -8156,7 +8156,24 @@ impl<'p> Ctx<'p> {
     /// lust knows lives for `'static`.
     fn static_borrow(&self, e: ExprId) -> bool {
         match self.p.ast.expr(e) {
-            Expr::Ref { raw: false, expr, .. } => matches!(self.out.expr_res[self.ei(*expr)], Res::Static(_)),
+            Expr::Ref { raw: false, expr, .. } if matches!(self.out.expr_res[self.ei(*expr)], Res::Static(_)) => true,
+            Expr::Ref { raw: false, mutable: false, expr } => self.is_place(*expr),
+            _ => false,
+        }
+    }
+
+    /// True for a place expression the borrow checker follows: a local
+    /// or static, a field of a place, or a deref of any expression. A
+    /// shared borrow of one coerced to `&'static dyn Tr` needs no proof
+    /// here (`static_borrow`): the borrow checker relates the borrow's
+    /// region to `'static` (`&**held` with `held: &'static Arc<dyn Tr>`
+    /// holds; a borrow of a local is L0306, of a parameter's pointee
+    /// L0733), as for any `&'static T` target.
+    fn is_place(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::Path(_) => matches!(self.out.expr_res[self.ei(e)], Res::Local(_) | Res::Static(_)),
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.is_place(*base),
+            Expr::Deref(_) => true,
             _ => false,
         }
     }
