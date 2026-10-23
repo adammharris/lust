@@ -3855,11 +3855,33 @@ fn resolve_dyn(
                         "Use a reference to an owned type, or a generic `F: Fn(..)` parameter.",
                     ));
                 }
+                // Every associated type of the principal and its
+                // supertraits is bound (rustc E0191): the object type
+                // has no impl to read an unbound one from.
+                // One binding per associated type (rustc E0719; a
+                // generic bound may repeat one).
+                let binds = tys.bindings(tr.bindings);
+                if let Some(i) = (1..binds.len()).find(|&i| binds[..i].iter().any(|(d, _)| *d == binds[i].0)) {
+                    let name = cx.index.trait_of_assoc(binds[i].0).and_then(|t| cx.index.trait_record(t)).and_then(|r| r.assoc_items.iter().find(|(d, _, _)| *d == binds[i].0).map(|(_, n, _)| *n));
+                    let name = name.map_or("?", |n| interner.get(n)).to_string();
+                    return Err(Diag::new(
+                        "L0106",
+                        span,
+                        format!("the value of the associated type `{name}` is already specified"),
+                        "Keep one binding of each associated type.",
+                    ));
+                }
+                if !fn_family && let Some(name) = unbound_dyn_assoc(cx, tys, trait_def, tr.bindings) {
+                    let tname = interner.get(seg.name).to_string();
+                    return Err(Diag::new(
+                        "L0110",
+                        span,
+                        format!("the value of the associated type `{}` in `dyn {tname}` must be specified", interner.get(name)),
+                        format!("Bind it: `dyn {tname}<{} = T>`.", interner.get(name)),
+                    ));
+                }
                 // The `Fn(..) -> R` sugar binds `Output`; other bindings
                 // are not supported yet.
-                if !fn_family && !tys.bindings(tr.bindings).is_empty() {
-                    return Err(dyn_not_yet(span, "associated type bindings in `dyn` types"));
-                }
                 principal = Some(Binder::plain(tr));
             }
         }
@@ -3872,6 +3894,33 @@ fn resolve_dyn(
     }
     let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto });
     Ok(tys.intern(TyKind::Dyn(bounds_id, region)))
+}
+
+/// The first associated type of `trait_def` or a supertrait (through
+/// `Self` supertrait predicates) that neither `bindings` nor a
+/// supertrait bound (`trait Sub: Base<Out = u8>`) gives a type.
+fn unbound_dyn_assoc(cx: &ResolveCx, tys: &impl TyIntern, trait_def: DefId, bindings: BindingsId) -> Option<Sym> {
+    let mut bound: Vec<DefId> = tys.bindings(bindings).iter().map(|(d, _)| *d).collect();
+    let mut wanted: Vec<(DefId, Sym)> = Vec::new();
+    let mut seen: Vec<DefId> = Vec::new();
+    let mut stack = vec![trait_def];
+    while let Some(def) = stack.pop() {
+        if seen.contains(&def) {
+            continue;
+        }
+        seen.push(def);
+        let Some(rec) = cx.index.trait_record(def) else { continue };
+        wanted.extend(rec.assoc_items.iter().filter(|(_, _, is_type)| *is_type).map(|&(d, n, _)| (d, n)));
+        for pred in &rec.generics.predicates {
+            let Predicate::Trait(b) = pred else { continue };
+            let is_self = tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| tys.kind(t) == TyKind::Param(ParamId(0)));
+            if is_self {
+                bound.extend(tys.bindings(b.value.bindings).iter().map(|(d, _)| *d));
+                stack.push(b.value.def);
+            }
+        }
+    }
+    wanted.into_iter().find(|(d, _)| !bound.contains(d)).map(|(_, n)| n)
 }
 
 /// True when a `dyn Fn*` principal's inputs or output hold a builtin Adt
@@ -5972,6 +6021,10 @@ pub fn ty_uses_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
             tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| ty_uses_param(tys, e, idx)))
         }
+        // The principal's args and bindings (`dyn Rule<Out = O>`).
+        TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| {
+            tys.args(pr.value.args).iter().chain(tys.bindings(pr.value.bindings).iter().map(|(_, g)| g)).any(|g| g.as_ty().is_some_and(|e| ty_uses_param(tys, e, idx)))
+        }),
         _ => false,
     }
 }
@@ -7815,6 +7868,9 @@ pub fn ty_uses_const_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
         TyKind::Array(e, n) => in_const(n) || ty_uses_const_param(tys, e, idx),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| ty_uses_const_param(tys, e, idx)),
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => in_args(a),
+        TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| {
+            in_args(pr.value.args) || tys.bindings(pr.value.bindings).iter().any(|(_, g)| g.as_ty().is_some_and(|e| ty_uses_const_param(tys, e, idx)))
+        }),
         _ => false,
     }
 }

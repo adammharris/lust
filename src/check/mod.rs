@@ -7616,7 +7616,14 @@ impl<'p> Ctx<'p> {
             let path_ok = if from.def == to.def {
                 self.unify_args(from.args, to.args) && self.unify_bindings(from.bindings, to.bindings)
             } else {
+                // An upcast keeps each associated type the source binds
+                // (`dyn Sub<Out = u8>` to `dyn Base<Out = u8>`).
                 object::upcast_path(p, &mut self.tys, from, to).is_some()
+                    && self.tys.bindings(to.bindings).to_vec().into_iter().all(|(assoc, g)| match g {
+                        GenericArg::Ty(want) => crate::traits::solve::dyn_assoc_binding(&mut self.tys, &p.gx.index, from, assoc)
+                            .is_some_and(|have| self.unify(have, want)),
+                        _ => false,
+                    })
             };
             if !auto_ok || !path_ok {
                 self.mismatch(span, expected, found);

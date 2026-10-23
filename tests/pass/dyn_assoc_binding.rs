@@ -1,6 +1,5 @@
-// expect: L0702
-// ARCH 2.8: associated type bindings in dyn types are valid Rust; lust has
-// no vtable form for them yet.
+// ARCH 2.8: a dyn type binds its trait's associated type, and a call
+// through it returns the bound type.
 trait Source {
     type Item;
     fn get(&self) -> Self::Item;

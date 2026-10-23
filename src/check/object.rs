@@ -320,9 +320,7 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
         }
     }
     for (_, aname, is_type) in &rec.assoc_items {
-        if *is_type {
-            info.unsupported.get_or_insert(format!("`dyn {tname}` with the associated type `{}`", p.name(*aname)));
-        } else {
+        if !*is_type {
             info.violation.get_or_insert((format!("it contains the associated const `{}`", p.name(*aname)), rec.span));
         }
     }
@@ -778,9 +776,11 @@ pub fn object_cands(p: &Program, tys: &mut impl TyIntern, principal: TraitRef, n
 /// The super-slot word indexes from a vtable of `from` to one of `to`
 /// (a supertrait reached by upcasting), outermost first. Empty when
 /// they are the same trait ref; None when `to` is not a supertrait.
+/// Bindings take no part (vtables are keyed without them): a caller
+/// that coerces checks `to`'s bindings against the source's.
 pub fn upcast_path(p: &Program, tys: &mut impl TyIntern, from: TraitRef, to: TraitRef) -> Option<Vec<u32>> {
     fn go(p: &Program, tys: &mut impl TyIntern, from: TraitRef, to: TraitRef, depth: u32) -> Option<Vec<u32>> {
-        if from == to {
+        if from.def == to.def && from.args == to.args {
             return Some(Vec::new());
         }
         if depth > 64 {
