@@ -1443,6 +1443,10 @@ fn parse_postfix(c: &mut Cur) -> bool {
                 match c.tok() {
                     Some(Tok::Await) => c.bump(),
                     Some(Tok::Int(..)) => c.bump(),
+                    // `t.0.1`: the `0.1` is one float token, two tuple
+                    // indexes in field position. The parser checks the
+                    // text (src/parser.rs) and rejects any other float.
+                    Some(Tok::Float(_)) => c.bump(),
                     Some(t) if is_seg(t) => {
                         c.bump();
                         if c.at(Tok::PathSep) {
