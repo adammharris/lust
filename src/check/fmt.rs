@@ -439,7 +439,10 @@ impl<'p> Ctx<'p> {
 
     /// True when `fmt::Write` is in scope by a `use` of its std path.
     fn fmt_write_in_scope(&mut self) -> bool {
-        self.std_trait_imported("fmt", "Write")
+        // An instance of a generic body (`W: fmt::Write` at `W =
+        // String`) reaches the methods through the bound the template
+        // check proved them by, imported or not, as in rustc.
+        self.std_trait_imported("fmt", "Write") || self.is_instance_check()
     }
 
     /// `t: Display` or `t: Debug` for a format argument whose type the
