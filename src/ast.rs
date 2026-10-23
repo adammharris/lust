@@ -408,6 +408,10 @@ pub struct SelfParam {
     pub ty: Option<TyId>,
     pub attrs: Vec<Attr>,
     pub span: Span,
+    /// The `self` keyword alone: its context names the binding when a
+    /// macro writes `&` and passes `self` in (`span` then joins two
+    /// contexts and falls back to the call site).
+    pub self_span: Span,
 }
 
 #[cfg_attr(test, derive(Debug))]

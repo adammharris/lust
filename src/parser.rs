@@ -2768,6 +2768,7 @@ impl<'a> Parser<'a> {
             || (self.peek() == Tok::Mut && self.peek_at(1) == Tok::SelfLower && self.peek_at(2) == Tok::Colon);
         if typed_self {
             let mutable = self.eat(Tok::Mut);
+            let self_span = self.span();
             self.bump(); // `self`
             self.bump(); // `:`
             let ty = self.ty()?;
@@ -2778,6 +2779,7 @@ impl<'a> Parser<'a> {
                 ty: Some(ty),
                 attrs: Vec::new(),
                 span: s.to(self.prev_span()),
+                self_span,
             });
             if !self.eat(Tok::Comma) && self.peek() != Tok::RParen {
                 return Err(syntax(self.span(), "expected `,` or `)`"));
@@ -2807,7 +2809,8 @@ impl<'a> Parser<'a> {
             for _ in 0..n {
                 self.bump();
             }
-            self_param = Some(SelfParam { kind, mutable, lifetime, ty: None, attrs: Vec::new(), span: s.to(self.prev_span()) });
+            let self_span = self.prev_span();
+            self_param = Some(SelfParam { kind, mutable, lifetime, ty: None, attrs: Vec::new(), span: s.to(self_span), self_span });
             if !self.eat(Tok::Comma) && self.peek() != Tok::RParen {
                 return Err(syntax(self.span(), "expected `,` or `)`"));
             }

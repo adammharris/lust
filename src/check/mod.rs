@@ -2767,7 +2767,10 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
     cx.tys.env = p.gx.fn_scopes.get(fid.0 as usize).map_or(&[], |fs| fs.env.as_slice());
     let mut pi = 0;
     if let Some(sp) = &def.self_param {
-        let l = cx.add_local(p.known.self_value, f.params[0], sp.mutable, sp.span);
+        // Hygiene reads the binding's context: the `self` keyword's own
+        // when the receiver's tokens come from two expansions.
+        let span = if sp.span.ctxt == sp.self_span.ctxt { sp.span } else { sp.self_span };
+        let l = cx.add_local(p.known.self_value, f.params[0], sp.mutable, span);
         cx.out.param_locals.push(l);
         pi = 1;
     }
