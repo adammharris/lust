@@ -50,6 +50,7 @@ the upstream features it implements, and its exact-layout types.
 | deps/num-bigint | Adapter for 0.4.6: `BigInt` parse, print, pow, conversions (deps/num-bigint/README.md). | W-DEPS |
 | deps/bumpalo | Adapter for 3.20.3: the Bump subset of leak_arena.rs with upstream's chunk bookkeeping (deps/bumpalo/README.md). | W-DEPS |
 | deps/anyhow | Adapter for 1.0.104: `Error` over a boxed `dyn Error` of upstream's wrapper values, `Context`, `Chain`, and the macros, with upstream's texts (deps/anyhow/README.md). | W-DEPS |
+| deps/bitflags | Adapter for 2.13.2: upstream's source, with a generic field type in place of the per-call `InternalBitFlags` (deps/bitflags/README.md). | W-DEPS |
 
 ## The std platform crate (W-SHIM)
 

@@ -57,6 +57,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "name-to-handle-at",
     "jiff",
     "anyhow",
+    "bitflags",
 ];
 
 /// One adapter crate, read from its manifest.

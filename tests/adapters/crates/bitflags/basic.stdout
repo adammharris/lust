@@ -1,0 +1,31 @@
+Edges(TOP | LEFT)
+Edges(0x0)
+Edges(TOP | LEFT | BOTTOM | RIGHT)
+Edges(TOP | 0x10)
+None Some(Edges(TOP | BOTTOM))
+Edges(TOP | LEFT | BOTTOM | RIGHT)
+3 true false
+false true
+Edges(BOTTOM | RIGHT)
+Edges(0x0) Edges(TOP | LEFT | BOTTOM | RIGHT)
+Edges(LEFT) Edges(BOTTOM | RIGHT) Edges(BOTTOM | RIGHT)
+Edges(TOP | BOTTOM | RIGHT)
+Edges(TOP) Edges(LEFT) Edges(BOTTOM) Edges(RIGHT) 
+TOP=1 RIGHT=8 
+Edges(TOP | BOTTOM)
+Edges(LEFT | RIGHT)
+Some(Edges(LEFT))
+None
+TOP | LEFT
+Edges(TOP | RIGHT | 0x10)
+err unrecognized named flag
+ok Edges(0x0)
+Some(Mask(0xf0))
+Mask(A | B | 0xfffffffc) Mask(A | B)
+Mask(A | 0x4)
+6
+NONE:0 TOP:1 LEFT:2 BOTTOM:4 RIGHT:8 ALL:15 
+3
+true
+Edges(0x0)
+true

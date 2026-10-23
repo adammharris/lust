@@ -1,0 +1,10 @@
+Raw(5) 5
+Raw(7)
+Some(Raw(2))
+["READ", "WRITE", "EXEC"]
+["first", "TWO"]
+Some(Named(first)) None
+Named(first | TWO)
+first | TWO
+READ 1
+WRITE 2
