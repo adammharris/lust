@@ -9251,6 +9251,10 @@ impl<'p> Ctx<'p> {
                 Expr::Let { pat, scrut } => {
                     let (pat, scrut) = (*pat, *scrut);
                     let st = self.expr(scrut, None);
+                    // ARCH 2.12 run point, as for a match scrutinee:
+                    // `if let Some(e) = o.and_then(V::as_slice)` knows
+                    // `e`'s type only once the fn item's output is solved.
+                    self.run_obligations(false);
                     self.set(el, BOOL);
                     self.pattern(pat, st, true);
                 }
