@@ -2997,8 +2997,13 @@ impl FnGen<'_, '_> {
                 && !self.knames.contains_key(&(i as Local))
             {
                 let ct = ctype(&self.local_cty[i]);
-                let init = if b.is_empty() { "{0}".to_string() } else { format!("{{ .v = {} }}", c_bytes_lit(b.as_slice())) };
-                let _ = writeln!(self.out, "  static {ct} l{i} = {init};");
+                // An empty blob (`b""`) is a `[u8; 0]`, an empty struct that
+                // tcc takes no `{0}` for; a static starts zeroed anyway.
+                if b.is_empty() {
+                    let _ = writeln!(self.out, "  static {ct} l{i};");
+                } else {
+                    let _ = writeln!(self.out, "  static {ct} l{i} = {{ .v = {} }};", c_bytes_lit(b.as_slice()));
+                }
                 if self.kconst_local(i) {
                     let d = self.kconst_decls(i);
                     self.out.push_str(&d);
