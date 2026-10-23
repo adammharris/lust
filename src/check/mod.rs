@@ -14647,10 +14647,12 @@ impl<'p> Ctx<'p> {
                         written_self = Some(base);
                         break 'qpath r;
                     }
-                    // `<[u8]>::len(s)`: a slice's builtin method by path.
+                    // `<[u8]>::len(s)`, `<u8>::from_str_radix(s, 16)`: a
+                    // slice's or a primitive's builtin item by path, as
+                    // `u8::from_str_radix` resolves.
                     if trait_path.is_empty()
                         && let base_r = self.resolve(base)
-                        && matches!(self.kind(base_r), TyKind::Slice(_))
+                        && matches!(self.kind(base_r), TyKind::Slice(_) | TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
                         && let Some((b, ..)) = self.prim_assoc_sig(base_r, segs[0].name, &[])
                     {
                         break 'qpath Res::PrimAssoc { b, self_ty: base_r, name: segs[0].name };
