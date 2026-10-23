@@ -5882,6 +5882,23 @@ impl<'p> Ctx<'p> {
                 if self.env().iter().any(|pred| matches!(pred, Predicate::TypeOutlives(x, Region::Static) if *x == t)) {
                     return None;
                 }
+                // `T: Tr` with `Tr: 'static` (or a supertrait of it), and
+                // `<T as Tr>::A` where `type A: Bound` and `Bound: 'static`.
+                let env: Vec<Predicate> = self.env().to_vec();
+                if env.iter().any(|pred| match pred {
+                    Predicate::Trait(b) if b.count == 0 => {
+                        self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(t)
+                            && crate::check::outlives::trait_is_static(&p.gx.index, &self.tys, b.value.def, 0)
+                    }
+                    _ => false,
+                }) {
+                    return None;
+                }
+                if let TyKind::Projection(assoc, _) = self.tys.kind(t)
+                    && crate::check::outlives::assoc_bounds_static(&p.gx.index, &self.tys, assoc.0)
+                {
+                    return None;
+                }
                 // A `T: 'static` the signature implies: a param, the
                 // return, or the impl header names a type whose Adt
                 // needs it (`impl<T> S<T>` with `struct S<T: 'static>`).

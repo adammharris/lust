@@ -127,6 +127,14 @@ fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, 
                         env.eqs.push((d, b.value.args, x));
                     }
                 }
+                // `T: Tr` where `Tr: 'static` (or a supertrait of it):
+                // `T: 'static` is implied (`trait Flags: Sized + 'static`).
+                if let Some(GenericArg::Ty(x)) = tys.args(b.value.args).first().copied()
+                    && trait_implies_static(cx, tys, b.value.def, 0)
+                    && !env.statics.contains(&x)
+                {
+                    env.statics.push(x);
+                }
             }
             _ => {}
         }
@@ -143,6 +151,45 @@ fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, 
         }
     }
     env
+}
+
+/// Whether trait `def` or one of its supertraits declares `Self: 'static`.
+fn trait_implies_static(cx: &Cx, tys: &impl TyIntern, def: DefId, depth: u32) -> bool {
+    trait_is_static(cx.index, tys, def, depth)
+}
+
+/// Whether trait `def` or one of its supertraits declares `Self:
+/// 'static` (`trait Flags: Sized + 'static`), so `T: def` implies
+/// `T: 'static`.
+pub(crate) fn trait_is_static(index: &crate::traits::index::ImplIndex, tys: &impl TyIntern, def: DefId, depth: u32) -> bool {
+    let Some(rec) = index.trait_record(def) else { return false };
+    if depth > 16 {
+        return false;
+    }
+    let is_self = |t: Ty| matches!(tys.kind(t), TyKind::Param(ParamId(0)));
+    rec.generics.predicates.iter().any(|q| match q {
+        Predicate::TypeOutlives(x, Region::Static) => is_self(*x),
+        Predicate::Trait(b) if b.count == 0 => {
+            b.value.def != def
+                && tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(is_self)
+                && trait_is_static(index, tys, b.value.def, depth + 1)
+        }
+        _ => false,
+    })
+}
+
+/// Whether associated type `assoc`'s declared bounds imply `'static`:
+/// `type A: 'static`, or `type A: Tr` with `Tr` static.
+pub(crate) fn assoc_bounds_static(index: &crate::traits::index::ImplIndex, tys: &impl TyIntern, assoc: DefId) -> bool {
+    let Some(rec) = index.trait_of_assoc(assoc).and_then(|d| index.trait_record(d)) else { return false };
+    let is_assoc = |t: Ty| matches!(tys.kind(t), TyKind::Projection(a, _) if a.0 == assoc);
+    rec.generics.predicates.iter().any(|q| match q {
+        Predicate::TypeOutlives(x, Region::Static) => is_assoc(*x),
+        Predicate::Trait(b) if b.count == 0 => {
+            tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(is_assoc) && trait_is_static(index, tys, b.value.def, 0)
+        }
+        _ => false,
+    })
 }
 
 /// The first requirement of the `required` types that `env` does not prove.
