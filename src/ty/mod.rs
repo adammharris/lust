@@ -540,6 +540,26 @@ pub struct AutoTraits {
     pub send: bool,
     pub sync: bool,
     pub unpin: bool,
+    /// std's `UnwindSafe` and `RefUnwindSafe` (library/std/src/panic.rs),
+    /// auto traits in rustc that a dyn type may add (`dyn Fn() + Send +
+    /// RefUnwindSafe`); check/unwind.rs answers them.
+    pub unwind_safe: bool,
+    pub ref_unwind_safe: bool,
+}
+
+impl AutoTraits {
+    /// True when every bit of `want` is set here.
+    pub fn covers(&self, want: &AutoTraits) -> bool {
+        (!want.send || self.send)
+            && (!want.sync || self.sync)
+            && (!want.unpin || self.unpin)
+            && (!want.unwind_safe || self.unwind_safe)
+            && (!want.ref_unwind_safe || self.ref_unwind_safe)
+    }
+    /// True when no bit is set.
+    pub fn is_empty(&self) -> bool {
+        !(self.send || self.sync || self.unpin || self.unwind_safe || self.ref_unwind_safe)
+    }
 }
 
 /// A `dyn` bound list: one principal trait ref under its binder (a `dyn for<'a>`

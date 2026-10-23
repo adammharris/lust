@@ -7445,7 +7445,7 @@ impl<'p> Ctx<'p> {
                 TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).auto,
                 _ => AutoTraits::default(),
             };
-            if (want.send && !have.send) || (want.sync && !have.sync) || (want.unpin && !have.unpin) {
+            if !have.covers(&want) {
                 self.mismatch(span, expected, found);
                 return None;
             }
@@ -7485,7 +7485,7 @@ impl<'p> Ctx<'p> {
             _ => AutoTraits::default(),
         };
         let lang = p.gx.lang;
-        for (on, def) in [(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)] {
+        for (on, def) in self.dyn_auto_goals(want) {
             if on {
                 let args = self.tys.intern_args(&[GenericArg::Ty(x)]);
                 self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
@@ -7612,7 +7612,7 @@ impl<'p> Ctx<'p> {
         let to_static = object::dyn_is_static(p, &self.tys, y);
         if let Some(from) = object::principal_of(&self.tys, x) {
             let have = object::dyn_auto(p, &self.tys, x);
-            let auto_ok = (!want.send || have.send) && (!want.sync || have.sync) && (!want.unpin || have.unpin);
+            let auto_ok = have.covers(&want);
             let path_ok = if from.def == to.def {
                 self.unify_args(from.args, to.args) && self.unify_bindings(from.bindings, to.bindings)
             } else {
@@ -7704,7 +7704,7 @@ impl<'p> Ctx<'p> {
         }
         let tr = object::with_self(&mut self.tys, to, x);
         self.obl.push_trait_at(tr, span, 0);
-        for (on, def) in [(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)] {
+        for (on, def) in self.dyn_auto_goals(want) {
             if on {
                 let args = self.tys.intern_args(&[GenericArg::Ty(x)]);
                 self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
@@ -7714,6 +7714,20 @@ impl<'p> Ctx<'p> {
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
     }
+    /// The trait goals a value unsized to a dyn type with auto bits `want`
+    /// must meet: each bit with its trait (an unwind trait lust's std does
+    /// not have is no goal).
+    fn dyn_auto_goals(&self, want: AutoTraits) -> Vec<(bool, DefId)> {
+        let lang = self.p.gx.lang;
+        let mut out = vec![(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)];
+        for (on, refs) in [(want.unwind_safe, false), (want.ref_unwind_safe, true)] {
+            if on && let Some(d) = unwind::unwind_trait_def(self.p, refs) {
+                out.push((true, d));
+            }
+        }
+        out
+    }
+
     /// A method found through a user `Deref` impl of the receiver
     /// (rustc's autoderef, ARCH 2.10; `SmallVec` derefs to `[T]`): when
     /// nothing answers on `base` (the receiver after `before` builtin

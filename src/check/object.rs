@@ -276,6 +276,19 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             }
             continue;
         }
+        // `trait Language: RefUnwindSafe`: an auto trait of every dyn type
+        // with this principal, as `Send` is (check/unwind.rs).
+        match crate::check::unwind::unwind_trait(p, sup) {
+            Some(false) => {
+                info.auto.unwind_safe = true;
+                continue;
+            }
+            Some(true) => {
+                info.auto.ref_unwind_safe = true;
+                continue;
+            }
+            None => {}
+        }
         // The fmt traits are not vtable supertraits: the dyn type
         // implements them through the fixed header shims, as rustc's
         // object type implements every supertrait. For a trait of
@@ -312,6 +325,8 @@ fn info_of(p: &Program, def: DefId, memo: &mut FxMap<DefId, DynInfo>, stack: &mu
             info.auto.send |= si.auto.send;
             info.auto.sync |= si.auto.sync;
             info.auto.unpin |= si.auto.unpin;
+            info.auto.unwind_safe |= si.auto.unwind_safe;
+            info.auto.ref_unwind_safe |= si.auto.ref_unwind_safe;
             info.fmt_debug |= si.fmt_debug;
             info.fmt_display |= si.fmt_display;
         }
@@ -499,12 +514,19 @@ pub fn dyn_auto(p: &Program, tys: &impl TyIntern, t: Ty) -> AutoTraits {
             None => {
                 let l = &p.gx.lang;
                 let has = |want| principal_has_supertrait(p, d, want);
-                AutoTraits { send: has(l.send), sync: has(l.sync), unpin: has(l.unpin) }
+                let has_unwind = |refs| crate::check::unwind::unwind_trait_def(p, refs).is_some_and(has);
+                AutoTraits { send: has(l.send), sync: has(l.sync), unpin: has(l.unpin), unwind_safe: has_unwind(false), ref_unwind_safe: has_unwind(true) }
             }
         },
         None => AutoTraits::default(),
     };
-    AutoTraits { send: b.auto.send || implied.send, sync: b.auto.sync || implied.sync, unpin: b.auto.unpin || implied.unpin }
+    AutoTraits {
+        send: b.auto.send || implied.send,
+        sync: b.auto.sync || implied.sync,
+        unpin: b.auto.unpin || implied.unpin,
+        unwind_safe: b.auto.unwind_safe || implied.unwind_safe,
+        ref_unwind_safe: b.auto.ref_unwind_safe || implied.ref_unwind_safe,
+    }
 }
 
 /// The problem with the first dyn type inside `t`, as a diagnostic at

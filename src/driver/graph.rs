@@ -740,7 +740,7 @@ pub(crate) fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty)
                 st.count.hash(h);
                 hash_trait_ref(h, p, tys, &st.value);
             }
-            (b.auto.send, b.auto.sync, b.auto.unpin).hash(h);
+            (b.auto.send, b.auto.sync, b.auto.unpin, b.auto.unwind_safe, b.auto.ref_unwind_safe).hash(h);
         }
         TyKind::Opaque(def, args) => {
             18u8.hash(h);

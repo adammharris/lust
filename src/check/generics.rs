@@ -3937,6 +3937,18 @@ fn resolve_dyn(
                     ));
                 }
                 let trait_def = trait_def_of_path(cx, interner, known, &trait_ref.path, span)?;
+                // std's `UnwindSafe` / `RefUnwindSafe`: auto traits too.
+                match std_unwind_trait(cx, interner, trait_def) {
+                    Some(false) => {
+                        auto.unwind_safe = true;
+                        continue;
+                    }
+                    Some(true) => {
+                        auto.ref_unwind_safe = true;
+                        continue;
+                    }
+                    None => {}
+                }
                 if cx.lang.is_auto(trait_def) {
                     if trait_def == cx.lang.send {
                         auto.send = true;
@@ -4016,7 +4028,7 @@ fn resolve_dyn(
     // `dyn Send`, `dyn Send + Sync`: no principal, only auto traits. Its
     // vtable holds drop, size, and align (`object::vtable_key`). No trait
     // at all (`dyn 'a`) is rustc E0224.
-    if principal.is_none() && !(auto.send || auto.sync || auto.unpin) {
+    if principal.is_none() && auto.is_empty() {
         return Err(Diag::new("L0110", span, "at least one trait is required for an object type", "Write a trait after `dyn`."));
     }
     let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto });
@@ -4048,6 +4060,18 @@ fn unbound_dyn_assoc(cx: &ResolveCx, tys: &impl TyIntern, trait_def: DefId, bind
         }
     }
     wanted.into_iter().find(|(d, _)| !bound.contains(d)).map(|(_, n)| n)
+}
+
+/// For std's `UnwindSafe` (false) and `RefUnwindSafe` (true), by the
+/// trait's flat name in the spliced `std::panic` module (src/stdmods.rs;
+/// `check::unwind::unwind_trait` once the program exists); None for any
+/// other trait.
+fn std_unwind_trait(cx: &ResolveCx, interner: &Interner, def: DefId) -> Option<bool> {
+    match interner.get(cx.index.trait_record(def)?.name) {
+        "__lust_std_panic$UnwindSafe" => Some(false),
+        "__lust_std_panic$RefUnwindSafe" => Some(true),
+        _ => None,
+    }
 }
 
 /// True when a `dyn Fn*` principal's inputs or output hold a builtin Adt
@@ -13485,6 +13509,12 @@ fn prove_trait_ref(
     // supertrait of `P` (the fmt traits included), with no impl record.
     if index.dyn_object_impl_holds(&mut cx.tys, tr) {
         return true;
+    }
+    // std's `UnwindSafe` / `RefUnwindSafe` by their table
+    // (check/unwind.rs), as body checking answers them.
+    if let Some(refs) = crate::check::unwind::unwind_trait(p, tr.def) {
+        let Some(t) = self_resolved else { return false };
+        return crate::check::unwind::unwind_safe(p, &mut cx.tys, env, refs, t, &mut Vec::new()) == Some(true);
     }
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {

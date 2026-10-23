@@ -11,8 +11,9 @@
 // are `UnwindSafe` when `T: RefUnwindSafe`; the cells (`Cell`, `RefCell`,
 // `OnceCell`, `LazyCell`) and their guards are not `RefUnwindSafe`; the
 // locks, atomics, and `OnceLock` are both; `Rc`, `Arc`, and `sync::Weak`
-// need `T: RefUnwindSafe` for both; `rc::Weak`, `JoinHandle`, and `dyn`
-// types are neither. Everything else is structural. An answer that
+// need `T: RefUnwindSafe` for both; `rc::Weak` and `JoinHandle` are
+// neither; a `dyn` type is what its auto bits say (`dyn Fn() +
+// RefUnwindSafe`, or a principal trait with the supertrait). Everything else is structural. An answer that
 // needs a type parameter's bounds or an unknown std type is "unknown":
 // lust rejects the call (L0820) rather than guess.
 use super::*;
@@ -134,7 +135,7 @@ impl<'p> Ctx<'p> {
 pub fn dyn_any_send(tys: &mut impl TyIntern, any: DefId) -> Ty {
     let args = tys.intern_args(&[GenericArg::Ty(DYN_SELF)]);
     let tr = TraitRef { def: any, args, bindings: EMPTY_BINDINGS };
-    let auto = crate::ty::AutoTraits { send: true, sync: false, unpin: false };
+    let auto = crate::ty::AutoTraits { send: true, ..Default::default() };
     let b = tys.intern_dyn_bounds(crate::ty::DynBounds { principal: Some(Binder::plain(tr)), supertraits: Box::new([]), auto });
     tys.intern(TyKind::Dyn(b, Region::Static))
 }
@@ -152,6 +153,14 @@ pub fn unwind_trait(p: &Program, def: DefId) -> Option<bool> {
         "std::panic::RefUnwindSafe" => Some(true),
         _ => None,
     }
+}
+
+/// The def of std's `UnwindSafe` (`refs` false) or `RefUnwindSafe`
+/// (`refs` true), if the program has it.
+pub fn unwind_trait_def(p: &Program, refs: bool) -> Option<DefId> {
+    let mut defs: Vec<DefId> = p.gx.trait_names.values().copied().filter(|&d| unwind_trait(p, d) == Some(refs)).collect();
+    defs.sort_by_key(|d| (d.krate, d.hash.0));
+    defs.first().copied()
 }
 
 /// True for std's `AssertUnwindSafe` (library/std/src/panic.rs).
@@ -189,7 +198,12 @@ pub fn unwind_safe(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], refs
         | TyKind::Never
         | TyKind::FnDef(..)
         | TyKind::FnPtr(_) => Some(true),
-        TyKind::Dyn(..) => Some(false),
+        // A dyn type is what its auto bits say (`dyn Fn() +
+        // RefUnwindSafe`, or a principal with the supertrait).
+        TyKind::Dyn(..) => {
+            let a = crate::check::object::dyn_auto(p, tys, t);
+            Some(if refs { a.ref_unwind_safe } else { a.unwind_safe })
+        }
         TyKind::Ref(_, m, _) if m.is_mut() && !refs => Some(false),
         TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) => all(tys, vec![(true, e)], seen),
         TyKind::Slice(e) | TyKind::Array(e, _) => all(tys, vec![(refs, e)], seen),
