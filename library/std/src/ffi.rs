@@ -402,6 +402,18 @@ impl Ord for OsStr {
     }
 }
 
+impl core::hash::Hash for OsStr {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.inner.hash(state)
+    }
+}
+
+impl core::borrow::Borrow<OsStr> for OsString {
+    fn borrow(&self) -> &OsStr {
+        self
+    }
+}
+
 impl Deref for OsString {
     type Target = OsStr;
     fn deref(&self) -> &OsStr {

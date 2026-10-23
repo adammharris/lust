@@ -313,6 +313,11 @@ pub(super) fn hash_value_body(p: &Program, slots: &Slots, key: &CTy, need: &mut 
         CTy::Adt(a) if let Some(&(_, f)) = p.gx.hash_impls.get(a).and_then(|v| v.iter().find(|(h, _)| cty(&p.tys, *h) == *hc)) => {
             let _ = writeln!(body, "  {}(p, h);", slots.callee(p, f));
         }
+        // An unsized newtype (`Path`, `OsStr`): its written impl takes
+        // `&self` as the fat value itself.
+        CTy::Unsized(a, _) if let Some(&(_, f)) = p.gx.hash_impls.get(a).and_then(|v| v.iter().find(|(h, _)| cty(&p.tys, *h) == *hc)) => {
+            let _ = writeln!(body, "  {}(*p, h);", slots.callee(p, f));
+        }
         CTy::Adt(a) => {
             let adt = p.adt(*a);
             if adt.is_enum {
@@ -526,10 +531,11 @@ fn borrow_expr(p: &Program, slots: &Slots, k: &CTy, q: &CTy, kp: &str) -> String
         } else {
             format!("{}({kp})", slots.callee(p, f))
         };
-        // `&str`, `&[T]` and `&dyn Tr` come back as fat values: point at a temporary.
+        // `&str`, `&[T]`, `&dyn Tr` and `&Path` (an unsized newtype) come
+        // back as fat values: point at a temporary.
         return match q {
             CTy::Str => format!("((lust_str[]){{ {call} }})"),
-            CTy::Slice(_) | CTy::Dyn => format!("(({}[]){{ {call} }})", ctype(q)),
+            CTy::Slice(_) | CTy::Dyn | CTy::Unsized(..) => format!("(({}[]){{ {call} }})", ctype(q)),
             _ => call,
         };
     }

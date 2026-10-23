@@ -5,8 +5,6 @@
 // prefixes, `/` is the only separator, repeated separators and inner
 // `.` components vanish, a leading `.` stays as `CurDir`. Comparison,
 // ordering, and hashing go through the components, as std's do.
-// `Hash` is missing until lust has user `Hasher` bounds: std hashes the
-// components, and a derived byte hash would disagree with `==`.
 // The parser works on byte offsets into the path (std uses pointer
 // arithmetic for `set_extension`; offsets give the same answers).
 
@@ -1066,6 +1064,53 @@ impl PartialOrd for Path {
 impl Ord for Path {
     fn cmp(&self, other: &Path) -> Ordering {
         Ord::cmp(&self.components(), &other.components())
+    }
+}
+
+// std's hash: the bytes of each component that `components()` keeps,
+// then a word that mixes the component lengths, so ["foo", "bar"] and
+// ["foobar"] differ. Skipping `.` after a separator matches `==`.
+impl core::hash::Hash for Path {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        let bytes = self.bytes();
+        let mut component_start = 0;
+        let mut chunk_bits: usize = 0;
+        for i in 0..bytes.len() {
+            if bytes[i] == b'/' {
+                if i > component_start {
+                    let to_hash = &bytes[component_start..i];
+                    chunk_bits = chunk_bits.wrapping_add(to_hash.len());
+                    chunk_bits = chunk_bits.rotate_right(2);
+                    h.write(to_hash);
+                }
+                component_start = i + 1;
+                let tail = &bytes[component_start..];
+                component_start += match tail {
+                    [b'.'] => 1,
+                    [b'.', b'/', ..] => 1,
+                    _ => 0,
+                };
+            }
+        }
+        if component_start < bytes.len() {
+            let to_hash = &bytes[component_start..];
+            chunk_bits = chunk_bits.wrapping_add(to_hash.len());
+            chunk_bits = chunk_bits.rotate_right(2);
+            h.write(to_hash);
+        }
+        h.write_usize(chunk_bits);
+    }
+}
+
+impl core::hash::Hash for PathBuf {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        self.as_path().hash(h)
+    }
+}
+
+impl core::borrow::Borrow<Path> for PathBuf {
+    fn borrow(&self) -> &Path {
+        self.as_path()
     }
 }
 
