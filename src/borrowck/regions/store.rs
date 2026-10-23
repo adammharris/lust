@@ -481,8 +481,53 @@ impl Builder<'_, '_> {
 /// they are: it holds no callable (closure, fn item, fn pointer, dyn or
 /// opaque value) that could move a region into a part of another shape
 /// (`it.map(|r| (r, Cell::new(r)))`), and no type param.
-pub(super) fn plain_store(tys: &impl TyIntern, t: Ty) -> bool {
-    !holds_closure(tys, t) && !has_fn_ptr(tys, t) && !has_fn_def(tys, t)
+/// A `dyn` whose trait args hold no region (`dyn Error + 'static`, `dyn
+/// Debug + Send`) counts as plain: whatever a call gets from it (an
+/// `Iterator` item, a `Fn` output) has the type its trait args write, so
+/// it holds no region, and the object's own lifetime is a part
+/// `store_into` relates (rustc E0521 kept: `&'a (dyn Tr + 'a)` pushed into
+/// a `Vec<&(dyn Tr + 'static)>`).
+pub(super) fn plain_store(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    !holds_callable(p, tys, t) && !has_fn_ptr(tys, t) && !has_fn_def(tys, t)
+}
+
+/// `holds_closure`, except for a `dyn` whose trait args hold no region
+/// (`plain_store`).
+fn holds_callable(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        // A lifetime arg of the trait (`dyn Get<'a>`) is a region it can
+        // hand on: not plain.
+        TyKind::Dyn(b, _) => {
+            let lifetime_arg = tys
+                .dyn_bounds(b)
+                .principal
+                .is_some_and(|pr| tys.args(pr.value.args).iter().any(|g| matches!(g, GenericArg::Lifetime(_))));
+            lifetime_arg || !dyn_arg_tys(tys, t).into_iter().all(|e| region_free(p, tys, e))
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => holds_callable(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| holds_callable(p, tys, e)),
+        TyKind::Adt(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| holds_callable(p, tys, e))),
+        _ => holds_closure(tys, t),
+    }
+}
+
+/// True when a type has no region place at all, late-bound ones
+/// included, and holds no value whose type could hide one.
+fn region_free(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => region_free(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| region_free(p, tys, e)),
+        TyKind::Adt(_, a) => {
+            adt_regions(p, tys, t) == 0
+                && tys.args(a).iter().all(|g| match g {
+                    GenericArg::Ty(e) => region_free(p, tys, *e),
+                    GenericArg::Lifetime(_) => false,
+                    _ => true,
+                })
+        }
+        TyKind::Ref(..) | TyKind::FnPtr(_) | TyKind::Dyn(..) | TyKind::FnDef(..) => false,
+        _ => !holds_closure(tys, t),
+    }
 }
 
 fn has_fn_def(tys: &impl TyIntern, t: Ty) -> bool {

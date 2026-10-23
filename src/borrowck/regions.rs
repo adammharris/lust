@@ -7915,7 +7915,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 for (j, (at, av)) in avs.iter().enumerate() {
                     if j != i {
                         self.store_into(*at, av, pt, &pv);
-                        let exact = self.cur_builtin.is_some() && store::plain_store(&self.body.tys, *at);
+                        let exact = self.cur_builtin.is_some() && store::plain_store(self.p, &self.body.tys, *at);
                         let rest: Vec<u32> = av.iter().zip(&self.store_covered).filter(|(_, c)| !exact || !**c).map(|(&x, _)| x).collect();
                         self.flow_all(&rest, &pv);
                     }
