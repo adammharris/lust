@@ -267,12 +267,22 @@ fn compiler_id(cmd: &[String]) -> String {
     if let Some(id) = map.lock().unwrap_or_else(|e| e.into_inner()).get(cmd).cloned() {
         return id;
     }
-    let ver = Command::new(&cmd[0])
+    // `zig cc --version` also writes an empty `a.o` in its working directory: run it in an
+    // empty dir of its own, not in the user's. A relative compiler path must not resolve
+    // against that dir (as in `unit_command`).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("lust-cc-version-{}-{seq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let prog = if cmd[0].contains('/') { std::fs::canonicalize(&cmd[0]).unwrap_or_else(|_| PathBuf::from(&cmd[0])) } else { PathBuf::from(&cmd[0]) };
+    let ver = Command::new(prog)
         .args(&cmd[1..])
         .arg("--version")
+        .current_dir(&dir)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string())
         .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
     let stamp = std::fs::metadata(resolve_bin(&cmd[0])).map(|m| format!("{} {:?}", m.len(), m.modified().ok())).unwrap_or_default();
     let id = format!("{} | {ver} | {stamp}", cmd.join(" "));
     map.lock().unwrap_or_else(|e| e.into_inner()).insert(cmd.to_vec(), id.clone());
