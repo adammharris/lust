@@ -13497,6 +13497,16 @@ fn glue_def_value(
                 let _ = writeln!(defs, "{ct} clone_{m}({ct} *p) {{\n{call}}}\n");
                 return;
             }
+            // rustc derives `Clone` of a non-generic `Copy` type as
+            // `*self`, not field by field.
+            if let CTy::Adt(a) = t
+                && p.derives_of(*a).clone
+                && p.derives_of(*a).copy
+                && !p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some())
+            {
+                let _ = writeln!(defs, "{ct} clone_{m}({ct} *p) {{\n  return *p;\n}}\n");
+                return;
+            }
             match t {
                 CTy::String => body.push_str("  return lust_string_clone(p);\n"),
                 CTy::Hash(k, _) if hash::is_table(*k) => body.push_str(&hash::clone_body(p, t, &mut need)),

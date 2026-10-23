@@ -14378,7 +14378,11 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&cra
                 break;
             }
         }
-        if derives.clone {
+        // rustc derives `Clone` of a non-generic `Copy` type as `*self`:
+        // the fields' `clone` is never called, only their `Copy` counts
+        // (checked above).
+        let shallow_clone = derives.copy && !p.gx.adt_generics[idx].params.iter().any(|q| matches!(q.kind, ParamKind::Type));
+        if derives.clone && !shallow_clone {
             for &ft in &field_tys {
                 if p.tys.flags(ft).contains_param() || crate::check::collect::has_clone(p, &p.tys, ft) {
                     continue;
