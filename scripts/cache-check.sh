@@ -15,7 +15,7 @@
 # last line is the last run's summary; the exit code covers all runs.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-jobs=${1:-$(nproc)}
+jobs=${1:-$(getconf _NPROCESSORS_ONLN)}
 python3 "$root/scripts/cache_check.py" --seqs "${SEQS:-40}" --steps 4 --seed "${SEED:-1}" --jobs "$jobs"
 rc=$?
 python3 "$root/scripts/cache_check.py" --seqs "${DAEMON_SEQS:-12}" --steps 12 --seed "${SEED:-1}" --jobs "$jobs" --daemon --threads 1,4,24

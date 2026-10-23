@@ -298,13 +298,22 @@ fn link_executable(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String
     linked
 }
 
-/// Links object files into a shared library at `out`.
-pub fn link_shared(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), String> {
+/// Links object files into a shared library at `out`. `soname` is the file name the library
+/// is installed under. On macOS it becomes the install name (`@rpath/<soname>`), which an
+/// executable linked against the library records as the library to load; an ELF executable
+/// records the file name it found instead.
+pub fn link_shared(objs: &[PathBuf], out: &Path, soname: &str, debug: bool) -> Result<(), String> {
     let tcc = Tcc::new(TCC_OUTPUT_DLL, debug)?;
+    if cfg!(target_os = "macos") {
+        let opt = CString::new(format!("-install_name @rpath/{soname}")).unwrap();
+        // SAFETY: valid state and a NUL-terminated string that outlives the call.
+        unsafe { tcc_set_options(tcc.s, opt.as_ptr()) };
+    }
     link_objects(&tcc, objs, out)
 }
 
-/// Links an executable from `objs` plus `<dir>/lib<base>.so`, which it loads at run time.
+/// Links an executable from `objs` plus `<dir>/lib<base>.so` (`.dylib` on macOS), which it
+/// loads at run time.
 /// The base name is versioned (for example `base-3`), so a rebuilt base never changes what an
 /// executable built earlier loads.
 pub fn link_with_base(objs: &[PathBuf], dir: &Path, base: &str, out: &Path, debug: bool) -> Result<(), String> {

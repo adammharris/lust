@@ -12,7 +12,7 @@ set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # --quick (for every land): the one-shot half on a 24-program sample, release C and dev C only,
 # no order audit; the image half as in full. The full form is for the release lane.
-jobs=${GATE_JOBS:-$(nproc)}
+jobs=${GATE_JOBS:-$(getconf _NPROCESSORS_ONLN)}
 t0=$(date +%s)
 if [ "${1:-}" = "--quick" ]; then
   shift

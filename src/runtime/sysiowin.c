@@ -169,6 +169,13 @@ int32_t lust_sys_fd_isatty(int32_t fd) {
 
 void lust_sys_stat_fields(lust_Vec *out, DWORD attrs, uint64_t size, FILETIME ct, FILETIME at, FILETIME mt, uint64_t ino); /* syswin.c */
 
+/* No fd path on Windows: ERROR_NOT_SUPPORTED. */
+int32_t lust_sys_fd_path(int32_t fd, lust_Vec *out) {
+    (void)fd;
+    (void)out;
+    return 50;
+}
+
 int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out) {
     HANDLE h = lust_win_handle(fd);
     if (h == INVALID_HANDLE_VALUE) return 6;

@@ -286,7 +286,7 @@ check "cache: hit build runs" test "$("$d/h")" = "hello 42"
 run_lust check hello.rs --timings >/dev/null
 out=$(run_lust check hello.rs --timings)
 case "$out" in *"whole-request cache hit"*) ok "cache: second check hits";; *) bad "cache: second check hits" "no hit line";; esac
-sed -i 's/40 + 2/1 + 2/' "$d/hello.rs"
+sed 's/40 + 2/1 + 2/' "$d/hello.rs" >"$d/hello.rs.tmp" && mv "$d/hello.rs.tmp" "$d/hello.rs"
 out=$(run_lust build hello.rs -o h --timings)
 case "$out" in *"cache hit"*) bad "cache: edit misses" "reported a hit after an edit";; *) ok "cache: edit misses";; esac
 check "cache: edited build has new output" test "$("$d/h")" = "hello 3"

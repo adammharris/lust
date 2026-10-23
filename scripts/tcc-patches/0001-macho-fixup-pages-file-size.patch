@@ -1,0 +1,31 @@
+tccmacho: size each segment's chained fixup page table by its file size
+
+A segment's dyld_chained_starts_in_segment.page_count covered its vmsize,
+zero-fill sections included. dyld's page-in linking maps each listed page
+from the file, so the .bss pages past the segment's file data were filled
+with the bytes that follow it in the file (the symbol strings in
+__LINKEDIT), not zeros. ld64 counts only the pages with file data; a
+zero-fill page holds no pointer to fix up.
+
+diff --git a/tccmacho.c b/tccmacho.c
+index cee09fd7..da22f8f4 100644
+--- a/tccmacho.c
++++ b/tccmacho.c
+@@ -1279,7 +1279,7 @@ static void calc_fixup_size(TCCState *s1, struct macho *mo)
+     size = (sizeof(struct dyld_chained_fixups_header) + 7) & -8;
+     size += (sizeof(struct dyld_chained_starts_in_image) + (mo->nseg - 1) * sizeof(uint32_t) + 7) & -8;
+     for (i = (s1->output_type == TCC_OUTPUT_EXE); i < mo->nseg - 1; i++) {
+-	int page_count = (get_segment(mo, i)->vmsize + SEG_PAGE_SIZE - 1) / SEG_PAGE_SIZE;
++	int page_count = (get_segment(mo, i)->filesize + SEG_PAGE_SIZE - 1) / SEG_PAGE_SIZE;
+ 	size += (sizeof(struct dyld_chained_starts_in_segment) + (page_count - 1) * sizeof(uint16_t) + 7) & -8;
+     }
+     size += mo->n_bind * sizeof (struct dyld_chained_import) + 1;
+@@ -2062,7 +2062,7 @@ ST_FUNC void bind_rebase_import(TCCState *s1, struct macho *mo)
+         image->seg_info_offset[i] = (data - mo->chained_fixups->data) -
+ 				    header->starts_offset;
+ 	seg = get_segment(mo, i);
+-	page_count = (seg->vmsize + SEG_PAGE_SIZE - 1) / SEG_PAGE_SIZE;
++	page_count = (seg->filesize + SEG_PAGE_SIZE - 1) / SEG_PAGE_SIZE;
+ 	size = sizeof(struct dyld_chained_starts_in_segment) +
+ 		      (page_count - 1) * sizeof(uint16_t);
+         segment = (struct dyld_chained_starts_in_segment *) data;

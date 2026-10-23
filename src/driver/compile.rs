@@ -647,6 +647,10 @@ fn record_base_user(base_dir: &Path, soname: &str, out: &Path) {
     }
 }
 
+/// The extension of a base library file: tcc on macOS reads a Mach-O
+/// library only under its own extension.
+pub const BASE_EXT: &str = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+
 /// The pid in a base file name (`libbase-<pid>-<hash>.so`): the process
 /// that built it. Base files are also unique per session instance (the
 /// session's object dir is mixed into the hash), so one session never
@@ -671,16 +675,16 @@ fn base_owner_pid(soname: &str) -> Option<u32> {
 /// rewritten with only the kept, deduplicated entries. Called on a
 /// session's first base build and on daemon exit.
 pub fn sweep_bases(base_dir: &Path, exiting_pid: u32) {
-    // Half-written temp bases from crashed builds. /proc presence is
-    // the liveness probe (Linux hosts only; elsewhere the file stays).
+    // Half-written temp bases from crashed builds (`daemon::pid_alive`
+    // is the liveness probe).
     if let Ok(rd) = std::fs::read_dir(base_dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if let Some(rest) = name.strip_prefix("libbase-tmp-")
                 && let Some(pid) = rest.split('-').next()
-                && pid.parse::<u32>().is_ok()
-                && pid != std::process::id().to_string()
-                && !Path::new(&format!("/proc/{pid}")).exists()
+                && let Ok(pid) = pid.parse::<u32>()
+                && pid != std::process::id()
+                && !crate::daemon::pid_alive(pid)
             {
                 let _ = std::fs::remove_file(e.path());
             }
@@ -707,7 +711,7 @@ pub fn sweep_bases(base_dir: &Path, exiting_pid: u32) {
     }
     let owner_alive = |soname: &str| match base_owner_pid(soname) {
         Some(pid) if pid == exiting_pid => false,
-        Some(pid) => pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists(),
+        Some(pid) => pid == std::process::id() || crate::daemon::pid_alive(pid),
         None => false,
     };
     let mut kept = String::new();
@@ -5901,18 +5905,37 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         let base = if rebuild_base {
             caches.base_gen += 1;
-            let tmp = base_dir.join(format!("libbase-tmp-{}-{}-{}.so", std::process::id(), caches.base_gen, base_tmp_seq()));
+            let tmp = base_dir.join(format!("libbase-tmp-{}-{}-{}.{BASE_EXT}", std::process::id(), caches.base_gen, base_tmp_seq()));
+            let obj_dir = caches.obj_dir.to_string_lossy().into_owned();
+            // The object dir in the hash makes the name unique to this
+            // session instance, and the pid names the owning process:
+            // see `base_owner_pid`.
+            let name_of = |content: &[u8]| {
+                let (a, b) = crate::driver::cache::hash128(&[content, obj_dir.as_bytes()], 41);
+                format!("base-{}-{a:016x}{b:016x}", std::process::id())
+            };
             let built = std::fs::create_dir_all(&base_dir)
                 .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
-                .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
                 .and_then(|_| {
+                    // On macOS the library holds its own install name, so the
+                    // name comes before the link: from the objects, which fix
+                    // the library's bytes.
+                    if cfg!(target_os = "macos") {
+                        let mut objs = Vec::new();
+                        for o in &all_base {
+                            objs.extend(std::fs::read(o).map_err(|e| format!("cannot read {}: {e}", o.display()))?);
+                        }
+                        let name = name_of(&objs);
+                        crate::tcc::link_shared(&all_base, &tmp, &format!("lib{name}.{BASE_EXT}"), req.debug)?;
+                        return Ok(name);
+                    }
+                    crate::tcc::link_shared(&all_base, &tmp, "", req.debug)?;
                     let bytes = std::fs::read(&tmp).map_err(|e| format!("cannot read {}: {e}", tmp.display()))?;
-                    // The object dir in the hash makes the name unique to this
-                    // session instance, and the pid names the owning process:
-                    // see `base_owner_pid`.
-                    let (a, b) = crate::driver::cache::hash128(&[&bytes, caches.obj_dir.to_string_lossy().as_bytes()], 41);
-                    caches.base_name = format!("base-{}-{a:016x}{b:016x}", std::process::id());
-                    let soname = format!("lib{}.so", caches.base_name);
+                    Ok(name_of(&bytes))
+                })
+                .and_then(|name| {
+                    caches.base_name = name;
+                    let soname = format!("lib{}.{BASE_EXT}", caches.base_name);
                     install_base(&tmp, &base_dir.join(&soname))?;
                     if !caches.base_files.contains(&soname) {
                         caches.base_files.push_back(soname);
@@ -5924,17 +5947,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
             t.lap("link libbase.so");
             built
-        } else if !caches.base_name.is_empty() && !base_dir.join(format!("lib{}.so", caches.base_name)).exists() {
+        } else if !caches.base_name.is_empty() && !base_dir.join(format!("lib{}.{BASE_EXT}", caches.base_name)).exists() {
             // The base file vanished under a live session. The bases dir
             // is in `.lust-cache`, state outside tools may delete as a
             // cache (the edit fuzzer rewrites the crate tree every edit).
             // The base objects still live in the session object dir, so
             // relink the same base under the same name.
-            let dest = base_dir.join(format!("lib{}.so", caches.base_name));
-            let tmp = base_dir.join(format!("libbase-tmp-{}-relink-{}.so", std::process::id(), base_tmp_seq()));
+            let dest = base_dir.join(format!("lib{}.{BASE_EXT}", caches.base_name));
+            let tmp = base_dir.join(format!("libbase-tmp-{}-relink-{}.{BASE_EXT}", std::process::id(), base_tmp_seq()));
             let built = std::fs::create_dir_all(&base_dir)
                 .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
-                .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
+                .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, &format!("lib{}.{BASE_EXT}", caches.base_name), req.debug))
                 .and_then(|_| install_base(&tmp, &dest));
             if built.is_err() {
                 let _ = std::fs::remove_file(&tmp);
@@ -5959,7 +5982,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // kept keeps its base; one that was overwritten or deleted does not. A running program
     // keeps its mapped copy after unlink.
     if caches.persistent && !caches.base_name.is_empty() {
-        let soname = format!("lib{}.so", caches.base_name);
+        let soname = format!("lib{}.{BASE_EXT}", caches.base_name);
         if let Some(base_dir) = caches.base_dir.clone() {
             record_base_user(&base_dir, &soname, &req.out);
         }

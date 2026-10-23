@@ -119,6 +119,21 @@ int64_t lust_sys_fd_pwrite(int32_t fd, const uint8_t *p, uint64_t len, int64_t o
 
 int32_t lust_sys_fd_isatty(int32_t fd) { return isatty(fd) ? 1 : 0; }
 
+/* The path an open fd names, as std's File Debug finds it: fcntl(F_GETPATH)
+   on Darwin, the /proc/self/fd link elsewhere. 0, or errno. */
+int32_t lust_sys_fd_path(int32_t fd, lust_Vec *out) {
+#ifdef __APPLE__
+    char buf[1024]; /* MAXPATHLEN */
+    if (fcntl(fd, F_GETPATH, buf) == -1) return errno;
+    lust_sysio_push(out, buf, strlen(buf));
+    return 0;
+#else
+    char link[32];
+    int n = snprintf(link, sizeof link, "/proc/self/fd/%d", (int)fd);
+    return lust_sys_readlink((const uint8_t *)link, (uint64_t)n, out);
+#endif
+}
+
 /* The stat fields of sys.c's lust_sys_stat, for an open fd. */
 int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out) {
     struct stat st;

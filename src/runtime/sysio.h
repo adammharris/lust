@@ -39,6 +39,8 @@ int32_t lust_sys_fd_isatty(int32_t fd);
 /* fstat(2) as 8-byte little-endian fields appended to the Vec (the
    same layout as lust_sys_stat): 0, or errno. */
 int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out);
+/* The path an open fd names, appended to the Vec: 0, or errno. */
+int32_t lust_sys_fd_path(int32_t fd, lust_Vec *out);
 /* open(2) of a path with std's flags for `flags` (see sysio.c) and
    mode 0666: the fd, -errno, or -1 for a path with a NUL byte as an
    errno of 0 is impossible, so -1 reads back as the NUL error only

@@ -17,7 +17,7 @@ set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
 [ -x "$lust" ] || { echo "error: $lust not built. Run scripts/build.sh first."; exit 2; }
-jobs=${1:-$(nproc)}
+jobs=${1:-$(getconf _NPROCESSORS_ONLN)}
 stride=${STRIDE:-1}
 work=$(mktemp -d "${TMPDIR:-/tmp}/warm-check.XXXXXX")
 trap 'rm -rf "$work"' EXIT

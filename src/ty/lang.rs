@@ -1085,6 +1085,15 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     },
     // isatty: 1 for a terminal, else 0 (IsTerminal, tf-p6).
     IntrinsicDef { name: "sys_fd_isatty", c_symbol: "lust_sys_fd_isatty", params: &[S::I32], ret: S::I32, allowed: ONLY_STD, implemented: true },
+    // The path an open fd names (File's Debug): 0 or errno.
+    IntrinsicDef {
+        name: "sys_fd_path",
+        c_symbol: "lust_sys_fd_path",
+        params: &[S::I32, S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // fstat as 8-byte fields, like sys_stat.
     IntrinsicDef {
         name: "sys_fd_stat",

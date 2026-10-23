@@ -5,4 +5,4 @@
 # Exit 0 = all same, 1 = a difference or a one-sided build failure, 2 = setup error.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-python3 "$root/scripts/front_check.py" --jobs "${GATE_JOBS:-$(nproc)}" "$@"
+python3 "$root/scripts/front_check.py" --jobs "${GATE_JOBS:-$(getconf _NPROCESSORS_ONLN)}" "$@"

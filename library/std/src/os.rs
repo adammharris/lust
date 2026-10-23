@@ -404,15 +404,21 @@ pub mod unix {
             fn from_mode(mode: u32) -> Self;
         }
 
+        /// A mode as std keeps it, a `mode_t`: `u32` on Linux, `u16` on macOS
+        /// (the bits above are dropped).
+        fn mode_t(mode: u32) -> u64 {
+            if cfg!(target_os = "macos") { (mode as u16) as u64 } else { mode as u64 }
+        }
+
         impl PermissionsExt for crate::fs::Permissions {
             fn mode(&self) -> u32 {
                 self.mode as u32
             }
             fn set_mode(&mut self, mode: u32) {
-                self.mode = mode as u64;
+                self.mode = mode_t(mode);
             }
             fn from_mode(mode: u32) -> crate::fs::Permissions {
-                crate::fs::Permissions { mode: mode as u64 }
+                crate::fs::Permissions { mode: mode_t(mode) }
             }
         }
 
@@ -605,7 +611,7 @@ pub mod unix {
                 self.stopped_raw()
             }
             fn continued(&self) -> bool {
-                self.raw() == 0xffff
+                self.continued_raw()
             }
             fn into_raw(self) -> i32 {
                 self.raw()

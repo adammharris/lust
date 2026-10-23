@@ -71,6 +71,12 @@ fn main() {
     }
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=static=tcc");
+    // The compile runs on the main thread (see `raise_stack_limit` in main.rs), which needs
+    // pool::STACK_SIZE (256 MiB). macOS fixes the main stack's size at exec, from the binary,
+    // and setrlimit cannot grow it later: give the size to the linker.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bin=lust-core=-Wl,-stack_size,0x10000000");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo:rustc-link-lib=dylib=dl");
         println!("cargo:rustc-link-lib=dylib=pthread");

@@ -147,7 +147,9 @@ The daemon exits after 30 idle minutes (`LUST_DAEMON_IDLE`, for example `10m`; `
 
 ## Build and use
 
-Linux x86_64 only. The daemon uses Unix sockets. Other platforms are not verified.
+Linux x86_64, and macOS arm64 from source. The daemon uses Unix sockets. Other platforms are not verified.
+
+On macOS arm64 (2026-10-21), the differential tests pass 5591 of 5597 and the crate fixtures 93 of 93. Three of the failing cases use `std::os::linux`, so rustc rejects them there too. The other three print the size of a std lock type (`Mutex`, `RwLock`, `Condvar`, `OnceLock`): lust lays these out as on Linux (futex words), where macOS std holds a pointer. The persistent front image (`LUST_FRONT_STATE`) is Linux only; elsewhere a build runs without it.
 
 ### From the release
 

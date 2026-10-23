@@ -1532,31 +1532,39 @@ float lust_f32_powi(float a, int32_t e) {
     return e < 0 ? 1.0f / r : r;
 }
 
-/* f64::min and f64::max: a NaN operand yields the other operand,
-   and equal operands yield the second one (so the zero sign of the
-   second operand wins). */
+/* f64::min and f64::max: a NaN operand yields the other operand.
+   Equal operands (0.0 and -0.0) are rustc's target's choice: on
+   x86_64 the second one (so the zero sign of the second operand
+   wins); on aarch64 fminnm and fmaxnm order -0.0 below 0.0, so min
+   yields a -0.0 operand and max a 0.0 one (LUST_F_TIE). */
+#if defined(__aarch64__)
+#define LUST_F_TIE(a, b, want_neg) (lust_f_neg(a) == (want_neg) ? (a) : (b))
+static int lust_f_neg(double x) { return x < 0 || (x == 0 && 1.0 / x < 0); }
+#else
+#define LUST_F_TIE(a, b, want_neg) (b)
+#endif
 double lust_f64_min(double a, double b) {
     if (a < b) return a;
     if (b < a) return b;
-    if (a == b) return b;
+    if (a == b) return LUST_F_TIE(a, b, 1);
     return a == a ? a : b;
 }
 double lust_f64_max(double a, double b) {
     if (a > b) return a;
     if (b > a) return b;
-    if (a == b) return b;
+    if (a == b) return LUST_F_TIE(a, b, 0);
     return a == a ? a : b;
 }
 float lust_f32_min(float a, float b) {
     if (a < b) return a;
     if (b < a) return b;
-    if (a == b) return b;
+    if (a == b) return LUST_F_TIE(a, b, 1);
     return a == a ? a : b;
 }
 float lust_f32_max(float a, float b) {
     if (a > b) return a;
     if (b > a) return b;
-    if (a == b) return b;
+    if (a == b) return LUST_F_TIE(a, b, 0);
     return a == a ? a : b;
 }
 

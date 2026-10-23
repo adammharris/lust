@@ -148,11 +148,13 @@ unsafe extern "C" {
     fn getenv(name: *const c_char) -> *const c_char;
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    #[cfg(target_os = "linux")]
     fn personality(persona: u64) -> c_int;
     fn writev(fd: c_int, iov: *const IoVec, cnt: c_int) -> isize;
     fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
     fn pread(fd: c_int, buf: *mut c_void, count: usize, off: i64) -> isize;
     fn pwrite(fd: c_int, buf: *const c_void, count: usize, off: i64) -> isize;
+    #[cfg(target_os = "linux")]
     fn copy_file_range(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: u32) -> isize;
     fn flock(fd: c_int, op: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
@@ -180,10 +182,26 @@ unsafe extern "C" {
     fn mi_usable_size(p: *const c_void) -> usize;
     fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    #[cfg(target_os = "linux")]
     fn memfd_create(name: *const c_char, flags: std::ffi::c_uint) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
     fn clone(f: extern "C" fn(*mut c_void) -> c_int, stack: *mut c_void, flags: c_int, arg: *mut c_void, ...) -> c_int;
     fn syscall(n: std::ffi::c_long, ...) -> std::ffi::c_long;
+}
+
+// Linux-only calls. Elsewhere each one fails: `reexec` fails, and the build
+// goes on without an image (the image paths after it never run).
+#[cfg(not(target_os = "linux"))]
+unsafe fn personality(_persona: u64) -> c_int {
+    -1
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn copy_file_range(_fd_in: c_int, _off_in: *mut i64, _fd_out: c_int, _off_out: *mut i64, _len: usize, _flags: u32) -> isize {
+    -1
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn memfd_create(_name: *const c_char, _flags: std::ffi::c_uint) -> c_int {
+    -1
 }
 
 const PROT_RW: c_int = 0x1 | 0x2;

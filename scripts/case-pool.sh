@@ -36,7 +36,7 @@ run_lust() {
 # `run_to cmd 2>file` also puts timeout's "dumped core" note and bash's "Aborted" job report
 # there when cmd dies by a signal (a panic=abort panic).
 run_to_err() { local e=$1; shift; run_to bash -c 'exec "$@" 2>"$0"' "$e" "$@" 2>/dev/null; }
-jobs=${DIFFTEST_JOBS:-$(nproc)}
+jobs=${DIFFTEST_JOBS:-$(getconf _NPROCESSORS_ONLN)}
 rustc_cache=${DIFFTEST_RUSTC_CACHE:-$HOME/.cache/lust-difftest}
 [ "$rustc_cache" = off ] || mkdir -p "$rustc_cache" || rustc_cache=off
 rustc_version=$(rustc -vV 2>&1)
@@ -129,8 +129,9 @@ rustc_oracle() {
     # masked (mask_stdout), so a cached result serves any checkout.
     run_to ./rustc.bin "${args[@]}" >rustc.out 2>rustc.stderr; rs=$?
     echo $rs >rustc.rs
-    sed -i "s|$f|@CASE@|g" rustc.stderr
-    sed -i -e "s|$f|@CASE@|g" -e "s|$root|@ROOT@|g" rustc.out
+    # Through a temp file, not `sed -i`: BSD sed (macOS) reads -i's next word as a suffix.
+    sed "s|$f|@CASE@|g" rustc.stderr >rustc.stderr.tmp && mv rustc.stderr.tmp rustc.stderr
+    sed -e "s|$f|@CASE@|g" -e "s|$root|@ROOT@|g" rustc.out >rustc.out.tmp && mv rustc.out.tmp rustc.out
   fi
   [ -n "$entry" ] && [ $cc -ne 124 ] && [ $cc -ne 137 ] && [ $rs -ne 124 ] && [ $rs -ne 137 ] || return 0
   tmp=$(mktemp -d "$rustc_cache/.tmp.XXXXXX") || return 0

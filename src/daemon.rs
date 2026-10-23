@@ -291,12 +291,16 @@ fn stale_temp_pid(name: &str) -> Option<u32> {
     None
 }
 
-/// True when a process with `pid` exists. Signal 0 plus the /proc
-/// fallback for a pid owned by another user (where signal 0 fails).
+/// True when a process with `pid` exists. Signal 0, which fails with
+/// EPERM for a pid owned by another user, plus the /proc fallback.
 /// A reused pid reads as alive, which only keeps a stale dir longer.
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    const EPERM: i32 = 1;
     // SAFETY: signal 0 only probes whether the pid exists.
-    (pid > 0 && unsafe { kill(pid as i32, 0) } == 0) || Path::new(&format!("/proc/{pid}")).exists()
+    let probe = if pid > 0 && pid <= i32::MAX as u32 { unsafe { kill(pid as i32, 0) } } else { -1 };
+    probe == 0
+        || (probe < 0 && pid > 0 && std::io::Error::last_os_error().raw_os_error() == Some(EPERM))
+        || Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Deletes lust temp dirs and files from processes that are gone:

@@ -64,6 +64,12 @@ pub fn start(dir: &Path) {
 }
 
 /// Asks the kernel to read `path` ahead into the page cache (`posix_fadvise` WILLNEED).
+/// Linux only; elsewhere the read itself warms the cache.
+#[cfg(not(target_os = "linux"))]
+fn read_ahead(_path: &Path) {}
+
+/// Asks the kernel to read `path` ahead into the page cache (`posix_fadvise` WILLNEED).
+#[cfg(target_os = "linux")]
 fn read_ahead(path: &Path) {
     use std::os::fd::AsRawFd;
     unsafe extern "C" {

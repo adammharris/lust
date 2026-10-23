@@ -50,7 +50,7 @@ EOF
 export -f one
 export CC OPT F work LLOBJ
 mkdir -p "${LLOBJ:-$work}"
-ls "$prefix".u*.c | xargs -P "${JOBS:-$(nproc)}" -I{} bash -c 'one "$@"' _ {} > "$work/objs" || { echo "llbuild: a unit failed" >&2; exit 1; }
+ls "$prefix".u*.c | xargs -P "${JOBS:-$(getconf _NPROCESSORS_ONLN)}" -I{} bash -c 'one "$@"' _ {} > "$work/objs" || { echo "llbuild: a unit failed" >&2; exit 1; }
 objs=$(cat "$work/objs")
 if [ -f "$prefix.eh.cc" ]; then
   $CXX -O2 -w -fexceptions -c "$prefix.eh.cc" -o "$work/eh.o"

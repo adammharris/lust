@@ -280,9 +280,8 @@ impl Drop for File {
 
 impl fmt::Debug for File {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let link = format!("/proc/self/fd/{}", self.fd);
         let mut raw: Vec<u8> = Vec::new();
-        let _ = core::intrinsics::sys_readlink(core::intrinsics::sys_str_as_bytes(&link), &mut raw);
+        let _ = core::intrinsics::sys_fd_path(self.fd, &mut raw);
         f.debug_struct("File")
             .field("fd", &self.fd)
             .field("path", &PathBuf::from_os_string(OsString::__from_vec(raw)))
@@ -557,10 +556,14 @@ impl PartialEq for FileType {
     }
 }
 
-/// Std hashes the type bits as a `mode_t` (`u32` on Linux).
+/// Std hashes the type bits as a `mode_t` (`u32` on Linux, `u16` on macOS).
 impl core::hash::Hash for FileType {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.masked().hash(state);
+        if cfg!(target_os = "macos") {
+            (self.masked() as u16).hash(state);
+        } else {
+            self.masked().hash(state);
+        }
     }
 }
 

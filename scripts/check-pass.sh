@@ -10,7 +10,7 @@ lust=$root/target/release/lust
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
 export lust
-ls "$root"/tests/pass/*.rs | xargs -P "${JOBS:-$(nproc)}" -I{} sh -c '
+ls "$root"/tests/pass/*.rs | xargs -P "${JOBS:-$(getconf _NPROCESSORS_ONLN)}" -I{} sh -c '
   e=$(mktemp)
   if ! LUST_NO_DAEMON=1 timeout 60 "$lust" check "$1" >/dev/null 2>"$e"; then
     echo "REJECT $(basename "$1"): $(head -1 "$e" | cut -c1-160)"

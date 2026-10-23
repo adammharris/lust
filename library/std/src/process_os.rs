@@ -145,8 +145,19 @@ impl ExitStatus {
     }
 
     /// glibc's `WIFSTOPPED` then `WSTOPSIG` (`ExitStatusExt::stopped_signal`).
+    /// Darwin's: the low 7 bits are 0x7f, the signal (`x >> 8`, unmasked) is
+    /// not SIGCONT (that is a continue).
     pub(crate) fn stopped_raw(&self) -> Option<i32> {
+        if cfg!(target_os = "macos") {
+            return if self.raw & 0x7f == 0x7f && self.raw >> 8 != 0x13 { Some(self.raw >> 8) } else { None };
+        }
         if self.raw & 0xff == 0x7f { Some((self.raw >> 8) & 0xff) } else { None }
+    }
+
+    /// glibc's `WIFCONTINUED` (0xffff); Darwin's is a stop by SIGCONT
+    /// (`ExitStatusExt::continued`).
+    pub(crate) fn continued_raw(&self) -> bool {
+        if cfg!(target_os = "macos") { self.raw & 0x7f == 0x7f && self.raw >> 8 == 0x13 } else { self.raw == 0xffff }
     }
 }
 
@@ -165,7 +176,7 @@ impl fmt::Display for ExitStatus {
             write!(f, "signal: {sig}{}{core}", name(sig))
         } else if let Some(sig) = self.stopped_raw() {
             write!(f, "stopped (not terminated) by signal: {sig}{}", name(sig))
-        } else if self.raw == 0xffff {
+        } else if self.continued_raw() {
             write!(f, "continued (WIFCONTINUED)")
         } else {
             write!(f, "unrecognised wait status: {} {:#x}", self.raw, self.raw)
@@ -939,7 +950,10 @@ impl fmt::Debug for Command {
             if let Some(cfg) = &self.stderr {
                 s.field("stderr", &Some(StdioField(cfg.kind)));
             }
-            s.field("create_pidfd", &false);
+            // std has the field on Linux only.
+            if cfg!(target_os = "linux") {
+                s.field("create_pidfd", &false);
+            }
             return s.finish();
         }
         if let Some(cwd) = &self.cwd {
