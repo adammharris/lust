@@ -3502,7 +3502,7 @@ impl<'a> Parser<'a> {
                 Ok(t)
             }
             Tok::For => Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types and bounds")),
-            Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+            Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower if self.cfg_syntax && self.at_path_macro_call() => {
                 let (span, _) = self.skip_macro_invocation()?;
                 Ok(self.push_ty(TyExpr::Unit, span))
             }
@@ -4113,7 +4113,7 @@ impl<'a> Parser<'a> {
                     Pat::QPath { self_ty, trait_path, segs }
                 }
             }
-            Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+            Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower if self.cfg_syntax && self.at_path_macro_call() => {
                 self.skip_macro_invocation()?;
                 Pat::Wild
             }
@@ -5081,6 +5081,9 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Bool(false)
             }
+            // `crate::err!(..)` in cfg-disabled code (active code reaches
+            // the parser expanded).
+            Tok::Crate | Tok::Super | Tok::SelfLower if self.cfg_syntax && self.at_path_macro_call() => return self.cfg_macro_expr(),
             Tok::Crate | Tok::Super | Tok::PathSep => {
                 let path = self.path(false)?;
                 if self.peek() == Tok::LBrace && !no_struct {
