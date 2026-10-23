@@ -4133,10 +4133,14 @@ impl<'a> Expander<'a> {
                 // expression position the empty expansion is an error,
                 // and dropping the `;` would let the flat stream read
                 // the next statement as the expression.
+                // A matched item, stmt, or block fragment ends a statement
+                // too, as `stmt_start` reads it: `m!({ $i:item });` then
+                // an empty `n!(..);` in an impl body.
                 let stmt_boundary = item_list
                     || out.is_empty()
                     || matches!(out.last(), Some(Tt::Tok(t)) if t.tok == Tok::Semi)
-                    || matches!(out.last(), Some(Tt::Delim(Delim::Brace, _, _)));
+                    || matches!(out.last(), Some(Tt::Delim(Delim::Brace, _, _)))
+                    || matches!(out.last(), Some(Tt::Frag(FragKind::Stmt | FragKind::Item | FragKind::Block, _, _)));
                 if next_is_semi && begins_item {
                     next += 1;
                 } else if next_is_semi && expanded.is_empty() && stmt_boundary {
