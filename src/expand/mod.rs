@@ -1195,6 +1195,9 @@ pub struct Expander<'a> {
     /// What kind of list is being expanded, for the position rules of a
     /// cfg run (`cfg_run_misplaced`).
     group: Group,
+    /// Set when a `#[cfg]` that is off drops a node: the call that
+    /// expands to nothing because of it is a removed list element.
+    cfg_dropped: bool,
     /// `use std::vec as v;` style renames of builtin macros seen
     /// during the walk: bound name to canonical macro name.
     builtin_imports: Vec<(Sym, Sym)>,
@@ -1363,6 +1366,7 @@ impl<'a> Expander<'a> {
             enum_body: false,
             assoc_body: false,
             group: Group::Brace,
+            cfg_dropped: false,
             builtin_imports: Vec::new(),
             module_builtin_alias: FxMap::default(),
             exported: FxMap::default(),
@@ -4113,11 +4117,28 @@ impl<'a> Expander<'a> {
                 } else {
                     Group::Expr(!cfg_run_misplaced(&out, &trees, i, self.group, self.enum_body, self.ctx.interner))
                 };
+                // Whether a cfg that is off dropped a node while this
+                // expansion ran (in it or in a call inside it): an empty
+                // result is then a removed list element (below).
+                let outer_dropped = std::mem::replace(&mut self.cfg_dropped, false);
                 let outer_group = std::mem::replace(&mut self.group, group);
                 let expanded = expanded.and_then(|e| self.expand_list(e, depth + 1, item_list, stmt_list, nest));
                 self.group = outer_group;
                 self.expn = outer_expn;
+                let cfg_headed = self.cfg_dropped;
+                self.cfg_dropped |= outer_dropped;
                 let mut expanded = expanded?;
+                // A list element the call is the whole of (`[a, m!(..), b]`)
+                // whose expansion a cfg removed goes with its comma, as a
+                // written `#[cfg(off)]` element does.
+                if expanded.is_empty()
+                    && cfg_headed
+                    && self.group.is_list()
+                    && (out.is_empty() || matches!(out.last(), Some(Tt::Tok(t)) if t.tok == Tok::Comma))
+                    && tok_at(&trees, next).map(|t| t.tok) == Some(Tok::Comma)
+                {
+                    next += 1;
+                }
                 let begins_item = starts_item(&expanded, self.ctx.interner);
                 let next_is_semi = tok_at(&trees, next).map(|t| t.tok) == Some(Tok::Semi);
                 if item_list && !expanded.is_empty() && begins_item && call.delim != Delim::Brace && !next_is_semi {
@@ -4429,6 +4450,7 @@ impl<'a> Expander<'a> {
                 "cfg" => {
                     let on = builtin::eval_cfg(&attr.inner, &self.ctx.cfg, self, attr.span)?;
                     if !on {
+                        self.cfg_dropped = true;
                         // A list element (argument, parameter, tuple or
                         // array element) runs to its comma, even a
                         // block-like one (`[#[cfg(off)] if c {1} else {2}, 3]`).
