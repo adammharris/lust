@@ -4164,9 +4164,11 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// `'static`, and each elided output slot is the one input slot's
     /// (elision; L0202 otherwise). Slots in `free` (`.0`, W-BORROW3) are
     /// the pointer's free region, var `.1`, in the inputs and the output.
+    /// A written binder (`binders`' `FnSig::binders`) is one fresh region
+    /// for all its slots, and each output slot is its input slot's.
     /// False when the shapes do not pair or the output is not the one
     /// input's (the caller's rule then).
-    fn call_late_bound_free(&mut self, ins: &[Ty], out: Ty, free: Option<(u32, u32)>, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+    fn call_late_bound_free(&mut self, ins: &[Ty], out: Ty, free: Option<(u32, u32)>, binders: Option<FnSig>, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         if ins.len() != avs.len() {
             return false;
         }
@@ -4181,10 +4183,17 @@ impl<'b, 'p> Builder<'b, 'p> {
             let (at, av) = &avs[i];
             let mut pv: Vec<u32> = Vec::new();
             for r in self.sig_slot_regions(it) {
+                // A slot of an earlier slot's binder (`FnSig::binders`)
+                // takes that slot's var: one region per binder.
+                let k = j as usize;
+                let shared = binders.and_then(|b| b.binder_of(k)).and_then(|l| slots.iter().chain(&pv).nth(l).copied());
                 pv.push(match is_free(&mut j) {
                     Some(v) => v,
                     None if r == Region::Static => 0,
-                    None => self.fresh(),
+                    None => match shared {
+                        Some(v) => v,
+                        None => self.fresh(),
+                    },
                 });
             }
             if !av.is_empty() && !self.relate(*at, av, it, &pv, Variance::Co) {
@@ -4203,10 +4212,15 @@ impl<'b, 'p> Builder<'b, 'p> {
         let one = if let [one] = late[..] { Some(one) } else { None };
         let rv = outs
             .iter()
-            .map(|&r| match is_free(&mut j) {
-                Some(v) => Some(v),
-                None if r == Region::Static => Some(0),
-                None => one,
+            .map(|&r| {
+                let k = j as usize;
+                match is_free(&mut j) {
+                    Some(v) => Some(v),
+                    None if r == Region::Static => Some(0),
+                    // A written binder: the output slot's input slot.
+                    None if binders.is_some_and(|b| b.binders != 0) => binders.and_then(|b| b.binder_of(k)).and_then(|l| slots.get(l).copied()),
+                    None => one,
+                }
             })
             .collect::<Option<Vec<u32>>>();
         let Some(rv) = rv else { return false };
@@ -4658,7 +4672,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             let mut lv = Vec::new();
             self.local_vars(l, &mut lv);
             let free = if s.free_slots != 0 { lv.first().map(|&v| (s.free_slots, v)) } else { None };
-            if (s.free_slots == 0 || free.is_some()) && self.call_late_bound_free(&ins, s.output, free, &avs, dt, &dv) {
+            if (s.free_slots == 0 || free.is_some()) && self.call_late_bound_free(&ins, s.output, free, Some(s), &avs, dt, &dv) {
                 return;
             }
         }
@@ -6543,7 +6557,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 if (s.free_slots != 0 && free.is_none()) || self.sc.slots(it) as usize != x.len() || self.sc.slots(out) as usize != item.len() {
                     return false;
                 }
-                self.call_late_bound_free(&ins, out, free, &[(it, x.to_vec())], out, item)
+                self.call_late_bound_free(&ins, out, free, Some(s), &[(it, x.to_vec())], out, item)
             }
             TyKind::FnDef(def, fargs) if self.body.tys.args(fargs).is_empty() => {
                 let Some(l) = self.p.local_def(def.hash) else { return false };

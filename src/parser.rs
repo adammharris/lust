@@ -2629,7 +2629,7 @@ impl<'a> Parser<'a> {
         if !binder.is_empty()
             && let Some(GenericArgs::Parenthesized { inputs, output }) = path.last().map(|s| s.args.clone())
         {
-            self.canon_binder(&binder, &inputs, output)?;
+            self.canon_binder(&binder, &inputs, output, false)?;
         }
         Ok(TraitBound::Trait { binder, trait_ref: TraitRefExpr { path }, maybe })
     }
@@ -3374,7 +3374,7 @@ impl<'a> Parser<'a> {
                 if let Some(TraitBound::Trait { trait_ref, .. }) = bounds.first()
                     && let Some(GenericArgs::Parenthesized { inputs, output }) = trait_ref.path.last().map(|s| s.args.clone())
                 {
-                    self.canon_binder(&binder, &inputs, output)?;
+                    self.canon_binder(&binder, &inputs, output, false)?;
                 }
                 // A trailing lifetime bound is the dyn lifetime.
                 let lifetime = match bounds.last() {
@@ -3495,7 +3495,7 @@ impl<'a> Parser<'a> {
                     return Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types other than fn pointers"));
                 };
                 let (inputs, ret): (Vec<TyId>, Option<TyId>) = (inputs.iter().map(|p| p.ty).collect(), *ret);
-                self.canon_binder(&binder, &inputs, ret)?;
+                self.canon_binder(&binder, &inputs, ret, true)?;
                 if let TyExpr::FnPtr { binder: b, .. } = &mut self.ast.tys[t.0 as usize] {
                     *b = binder;
                 }

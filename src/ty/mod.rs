@@ -433,12 +433,31 @@ pub struct FnSig {
     /// unknown (a pointer type lust builds, a free region, several input
     /// regions): every elided output slot is the one input's then.
     pub out_slots: u8,
+    /// A `for<..>` binder that elision cannot write (`for<'s> fn(&mut
+    /// Ctx<'s>, &'s [u8]) -> Cow<'s, [u8]>`, `parser::hrtb`): four bits
+    /// per region slot `k < 16` (borrowck's slot order over the inputs,
+    /// then the output), `j + 1` when slot `k` is the binder of slot
+    /// `j < k`, 0 when it is a binder of its own (or `'static`). Every
+    /// non-`'static` output slot then names an input slot. 0 for an
+    /// elided signature; such a type has no free slots and `own_out` 0.
+    pub binders: u64,
 }
 
 impl FnSig {
     /// A signature with no free region (`free_slots` 0).
     pub fn plain(inputs: TysId, output: Ty) -> FnSig {
-        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased, own_out: 0, out_slots: u8::MAX }
+        FnSig { inputs, output, is_unsafe: false, extern_c: false, free_slots: 0, free_region: Region::Erased, own_out: 0, out_slots: u8::MAX, binders: 0 }
+    }
+
+    /// The slot whose binder region slot `k` is (`binders`), if another.
+    pub fn binder_of(&self, k: usize) -> Option<usize> {
+        if k >= 16 {
+            return None;
+        }
+        match (self.binders >> (4 * k)) & 0xf {
+            0 => None,
+            j => Some(j as usize - 1),
+        }
     }
 
     /// True when the output has `actual` region slots and the written one

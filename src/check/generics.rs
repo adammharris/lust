@@ -1852,14 +1852,20 @@ fn dyn_args_have_regions(ast: &Ast, interner: &Interner, path: &[ast::PathSeg]) 
 /// may sit anywhere. L0203 for the cut forms: two such lifetimes, one
 /// inside a nested fn pointer, `dyn`, `impl`, or `Fn` sugar type, and a
 /// `'static` that is not on a reference.
-fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId) -> Result<Option<ast::Lifetime>, Diag> {
+fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId, binder: &[ast::Lifetime]) -> Result<Option<ast::Lifetime>, Diag> {
     struct W<'x> {
         ast: &'x Ast,
         interner: &'x Interner,
+        binder: &'x [ast::Lifetime],
         found: Option<ast::Lifetime>,
     }
     impl W<'_> {
         fn note(&mut self, lt: ast::Lifetime, plain: bool, on_ref: bool) -> Result<(), Diag> {
+            // A kept `for<..>` binder's lifetime (`FnSig::binders`) in a
+            // plain place; elsewhere it stays undeclared (L0203).
+            if plain && self.binder.iter().any(|b| b.name == lt.name) {
+                return Ok(());
+            }
             let cut = |why: &str| {
                 Diag::new(
                     "L0203",
@@ -1937,11 +1943,107 @@ fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId) -> Result<Opt
         }
     }
     let TyExpr::FnPtr { inputs, ret, .. } = ast.ty(id) else { return Ok(None) };
-    let mut w = W { ast, interner, found: None };
+    let mut w = W { ast, interner, binder, found: None };
     for t in inputs.iter().map(|p| p.ty).chain(*ret) {
         w.ty(t, true)?;
     }
     Ok(w.found)
+}
+
+/// The marker region of kept binder lifetime `i` (`fn_ptr_binders`).
+fn binder_marker(i: usize) -> Region {
+    Region::Placeholder(u32::MAX - 1 - i as u32)
+}
+
+/// True when fn pointer type `id` writes a lifetime of its `for<..>`
+/// binder on a reference or a type arg of its inputs or output: the
+/// parser kept the binder (`parser::hrtb`), as elision cannot say it.
+fn fn_ptr_kept_binder(ast: &Ast, binder: &[ast::Lifetime], id: ast::TyId) -> bool {
+    fn ty(ast: &Ast, binder: &[ast::Lifetime], t: ast::TyId) -> bool {
+        let named = |lt: &ast::Lifetime| binder.iter().any(|b| b.name == lt.name);
+        match ast.ty(t) {
+            TyExpr::Ref { lifetime, inner, .. } => lifetime.as_ref().is_some_and(named) || ty(ast, binder, *inner),
+            TyExpr::Tuple(elems) => elems.iter().any(|&e| ty(ast, binder, e)),
+            TyExpr::Paren(i) | TyExpr::Slice(i) | TyExpr::Array { inner: i, .. } | TyExpr::Ptr { inner: i, .. } => ty(ast, binder, *i),
+            TyExpr::Path(segs) => segs.iter().any(|s| match &s.args {
+                GenericArgs::Angle(a) => a.iter().any(|g| match g {
+                    AstArg::Lifetime(lt) => named(lt),
+                    AstArg::Type(t) => ty(ast, binder, *t),
+                    _ => false,
+                }),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+    let TyExpr::FnPtr { inputs, ret, .. } = ast.ty(id) else { return false };
+    !binder.is_empty() && inputs.iter().map(|p| p.ty).chain(*ret).any(|t| ty(ast, binder, t))
+}
+
+/// `FnSig::binders` of a fn pointer type whose `for<..>` binder the
+/// parser kept: its inputs `in_tys` and output `ret` resolve again with
+/// regions kept, each binder lifetime its marker (`scope` has them), and
+/// each slot of the erased signature (`ins`, `out`) where a marker lands
+/// again after its first input slot names that slot. An output slot that
+/// is elided, or a binder lifetime the inputs do not write (rustc E0581),
+/// is L0203; so is a binder slot past the sixteenth.
+#[allow(clippy::too_many_arguments)]
+fn fn_ptr_binders(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    binder: &[ast::Lifetime],
+    in_tys: &[ast::TyId],
+    ret: Option<ast::TyId>,
+    ins: &[Ty],
+    out: Ty,
+) -> Result<u64, Diag> {
+    let span = binder.first().map_or_else(Span::default, |l| l.span);
+    let cut = |why: &str| Diag::new("L0203", span, format!("this `for<..>` lifetime is not supported yet: {why}"), "Elide it, or use a generic `F: Fn(..)` parameter.");
+    let mut ts = scope.clone();
+    ts.fn_ptr_free = false;
+    ts.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    let mut twin_ins = Vec::with_capacity(in_tys.len());
+    for &t in in_tys {
+        twin_ins.push(resolve_scoped(ast, interner, known, cx, tys, t, &ts)?);
+    }
+    let twin_out = match ret {
+        Some(r) => resolve_scoped(ast, interner, known, cx, tys, r, &ts)?,
+        None => UNIT,
+    };
+    let mut slots: Vec<Region> = Vec::new();
+    if !twin_ins.iter().zip(ins).all(|(&r, &e)| crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, r, e, &mut slots)) {
+        return Err(cut("lust cannot place it in the signature"));
+    }
+    let n_in = slots.len();
+    if !crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, twin_out, out, &mut slots) {
+        return Err(cut("lust cannot place it in the signature"));
+    }
+    let markers: Vec<Region> = (0..binder.len()).map(binder_marker).collect();
+    let mut first: Vec<Option<usize>> = vec![None; binder.len()];
+    let mut map = 0u64;
+    for (k, r) in slots.into_iter().enumerate() {
+        let Some(i) = markers.iter().position(|&m| m == r) else {
+            if k >= n_in && r == Region::Bound(0) {
+                return Err(cut("the output elides a lifetime next to a binder elision cannot write"));
+            }
+            continue;
+        };
+        match first[i] {
+            None if k >= n_in => return Err(cut("the output uses it, but no input does")),
+            None => first[i] = Some(k),
+            Some(j) => {
+                if k >= 16 {
+                    return Err(cut("the signature has more than 16 region places"));
+                }
+                map |= ((j + 1) as u64) << (4 * k);
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// `FnSig::own_out` and `FnSig::out_slots` of a fn pointer type with
@@ -3588,8 +3690,19 @@ pub fn resolve_scoped(
             // A fn pointer's elided lifetimes are its own (late-bound), a
             // written `&'static` is kept (`Scope::static_refs`), and one
             // lifetime of the enclosing item is its free region (W-BORROW3,
-            // `FnSig::free_slots`). Other written lifetimes are L0203.
-            let free = fn_ptr_free_name(ast, interner, id)?;
+            // `FnSig::free_slots`). A `for<..>` binder the parser kept
+            // written (`parser::hrtb`) is `FnSig::binders`. Other written
+            // lifetimes are L0203.
+            let kept = fn_ptr_kept_binder(ast, binder, id);
+            let free = fn_ptr_free_name(ast, interner, id, binder)?;
+            if let (true, Some(lt)) = (kept, free) {
+                return Err(Diag::new(
+                    "L0203",
+                    lt.span,
+                    "a fn pointer type with both a `for<..>` binder and a lifetime of the enclosing item is not supported yet",
+                    "Name only binder lifetimes in the fn pointer type, or elide them.",
+                ));
+            }
             if free.is_some() && !scope.fn_ptr_free {
                 return Err(Diag::new(
                     "L0203",
@@ -3599,7 +3712,14 @@ pub fn resolve_scoped(
                 ));
             }
             let in_tys: Vec<ast::TyId> = inputs.iter().map(|p| p.ty).collect();
-            sugar_elision(ast, interner, known, cx, tys, scope, &in_tys, *ret)?;
+            // The kept binder's lifetimes, each its own marker region.
+            let mut bscope = scope.clone();
+            if kept {
+                for (i, lt) in binder.iter().enumerate() {
+                    bscope.alias_lifetimes.insert(0, (lt.name, binder_marker(i)));
+                }
+            }
+            sugar_elision(ast, interner, known, cx, tys, &bscope, &in_tys, *ret)?;
             let free_region = match free {
                 Some(lt) => Some((lt, scope_region(interner, scope, Some(lt), lt.span)?)),
                 None => None,
@@ -3607,6 +3727,11 @@ pub fn resolve_scoped(
             let outer = scope;
             let mut erased = scope.erased();
             erased.static_refs = true;
+            if kept {
+                for lt in binder {
+                    erased.alias_lifetimes.insert(0, (lt.name, Region::Erased));
+                }
+            }
             let scope = &erased;
             let mut ins = Vec::with_capacity(inputs.len());
             for p in inputs {
@@ -3620,9 +3745,11 @@ pub fn resolve_scoped(
                 Some((lt, r)) => (fn_ptr_free_mask(ast, interner, known, cx, tys, outer, &in_tys, *ret, lt, &ins, out)?, r),
                 None => (0, Region::Erased),
             };
-            let (own_out, out_slots) = if free_slots == 0 { fn_ptr_own_output(ast, interner, known, cx, tys, outer, &in_tys, *ret, out) } else { (0, u8::MAX) };
+            let binders = if kept { fn_ptr_binders(ast, interner, known, cx, tys, &bscope, binder, &in_tys, *ret, &ins, out)? } else { 0 };
+            let (own_out, out_slots) =
+                if free_slots == 0 && binders == 0 { fn_ptr_own_output(ast, interner, known, cx, tys, outer, &in_tys, *ret, out) } else { (0, u8::MAX) };
             let inputs = tys.intern_tys(&ins);
-            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, out_slots, ..FnSig::plain(inputs, out) }));
+            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, out_slots, binders, ..FnSig::plain(inputs, out) }));
             Ok(tys.intern(TyKind::FnPtr(sig)))
         }
         TyExpr::QPath { self_ty, trait_path, segs } => {
