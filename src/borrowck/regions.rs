@@ -5720,9 +5720,16 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// `it.flat_map(f)`, typed `Flatten<Map<I, F, B>, U>` (check/iter.rs):
     /// the arguments make the inner `Map` as `it.map(f)` does
     /// (`call_adapter`), and the front and back iterators `U` hold what
-    /// the map's parts hold. A `&mut` capture of `f` then stays apart from
-    /// the regions it points to (else a `RefMut` it borrows would stay
-    /// borrowed for the guard's whole life). False for another shape.
+    /// the map's output part `B` holds: `U` is `B::IntoIter`, made from a
+    /// `B` alone, and `B` holds what `f` returns for the items (a closure
+    /// ties it through `closure_reqs`, a fn item or `dyn Fn` through
+    /// `map_output_part`). So `U` holds no loan of the source iterator
+    /// the closure does not return (`ls.iter().flat_map(|l| l.names())`
+    /// over `&[&'static dyn L]` yields `'static` items). A fn pointer
+    /// leaves `B` untied, so there every part of the map reaches `U`. A
+    /// `&mut` capture of `f` then stays apart from the regions it points
+    /// to (else a `RefMut` it borrows would stay borrowed for the guard's
+    /// whole life). False for another shape.
     fn call_flat_map(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         use crate::ty::iter::IterKind as K;
         let Some((K::Flatten, a)) = crate::ty::iter::iter_parts(&self.body.tys, dt) else { return false };
@@ -5737,11 +5744,25 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let (mv, uv) = (dv[..nm].to_vec(), dv[nm..].to_vec());
         self.call_adapter(avs, m, &mv);
-        self.flow_all(&mv, &uv);
+        let src = self.map_output_vars(m, &mv).unwrap_or_else(|| mv.clone());
+        self.flow_all(&src, &uv);
         if has_interior(&self.body.tys, u) {
-            self.flow_all(&uv, &mv);
+            self.flow_all(&uv, &src);
         }
         true
+    }
+
+    /// The vars of `Map<I, F, B>`'s output part `B` (map vars `mv`) when
+    /// the map ties it to what `F` returns: any callable but a fn pointer
+    /// (`map_output_part`). None otherwise.
+    fn map_output_vars(&mut self, m: Ty, mv: &[u32]) -> Option<Vec<u32>> {
+        let (_, a) = crate::ty::iter::iter_parts(&self.body.tys, m)?;
+        let [i, f, b] = a[..] else { return None };
+        if matches!(self.body.tys.kind(f), TyKind::FnPtr(_)) {
+            return None;
+        }
+        let at = adt_regions(self.p, &self.body.tys, m) as usize + self.sc.slots(i) as usize + self.sc.slots(f) as usize;
+        mv.get(at..at + self.sc.slots(b) as usize).map(<[u32]>::to_vec)
     }
 
     /// A builtin that builds an iterator adapter (`map`, `filter`,
