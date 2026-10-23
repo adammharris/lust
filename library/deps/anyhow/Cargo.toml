@@ -1,0 +1,13 @@
+# Lust adapter crate (docs/ARCH.md section 3.6). Dev builds compile this
+# crate in place of the registry package anyhow 1.0.104; release builds
+# use the real crate through Cargo. The driver checks `version` against
+# the resolved package and the metadata against src/resolve/adapters.rs.
+[package]
+name = "anyhow"
+version = "1.0.104"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+features = ["default", "std"]

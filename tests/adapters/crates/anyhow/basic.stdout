@@ -1,0 +1,221 @@
+display: bad number "x"
+alt: bad number "x": invalid digit found in string
+debug: bad number "x"
+
+Caused by:
+    invalid digit found in string
+alt debug: Error {
+    context: "bad number \"x\"",
+    source: ParseIntError {
+        kind: InvalidDigit,
+    },
+}
+chain: 2
+root: invalid digit found in string
+--
+display: loading
+alt: loading: bad number "x": invalid digit found in string
+debug: loading
+
+Caused by:
+    0: bad number "x"
+    1: invalid digit found in string
+alt debug: Error {
+    context: "loading",
+    source: Error {
+        context: "bad number \"x\"",
+        source: ParseIntError {
+            kind: InvalidDigit,
+        },
+    },
+}
+chain: 3
+root: invalid digit found in string
+--
+display: plain message
+alt: plain message
+debug: plain message
+alt debug: "plain message"
+chain: 1
+root: plain message
+--
+display: formatted 3
+alt: formatted 3
+debug: formatted 3
+alt debug: "formatted 3"
+chain: 1
+root: formatted 3
+--
+display: outer failure
+alt: outer failure: inner failure
+second line
+debug: outer failure
+
+Caused by:
+    inner failure
+    second line
+alt debug: Outer(
+    Inner,
+)
+chain: 2
+root: inner failure
+second line
+--
+display: two
+alt: two: one: outer failure: inner failure
+second line
+debug: two
+
+Caused by:
+    0: one
+    1: outer failure
+    2: inner failure
+       second line
+alt debug: Error {
+    context: "two",
+    source: Error {
+        context: "one",
+        source: Outer(
+            Inner,
+        ),
+    },
+}
+chain: 4
+root: inner failure
+second line
+--
+display: negative: -1
+alt: negative: -1
+debug: negative: -1
+alt debug: "negative: -1"
+chain: 1
+root: negative: -1
+--
+display: too big
+alt: too big
+debug: too big
+alt debug: "too big"
+chain: 1
+root: too big
+--
+display: the answer 42
+alt: the answer 42
+debug: the answer 42
+alt debug: "the answer 42"
+chain: 1
+root: the answer 42
+--
+display: seven is a message
+alt: seven is a message
+debug: seven is a message
+alt debug: "seven is a message"
+chain: 1
+root: seven is a message
+--
+display: outer failure
+alt: outer failure: inner failure
+second line
+debug: outer failure
+
+Caused by:
+    inner failure
+    second line
+alt debug: Outer(
+    Inner,
+)
+chain: 2
+root: inner failure
+second line
+--
+ok 5
+display: nothing here
+alt: nothing here
+debug: nothing here
+alt debug: nothing here
+chain: 1
+root: nothing here
+--
+display: still nothing
+alt: still nothing
+debug: still nothing
+alt debug: still nothing
+chain: 1
+root: still nothing
+--
+display: reading
+alt: reading: io broke
+debug: reading
+
+Caused by:
+    io broke
+alt debug: Error {
+    context: "reading",
+    source: Custom {
+        kind: Other,
+        error: "io broke",
+    },
+}
+chain: 2
+root: io broke
+--
+["inner failure\nsecond line", "outer failure", "ctx"]
+3
+ctx
+ctx
+
+Caused by:
+    0: outer failure
+    1: inner failure
+       second line
+outer failure
+display: outer failure
+alt: outer failure: inner failure
+second line
+debug: outer failure
+
+Caused by:
+    inner failure
+    second line
+alt debug: Outer(
+    Inner,
+)
+chain: 2
+root: inner failure
+second line
+--
+display: owned message
+alt: owned message
+debug: owned message
+alt debug: "owned message"
+chain: 1
+root: owned message
+--
+display: outer failure
+alt: outer failure: inner failure
+second line
+debug: outer failure
+
+Caused by:
+    inner failure
+    second line
+alt debug: Outer(
+    Inner,
+)
+chain: 2
+root: inner failure
+second line
+--
+display: second
+alt: second: first
+debug: second
+
+Caused by:
+    first
+alt debug: Error {
+    context: "second",
+    source: "first",
+}
+chain: 2
+root: first
+--
+3

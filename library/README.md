@@ -49,6 +49,7 @@ the upstream features it implements, and its exact-layout types.
 | deps/num-traits | Adapter for 0.2.19: `ToPrimitive` with the f64 impl (deps/num-traits/README.md). | W-DEPS |
 | deps/num-bigint | Adapter for 0.4.6: `BigInt` parse, print, pow, conversions (deps/num-bigint/README.md). | W-DEPS |
 | deps/bumpalo | Adapter for 3.20.3: the Bump subset of leak_arena.rs with upstream's chunk bookkeeping (deps/bumpalo/README.md). | W-DEPS |
+| deps/anyhow | Adapter for 1.0.104: `Error` over a boxed `dyn Error` of upstream's wrapper values, `Context`, `Chain`, and the macros, with upstream's texts (deps/anyhow/README.md). | W-DEPS |
 
 ## The std platform crate (W-SHIM)
 

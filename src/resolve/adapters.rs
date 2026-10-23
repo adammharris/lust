@@ -56,6 +56,7 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "same-file",
     "name-to-handle-at",
     "jiff",
+    "anyhow",
 ];
 
 /// One adapter crate, read from its manifest.
