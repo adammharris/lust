@@ -1,0 +1,6 @@
+# `use util as u; use u::matches;`: the expander does not follow a renamed
+# dependency, so lust rejects the import rather than expand the builtin
+# `matches!` (rustc expands the dependency's).
+bin=scen
+expect=L0820
+cargo=pass
