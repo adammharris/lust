@@ -811,6 +811,14 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         if path.is_empty() {
             continue;
         }
+        // An overlay text (`lust test`'s harness shims) can change while its file's stamp
+        // stands: the shims of a module name the tests of the modules below it. Compare it.
+        if let Some(text) = crate::driver::overlay_text(std::path::Path::new(path)) {
+            if front.map.text(file) != Some(text.as_str()) {
+                changed.push((file, text));
+            }
+            continue;
+        }
         let md = std::fs::metadata(path).map_err(|_| "file gone")?;
         if let (Some(st), Ok(mtime)) = (base.stamps.get(k).copied().flatten(), md.modified())
             && st == (Stamp { mtime, len: md.len() })
@@ -3100,7 +3108,7 @@ pub fn run() -> i64 {
             emit_c: None,
             max_errors: 0,
             run_args: None,
-            harness: false, cc: false,
+            harness: false, cc: false, overlay: Default::default(),
             client: Default::default(),
         };
         let resp = compile(&req, session);

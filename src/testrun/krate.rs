@@ -3,7 +3,7 @@
 //
 // A Cargo target's tests live in many files, so the harness cannot be one copied file. The
 // crate builds from its own files through the driver's source overlay
-// (`driver::set_source_overlay`): each module that holds a test, in a file or inline, gets the
+// (`Request::overlay`, `driver::read_source`): each module that holds a test, in a file or inline, gets the
 // same `__lust_test_{i}` shims as a one-file test (`harness_shims`), and the crate root gets the
 // dispatching `main`. Every added item is `#[cfg(test)]`, so the same files compiled as a
 // dependency (the lib of an integration test, or of a dev-dependency) read as written. Each shim
@@ -103,6 +103,7 @@ fn unit_cargo_env(key: &crate::protocol::SessionKey) -> Vec<(String, String)> {
         target_triple: key.target_triple.clone(),
         cargo_net: key.cargo_net,
         env: None,
+        cache_dir: Some(crate::driver::cache::cache_dir(&key.krate.root)),
     };
     let Ok(graph) = cargo::load_graph(&greq) else { return Vec::new() };
     let interner = Interner::default();
@@ -588,6 +589,16 @@ fn overlay(d: &Discovery, root: &Path) -> HashMap<String, String> {
     out
 }
 
+/// The test binary built by the daemon that serves this directory, as the client sends a
+/// build (src/client.rs): None when `LUST_NO_DAEMON` is set, a source override is set
+/// (`protocol::source_override`), or no daemon of this build answers.
+fn daemon_build(req: &driver::Request) -> Option<driver::Response> {
+    if std::env::var("LUST_NO_DAEMON").is_ok_and(|v| !v.is_empty() && v != "0") || crate::protocol::source_override().is_some() {
+        return None;
+    }
+    crate::protocol::request(&crate::protocol::socket_path(), req)
+}
+
 /// Removes the build dir, unless `LUST_TEST_KEEP` is set: it then keeps the
 /// generated C and the binary for a look at a build or runtime bug.
 fn remove_dir(dir: &Path) {
@@ -658,15 +669,24 @@ pub(super) fn run(o: &Opts, crate_args: &[String]) -> i32 {
         }
         return fail(&text);
     }
-    driver::set_source_overlay(overlay(&d, &root));
+    req.overlay = std::sync::Arc::new(overlay(&d, &root));
     let dir = std::env::temp_dir().join(format!("lust-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let bin = dir.join("testbin");
     req.out = bin.clone();
     req.cmd = Cmd::Build;
-    let mut session = driver::Session::new(dir.join("obj"), false, req.session.clone());
-    session.caches.leak_at_exit = true;
-    let build = driver::compile(&req, &mut session);
+    // A daemon builds it warm (its session for this test target keeps the last build's
+    // state), as `lust build` does; with none, it builds cold here.
+    let build = match daemon_build(&req) {
+        Some(resp) => resp,
+        None => {
+            let mut session = driver::Session::new(dir.join("obj"), false, req.session.clone());
+            session.caches.leak_at_exit = true;
+            let resp = driver::compile(&req, &mut session);
+            std::mem::forget(session);
+            resp
+        }
+    };
     if build.code != 0 {
         print!("{}", build.stdout);
         eprint!("{}", build.stderr);

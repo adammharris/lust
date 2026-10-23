@@ -50,6 +50,11 @@ pub fn set_background(cancel: Option<std::sync::Arc<AtomicBool>>) {
     BACKGROUND.with(|b| *b.borrow_mut() = cancel);
 }
 
+/// True on a background thread (`set_background`) and the phase threads it starts.
+pub fn is_background() -> bool {
+    BACKGROUND.with(|b| b.borrow().is_some())
+}
+
 /// The name of every pool thread (also what /proc shows for it).
 const THREAD_NAME: &str = "lust-pool";
 

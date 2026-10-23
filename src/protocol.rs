@@ -292,9 +292,13 @@ pub struct Request {
     /// the client runs it.
     pub run_args: Option<Vec<String>>,
     /// For `lust test`: the file gets a generated `main`, so a missing user `main` is not
-    /// an error. The daemon wire format does not carry this (decode sets false): `lust
-    /// test` compiles in its own process.
+    /// an error.
     pub harness: bool,
+    /// Source texts that stand in for files on disk, by canonical path, for this request
+    /// only: `lust test` of a Cargo target adds its harness shims to copies of the crate's
+    /// files (src/testrun/krate.rs). `driver::compile` makes them the active overlay while it
+    /// runs (`driver::read_source`). Empty for every other request.
+    pub overlay: std::sync::Arc<std::collections::HashMap<String, String>>,
     /// Build with the external C compiler backend (src/cc.rs) for
     /// `session.target_triple` instead of tcc, the release driver form.
     /// The daemon wire format does not carry this (decode sets false):
@@ -812,6 +816,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
                 run_args: None,
                 harness: false,
                 cc: true,
+                overlay: Default::default(),
                 client: Client::current(&typed),
             });
         }
@@ -858,7 +863,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
         emit_c: emit_c.map(|p| abs(&p)),
         max_errors,
         run_args: if run { Some(run_args.clone()) } else { None },
-        harness: false, cc: false,
+        harness: false, cc: false, overlay: Default::default(),
         client: Client::current(&typed),
     };
     Some(Invocation::Compile { req, run, args: run_args })
@@ -940,7 +945,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
     let s = &r.session;
     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {} {} {}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -955,6 +960,8 @@ pub fn encode(r: &Request) -> Vec<u8> {
         b(s.cargo_net.offline),
         b(s.cargo_net.locked),
         s.source_deps.len(),
+        b(r.harness),
+        r.overlay.len(),
         build_id()
     )
     .into_bytes();
@@ -979,6 +986,13 @@ pub fn encode(r: &Request) -> Vec<u8> {
         put_field(&mut out, k.as_bytes());
         put_field(&mut out, v.as_bytes());
     }
+    // Sorted, so one overlay always encodes the same bytes.
+    let mut overlay: Vec<(&String, &String)> = r.overlay.iter().collect();
+    overlay.sort();
+    for (path, text) in overlay {
+        put_field(&mut out, path.as_bytes());
+        put_field(&mut out, text.as_bytes());
+    }
     out
 }
 
@@ -990,7 +1004,7 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
         return Err(ReadError::Bad);
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 17 || f[16] != build_id() {
+    if f.len() != 19 || f[18] != build_id() {
         // The first word is always a command, so a short header of a known
         // command is a client from before this field.
         return Err(if matches!(f.first(), Some(&"check" | &"build")) { ReadError::OtherBuild } else { ReadError::Bad });
@@ -1048,6 +1062,15 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
             Some(env)
         }
     };
+    // Same bound as the env count.
+    let n_overlay: usize = f[17].parse().ok()?;
+    if n_overlay > 1 << 16 {
+        return None;
+    }
+    let mut overlay = std::collections::HashMap::with_capacity(n_overlay);
+    for _ in 0..n_overlay {
+        overlay.insert(text(get_field(r)?)?, text(get_field(r)?)?);
+    }
     Some(Request {
         cmd: if f[0] == "check" { Cmd::Check } else { Cmd::Build },
         session: SessionKey {
@@ -1075,7 +1098,9 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
         emit_c: if emit.is_empty() { None } else { Some(path(emit)) },
         max_errors: f[4].parse().ok()?,
         run_args: None,
-        harness: false, cc: false,
+        harness: f[16] == "1",
+        cc: false,
+        overlay: std::sync::Arc::new(overlay),
         client: Client { env, shown: if shown.is_empty() { None } else { Some(path(shown)) } },
     })
 }
@@ -1719,6 +1744,12 @@ mod tests {
         // The client's env and typed root path ride along (env! and file! read them).
         assert!(req.client.env.is_some() && req.client.shown.is_some());
         assert_eq!(back.client, req.client);
+        // A `lust test` build's harness flag and source overlay ride along too.
+        let mut test_req = req.clone();
+        test_req.harness = true;
+        test_req.overlay = std::sync::Arc::new([("/tmp/x/a.rs".to_string(), "fn a() {}\n".to_string()), ("/tmp/x/b.rs".to_string(), String::new())].into());
+        let back = read_request(&mut std::io::Cursor::new(encode(&test_req))).unwrap();
+        assert!(back.harness && back.overlay == test_req.overlay);
         // A truncated wire form never reads as a request.
         let bytes = encode(&req);
         assert_eq!(read_request(&mut std::io::Cursor::new(&bytes[..bytes.len() - 3])).err(), Some(ReadError::Bad));

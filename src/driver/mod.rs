@@ -27,27 +27,53 @@ pub mod read_cover;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
 
-/// Source texts that stand in for files on disk, by canonical path, for this
-/// process: `lust test` of a Cargo target adds its harness shims to copies of
-/// the crate's files and builds those (testrun.rs). Every crate source read
-/// (the root, module files) goes through `read_source`, and the disk cache is
-/// off while an overlay is set, as under `protocol::source_override`.
-static SOURCE_OVERLAY: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+/// The source overlay of the compile running now (`Request::overlay`): source texts that
+/// stand in for files on disk, by canonical path. `lust test` of a Cargo target adds its
+/// harness shims to copies of the crate's files and builds those (testrun/krate.rs). Every
+/// crate source read (the root, module files) goes through `read_source`, the warm patch path
+/// compares overlay texts instead of trusting file stamps (patch.rs), and the disk cache is off
+/// while an overlay is set, as under `protocol::source_override`.
+///
+/// One slot per process: compiles on the serve loop (or a cold process) run one at a time, and
+/// `compile` sets the slot for each. A daemon guard check runs beside them, on background
+/// threads (`pool::set_background`) that never read the slot: a guard compiles a request
+/// without an overlay (the daemon starts none for one with an overlay).
+static SOURCE_OVERLAY: std::sync::RwLock<Option<std::sync::Arc<std::collections::HashMap<String, String>>>> = std::sync::RwLock::new(None);
 
-/// Sets this process's source overlay (once; a later call is ignored).
-pub fn set_source_overlay(files: std::collections::HashMap<String, String>) {
-    let _ = SOURCE_OVERLAY.set(files);
+/// The active overlay as this thread sees it: None on a background thread.
+fn active_overlay() -> Option<std::sync::Arc<std::collections::HashMap<String, String>>> {
+    if crate::pool::is_background() {
+        return None;
+    }
+    SOURCE_OVERLAY.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// True when this process has a source overlay.
+/// Makes `overlay` the active one until the returned guard drops (an empty one clears it).
+fn enter_overlay(overlay: &std::sync::Arc<std::collections::HashMap<String, String>>) -> impl Drop {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            *SOURCE_OVERLAY.write().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+    *SOURCE_OVERLAY.write().unwrap_or_else(|e| e.into_inner()) = (!overlay.is_empty()).then(|| overlay.clone());
+    Clear
+}
+
+/// True when this thread's compile has a source overlay.
 pub fn has_source_overlay() -> bool {
-    SOURCE_OVERLAY.get().is_some_and(|m| !m.is_empty())
+    active_overlay().is_some()
+}
+
+/// The overlay text for `path`, if the active overlay has one.
+pub(crate) fn overlay_text(path: &std::path::Path) -> Option<String> {
+    active_overlay().and_then(|m| m.get(&crate::resolve::modules::canonical_string(path)).cloned())
 }
 
 /// The text of a crate source file: the overlay's, else the file's.
 pub fn read_source(path: &std::path::Path) -> std::io::Result<String> {
-    if let Some(text) = SOURCE_OVERLAY.get().and_then(|m| m.get(&crate::resolve::modules::canonical_string(path))) {
-        return Ok(text.clone());
+    if let Some(text) = overlay_text(path) {
+        return Ok(text);
     }
     std::fs::read_to_string(path)
 }
@@ -59,6 +85,7 @@ pub(crate) use patch::drop_unkept;
 /// patch oracle (`item_oracle.rs`) a daemon check request then compares
 /// its answer with a fresh session's.
 pub fn compile(req: &Request, session: &mut Session) -> Response {
+    let _overlay = enter_overlay(&req.overlay);
     let resp = compile::compile(req, session);
     if item_oracle::on() {
         item_oracle::compare_response(req, session, &resp);

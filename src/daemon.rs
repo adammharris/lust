@@ -984,6 +984,9 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
     let start = std::time::SystemTime::now();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut entry.session))) {
         Ok(r) if r.code == 0 || r.code == 2 => r,
+        // A `lust test` harness build reads its overlay, which a guard thread
+        // cannot see (`driver::read_source`): no background check for it.
+        Ok(r) if !req.overlay.is_empty() => r,
         Ok(r) if r.code == 3 && r.stderr.contains("function count mismatch") => {
             // The warm session's scan and Ast disagree on the fn list
             // (unusual shapes: items moved into bodies). The session
@@ -1197,7 +1200,7 @@ pub fn serve(sock: &Path) -> ! {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false,
+            harness: false, cc: false, overlay: Default::default(),
             client: protocol::Client::default(),
             file: file.clone(),
         };
@@ -1357,7 +1360,7 @@ mod tests {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false,
+            harness: false, cc: false, overlay: Default::default(),
             client: protocol::Client::default(),
             file: file.to_path_buf(),
         }

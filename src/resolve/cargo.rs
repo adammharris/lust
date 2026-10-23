@@ -360,6 +360,9 @@ pub struct GraphRequest {
     /// A daemon passes its client's: the daemon's own env is the env of
     /// the client that started it.
     pub env: Option<Vec<(String, String)>>,
+    /// Where the graph is kept on disk across processes (`disk_graph`), as
+    /// the crate's disk cache (`driver::cache::cache_dir`). None keeps none.
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// True for an env var that changes what Cargo reads or runs: its
@@ -559,15 +562,22 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     // graph watched (else the named manifest's dir), so an edit made
     // while Cargo runs moves the stamp. When metadata names a path
     // package outside that set, the run repeats with it in the set.
+    if cached.is_none()
+        && let Some(graph) = disk_graph(req, key)
+    {
+        let graph = std::sync::Arc::new(graph);
+        graph_cache().lock().unwrap().insert(key, graph.clone());
+        return Ok(graph);
+    }
     let mut watch = cached.map_or_else(|| watch_dirs(req, &[]), |g| g.watch.clone());
     for _ in 0..4 {
         let stamp = watch_stamp(&watch);
-        let mut graph = run_metadata(req, key)?;
+        let text = run_metadata(req)?;
+        let mut graph = parse_metadata(&text, key)?;
         let dirs = watch_dirs(req, &graph.packages);
         if dirs.iter().all(|d| watch.contains(d)) {
-            let mut h = FxHasher::default();
-            (key, stamp).hash(&mut h);
-            (graph.key, graph.watch, graph.stamp) = (h.finish(), watch, stamp);
+            (graph.key, graph.watch, graph.stamp) = (stamped_key(key, stamp), watch, stamp);
+            store_disk_graph(req, key, &graph, &text);
             let graph = std::sync::Arc::new(graph);
             graph_cache().lock().unwrap().insert(key, graph.clone());
             return Ok(graph);
@@ -579,9 +589,71 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     Err("the Cargo package set kept changing while `cargo metadata` ran".into())
 }
 
-/// One `cargo metadata` run for `req`, read into a graph (key, watch,
-/// and stamp are filled by `load_graph`).
-fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
+/// A graph's own key: the graph key mixed with the watch stamp (`CrateGraph::key`).
+fn stamped_key(key: u64, stamp: u64) -> u64 {
+    let mut h = FxHasher::default();
+    (key, stamp).hash(&mut h);
+    h.finish()
+}
+
+/// The first line of a disk graph file (`store_disk_graph`). Bump it when the format changes.
+const DISK_GRAPH_HEAD: &str = "lust-cargo-graph-v1";
+
+/// The disk graph file of graph key `key`, or None when `req` keeps none
+/// (no cache dir, or `LUST_NO_CACHE` set).
+fn disk_graph_path(req: &GraphRequest, key: u64) -> Option<PathBuf> {
+    let dir = req.cache_dir.as_ref()?;
+    if std::env::var("LUST_NO_CACHE").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
+    Some(dir.join(format!("cargo-graph-{key:016x}.txt")))
+}
+
+/// The graph of key `key` a cold process stored (`store_disk_graph`), when it
+/// still stands by the rule of the in-process cache (`load_graph`): the key, then
+/// the stamp of the dirs it watched. So a one-shot compile runs `cargo metadata`
+/// once per change of its inputs, not on every run (about 0.5 s on a workspace
+/// with a few hundred packages). An entry that names a package manifest which is
+/// gone is not used, as in `put_graph_cache`.
+fn disk_graph(req: &GraphRequest, key: u64) -> Option<CrateGraph> {
+    let text = std::fs::read_to_string(disk_graph_path(req, key)?).ok()?;
+    let mut lines = text.splitn(4, '\n');
+    if lines.next()? != DISK_GRAPH_HEAD {
+        return None;
+    }
+    let stamp = u64::from_str_radix(lines.next()?, 16).ok()?;
+    let watch: Vec<PathBuf> = lines.next()?.split('\0').filter(|d| !d.is_empty()).map(PathBuf::from).collect();
+    if watch.is_empty() || watch_stamp(&watch) != stamp {
+        return None;
+    }
+    let mut graph = parse_metadata(lines.next()?, key).ok()?;
+    if watch_dirs(req, &graph.packages).iter().any(|d| !watch.contains(d)) || !graph.packages.iter().all(|p| p.manifest_path.exists()) {
+        return None;
+    }
+    (graph.key, graph.watch, graph.stamp) = (stamped_key(key, stamp), watch, stamp);
+    Some(graph)
+}
+
+/// Stores `graph` and the `cargo metadata` output it was read from (`disk_graph`):
+/// the head line, the stamp, the watched dirs (NUL-separated), then the output.
+/// Written to a temp file and renamed, so a reader never sees half a file. Best effort.
+fn store_disk_graph(req: &GraphRequest, key: u64, graph: &CrateGraph, metadata: &str) {
+    let Some(path) = disk_graph_path(req, key) else { return };
+    if graph.watch.iter().any(|d| d.as_os_str().as_encoded_bytes().iter().any(|&b| b == b'\n' || b == 0)) {
+        return;
+    }
+    let watch: Vec<String> = graph.watch.iter().map(|d| d.to_string_lossy().into_owned()).collect();
+    let text = format!("{DISK_GRAPH_HEAD}\n{:x}\n{}\n{metadata}", graph.stamp, watch.join("\0"));
+    let Some(dir) = path.parent() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = dir.join(format!(".cargo-graph-{key:016x}.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// One `cargo metadata` run for `req`: its output.
+fn run_metadata(req: &GraphRequest) -> Result<String, String> {
     let mut cmd = cargo_command(req.env.as_deref());
     // Run in the manifest's directory: Cargo discovers `.cargo/config.toml`
     // from the working directory, and the project's config (source
@@ -614,8 +686,13 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
             String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join(" ")
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let root = parse_json(&text).map_err(|e| format!("cannot parse `cargo metadata` output: {e}"))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A `cargo metadata` output read into a graph (key, watch, and stamp are
+/// filled by `load_graph`).
+fn parse_metadata(text: &str, key: u64) -> Result<CrateGraph, String> {
+    let root = parse_json(text).map_err(|e| format!("cannot parse `cargo metadata` output: {e}"))?;
     let workspace_root = PathBuf::from(root.get("workspace_root").and_then(|v| v.as_str()).unwrap_or(""));
     let members: Vec<String> = root.get("workspace_members").map(|v| v.strings()).unwrap_or_default();
     // Resolve nodes: features per package id, and the exact dep edges.
@@ -1294,8 +1371,20 @@ mod tests {
             target_triple: String::new(),
             cargo_net: Default::default(),
             env: None,
+            cache_dir: Some(dir.join(".lust-cache")),
         };
+        // The key before metadata runs (which writes a Cargo.lock), as `load_graph` takes it.
+        let key = graph_key(&req);
         let graph = load_graph(&req).expect("cargo metadata on the hello fixture");
+        // The graph is on disk too, for the next process: it reads back the
+        // same, and stops standing once a watched dir's target set changes.
+        let back = disk_graph(&req, key).expect("the stored graph reads back");
+        assert_eq!((back.key, &back.watch, back.stamp), (graph.key, &graph.watch, graph.stamp));
+        assert_eq!(back.packages.iter().map(|p| &p.id_repr).collect::<Vec<_>>(), graph.packages.iter().map(|p| &p.id_repr).collect::<Vec<_>>());
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        assert!(disk_graph(&req, key).is_none(), "a new lib target moves the watch stamp");
+        std::fs::remove_file(dir.join("src/lib.rs")).unwrap();
+        assert!(disk_graph(&req, key).is_some());
         let interner = crate::intern::Interner::default();
         let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
         let unit = select_unit(&graph, &req, "bin", "hello", &env, &interner, false).expect("hello unit");

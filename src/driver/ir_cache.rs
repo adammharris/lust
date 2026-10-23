@@ -1415,7 +1415,7 @@ fn main() {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false, cc: false,
+            harness: false, cc: false, overlay: Default::default(),
             client: Default::default(),
         };
         let mut s = Session::new(dir.join("obj"), false, key);

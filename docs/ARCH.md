@@ -84,7 +84,10 @@ requested packages and targets, the requested features and the
 default-feature policy, the target triple, and the Cargo config
 files that apply (`.cargo/config.toml` chain). The driver runs
 `cargo metadata --format-version 1` with those inputs once per
-graph key. `cargo metadata` alone unifies features over the whole
+graph key, and keeps its output in the crate's disk cache dir
+(`cargo-graph-<key>.txt`, with the watch stamp of the path packages),
+so a cold process reuses it until the key or the stamp moves
+(`src/resolve/cargo.rs` `disk_graph`). `cargo metadata` alone unifies features over the whole
 workspace, which can differ from a `-p ts_goport --bin tsgo`
 build. So the feature set of each selected unit comes from one
 cached `cargo check --message-format=json` dry run for the same
