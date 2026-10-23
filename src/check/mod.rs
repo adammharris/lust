@@ -21370,6 +21370,11 @@ impl<'p> Ctx<'p> {
         match self.tys.kind(t) {
             // `const WHAT: &'static str` read through a parameter.
             TyKind::Ref(_, _, inner) if matches!(self.tys.kind(inner), TyKind::Str) => Some(ConstValue::StrBytes(crate::ast::ByteBlob::new(Vec::new()))),
+            // `const FLAGS: &'static [Flag<Self>]` read through a
+            // parameter: an empty slice (an aggregate at a slice
+            // reference type lowers through a promoted array).
+            TyKind::Ref(_, Mut::Shared, inner) if matches!(self.tys.kind(inner), TyKind::Slice(_)) => Some(ConstValue::Aggregate(Vec::new())),
+            TyKind::Ref(_, Mut::Shared, inner) => Some(ConstValue::Ref(Box::new(self.zero_const(inner)?))),
             // A value of a parameter's type (`B::MIN` with `const MIN:
             // Self::Primitive` under `B: Bounds<Primitive = P>`): the
             // template body is only borrow checked, never built, so any
