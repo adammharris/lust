@@ -9509,7 +9509,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
         // core's `Display` for its conversion errors (the text is
         // `display_glue_body`'s): a record, so the source `Error`
         // impls in library/core/src/error.rs meet their supertrait.
-        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def(), try_from_slice_error_def()] {
+        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def(), try_from_slice_error_def(), utf8_error_def(), from_utf8_error_def(), fmt_error_def(), borrow_error_def(), borrow_mut_error_def(), recv_error_def(), try_recv_error_def(), recv_timeout_error_def()] {
             let t = p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
             insert_synthetic(p, &mut ordinal, lang.display, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }

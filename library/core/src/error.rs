@@ -110,7 +110,9 @@ impl<T: ?Sized + Error> Error for &T {
     }
 }
 
-impl<T: ?Sized + Error> Error for Box<T> {
+// alloc's impl is over sized errors only (`impl<E: Error> Error for
+// Box<E>`): `Box<dyn Error>` is no `Error` itself.
+impl<T: Error> Error for Box<T> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         (**self).source()
     }
@@ -122,6 +124,27 @@ impl Error for core::num::TryFromIntError {}
 impl Error for core::char::CharTryFromError {}
 impl Error for core::char::TryFromCharError {}
 impl Error for core::convert::Infallible {}
+
+// The parse, UTF-8, fmt, and cell errors: `Error` with no source, as
+// in core, alloc, and std.
+impl Error for core::num::ParseIntError {}
+impl Error for core::num::ParseFloatError {}
+impl Error for core::str::ParseBoolError {}
+impl Error for core::char::ParseCharError {}
+impl Error for core::str::Utf8Error {}
+impl Error for alloc::string::FromUtf8Error {}
+impl Error for core::array::TryFromSliceError {}
+impl Error for core::fmt::Error {}
+impl Error for core::cell::BorrowError {}
+impl Error for core::cell::BorrowMutError {}
+impl Error for std::sync::mpsc::RecvError {}
+impl Error for std::sync::mpsc::TryRecvError {}
+impl Error for std::sync::mpsc::RecvTimeoutError {}
+
+// std's platform errors (written beside their types in std; here so
+// the trait path resolves in this splice, as for `io::Error` below).
+impl Error for std::env::VarError {}
+impl Error for std::path::StripPrefixError {}
 
 // std's `Error` for `io::Error` (written in std::io in std; here so
 // the trait path resolves in this splice): `source` is the boxed
