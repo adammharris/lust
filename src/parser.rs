@@ -1785,6 +1785,13 @@ impl<'a> Parser<'a> {
                     out.attrs.push(attr);
                     continue;
                 }
+                // `#[diagnostic::on_unimplemented(..)]` and the rest of the
+                // `diagnostic` namespace only shape rustc's messages; an
+                // unknown or misplaced one is a warning there too.
+                if name_text == "diagnostic" && path.len() == 2 {
+                    out.attrs.push(attr);
+                    continue;
+                }
                 return Err(Diag::new(
                     "L0402",
                     name_span,
