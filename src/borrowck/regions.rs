@@ -259,6 +259,12 @@ pub struct RegionTables {
     /// regions kept, by def: each impl owes them by regions too
     /// (`check_impl_supers`).
     pub trait_preds: FxMap<DefId, Vec<Predicate>>,
+    /// The bounds of a trait's associated types on traits with lifetime
+    /// params (`type Deserializer: Deserializer<'de>`), by assoc def: the
+    /// bound trait and its lifetime args over the outer trait's lifetimes
+    /// (`Region::Param(i)`), so a projection tells its lifetimes as a
+    /// bounded type param does.
+    pub assoc_lts: FxMap<DefId, Vec<(DefId, Vec<Region>)>>,
     /// Declared outlives facts between an Adt's lifetime params
     /// (`struct H<'a, 'b: 'a>`), by def: `(x, y)` is `'x: 'y` by param
     /// index, `y == STATIC_FACT` is `'static`. Every use of the type must
@@ -7897,6 +7903,16 @@ impl<'b, 'p> Builder<'b, 'p> {
             let want: Vec<u32> = b.lifetimes.iter().map(|&r| self.inst_region(r, &univ)).collect();
             let have = match (self.bind_tys.get(&b.param).copied(), binds.get(&b.param).cloned()) {
                 (Some(t), Some(vs)) => self.trait_lts_for(b.trait_def, t, &vs, n),
+                // A param the call's types do not name, fixed by a binding
+                // of another one (`T` in `I: Iterator<Item = T>`).
+                (None, _) => {
+                    let all: Vec<Predicate> = preds.iter().chain(&sig.bounds).copied().collect();
+                    let bound = self.bind_tys.clone();
+                    match self.impl_param_by_binding(&all, b.param, &bound) {
+                        Some(t) => self.trait_lts_for(b.trait_def, t, &[], n),
+                        None => None,
+                    }
+                }
                 _ => None,
             }
             .unwrap_or_else(|| vec![0; n]);
@@ -8202,6 +8218,30 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             return None;
         }
+        // A projection (`<T as IntoDeserializer<'de>>::Deserializer`) through
+        // its associated type's bound (`type Deserializer: Deserializer<'de>`),
+        // with the outer trait's lifetimes read off its Self type.
+        if let TyKind::Projection(assoc, pargs) = self.body.tys.kind(t) {
+            let lts = p.regions.assoc_lts.get(&assoc.0)?.iter().find(|(d, _)| *d == trait_def)?.1.clone();
+            let outer = p.gx.index.trait_of_assoc(assoc.0)?;
+            let on = p.gx.adt_lifetimes.get(&outer).map_or(0, |v| v.len());
+            let self_t = self.body.tys.args(pargs).first().and_then(|g| g.as_ty())?;
+            let outer_lts = if on == 0 {
+                Vec::new()
+            } else if self.sc.slots(self_t) == 0 {
+                self.trait_lts_at(outer, self_t, &[], on, depth + 1)?
+            } else {
+                return None;
+            };
+            return lts
+                .iter()
+                .map(|&r| match r {
+                    Region::Param(k) => outer_lts.get(k as usize).copied(),
+                    Region::Bound(_) => Some(self.fresh()),
+                    _ => Some(0),
+                })
+                .collect();
+        }
         let mut found: Option<Vec<u32>> = None;
         for &id in p.gx.index.impls_of_trait(trait_def) {
             let rec = p.gx.index.get(id);
@@ -8212,9 +8252,12 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             let head = p.regions.impl_heads.get(&rec.def)?;
             // Every where-clause on a lifetime trait must be one the head
-            // kept (on a type param), else nothing tells its lifetimes.
+            // kept (on a type param), else nothing tells its lifetimes;
+            // inside that impl, on its own Self type, the body assumes
+            // exactly those where-clauses (`First<I::Item>:
+            // IntoDeserializer<'de, E>`), so the header alone tells.
             let nested = rec.generics.predicates.iter().filter(|pr| self.lifetime_trait_pred(pr)).count();
-            if found.is_some() || nested != head.where_lts.len() {
+            if found.is_some() || (nested != head.where_lts.len() && !(pat == t && self.in_own_impl(rec.def))) {
                 return None;
             }
             let mut lts: FxMap<u32, u32> = FxMap::default();
@@ -8226,7 +8269,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let mut part_tys: FxMap<u32, Ty> = FxMap::default();
                 self.impl_param_tys(pat, t, &mut part_tys);
                 for w in head.where_lts.clone() {
-                    let pt = *part_tys.get(&w.param)?;
+                    let pt = match part_tys.get(&w.param) {
+                        Some(&t) => t,
+                        None => self.impl_param_by_binding(&rec.generics.predicates, w.param, &part_tys)?,
+                    };
                     let pv = parts.get(&w.param).cloned().unwrap_or_default();
                     let inner = self.trait_lts_at(w.trait_def, pt, &pv, w.lifetimes.len(), depth + 1)?;
                     for (r, v) in w.lifetimes.iter().zip(inner) {
@@ -8366,6 +8412,48 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             _ => {}
         }
+    }
+
+    /// A param of an impl or callee that its matched types do not name
+    /// (`known`: param to this body's type), read through an
+    /// associated-type binding of its where clauses (`T` in `I:
+    /// Iterator<Item = T>`): when `I` matched a type param of this body
+    /// whose own bound binds the same item (`I: Iterator<Item = U>`), `T`
+    /// is that binding. None otherwise (no normalization here).
+    fn impl_param_by_binding(&self, preds: &[Predicate], k: u32, known: &FxMap<u32, Ty>) -> Option<Ty> {
+        let p = self.p;
+        let root = root_fn(p, self.body.fn_id);
+        let sig = p.regions.own_body_sig(p, root)?;
+        for pr in preds {
+            let Predicate::Trait(b) = pr else { continue };
+            let Some(&(assoc, _)) = p.tys.bindings(b.value.bindings).iter().find(|(_, g)| matches!(g.as_ty().map(|t| p.tys.kind(t)), Some(TyKind::Param(q)) if q.0 == k)) else {
+                continue;
+            };
+            let Some(TyKind::Param(m)) = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).map(|t| p.tys.kind(t)) else { continue };
+            let Some(&actual) = known.get(&m.0) else { continue };
+            let TyKind::Param(j) = self.body.tys.kind(actual) else { continue };
+            for bp in &sig.bounds {
+                let Predicate::Trait(b2) = bp else { continue };
+                if b2.value.def != b.value.def
+                    || !p.tys.args(b2.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| matches!(p.tys.kind(t), TyKind::Param(q) if q.0 == j.0))
+                {
+                    continue;
+                }
+                if let Some(t) = p.tys.bindings(b2.value.bindings).iter().find(|(d, _)| *d == assoc).and_then(|(_, g)| g.as_ty()) {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    }
+
+    /// True when this body is a method of impl `impl_def` (its template's
+    /// parent), so the impl's params are this body's.
+    fn in_own_impl(&self, impl_def: DefId) -> bool {
+        let p = self.p;
+        let root = root_fn(p, self.body.fn_id);
+        let src = p.gx.instances.get(&root).and_then(|i| i.template_local).unwrap_or(root);
+        p.fn_defs.get(src.0 as usize).and_then(|&d| p.defs.get(d)).and_then(|d| d.parent) == Some(impl_def)
     }
 
     /// True for a predicate on a trait with lifetime params.

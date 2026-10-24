@@ -636,17 +636,29 @@ impl Solver {
                 env_hits.push(i);
             }
         }
-        // Hits that name one trait ref once their variables resolve are
-        // one piece of evidence (an opaque's bounds noted before and
-        // after its args were inferred).
+        // Hits that name one trait ref once their variables resolve and
+        // their projections normalize are one piece of evidence (an
+        // opaque's bounds noted before and after its args were inferred;
+        // `S::E: Tr` next to `<S::Seq as SeqT>::E: Tr` from
+        // `type Seq: SeqT<E = Self::E>`).
         if env_hits.len() > 1 {
-            let key = |cx: &mut C, i: usize| -> Option<Vec<GenericArg>> {
+            let key = |solver: &mut Solver, cx: &mut C, i: usize| -> Option<Vec<GenericArg>> {
                 let Predicate::Trait(b) = env[i] else { return None };
                 let args: Vec<GenericArg> = cx.tys().args(b.value.args).to_vec();
-                Some(args.into_iter().map(|g| match g { GenericArg::Ty(t) => GenericArg::Ty(cx.deep_resolve(t)), g => g }).collect())
+                Some(
+                    args.into_iter()
+                        .map(|g| match g {
+                            GenericArg::Ty(t) => {
+                                let t = cx.deep_resolve(t);
+                                GenericArg::Ty(solver.normalize_inner(cx, index, env, t, 0))
+                            }
+                            g => g,
+                        })
+                        .collect(),
+                )
             };
-            let first = key(cx, env_hits[0]);
-            if first.is_some() && env_hits[1..].iter().all(|&i| key(cx, i) == first) {
+            let first = key(self, cx, env_hits[0]);
+            if first.is_some() && env_hits[1..].iter().all(|&i| key(self, cx, i) == first) {
                 env_hits.truncate(1);
             }
         }

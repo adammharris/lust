@@ -7452,6 +7452,13 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 for b in &at_bounds {
                     bound_predicates(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &scope, proj, b, &mut preds, &mut relaxed, errs);
                 }
+                // Its bounds on traits with lifetime params, with the
+                // lifetimes written (`RegionTables::assoc_lts`).
+                let lts: Vec<(DefId, Vec<Region>)> =
+                    trait_lts_in(&p.interner, &p.known, &cx, &scope, &[(0, &at_bounds[..])]).into_iter().map(|b| (b.trait_def, b.lifetimes)).collect();
+                if !lts.is_empty() {
+                    p.regions.assoc_lts.insert(assoc_def, lts);
+                }
                 // An associated type has an implicit `Sized` bound
                 // unless the trait writes `type A: ?Sized` (rustc
                 // E0277 on an unsized binding at the impl).
@@ -9569,10 +9576,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let err_proj = p.tys.intern(TyKind::Projection(AssocId(lang.assoc_try_from_error), err_args));
         let g = pred(p, lang.try_from);
         insert_synthetic(p, &mut ordinal, lang.try_into, p0, &[p1], g, vec![(lang.assoc_try_into_error, err_proj)], Synthetic::Lang, false, span);
-        // core's `Display` for its conversion errors (the text is
-        // `display_glue_body`'s): a record, so the source `Error`
-        // impls in library/core/src/error.rs meet their supertrait.
-        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def(), try_from_slice_error_def()] {
+        // core's `Display` for its conversion errors and `fmt::Error`
+        // (the text is `display_glue_body`'s): a record, so the source
+        // `Error` impls in library/core/src/error.rs meet their supertrait.
+        for def in [fmt_error_def(), try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def(), try_from_slice_error_def()] {
             let t = p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
             insert_synthetic(p, &mut ordinal, lang.display, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
@@ -13954,6 +13961,14 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
         let self_ty = subst_args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
         let mut goals: Vec<TraitRef> = Vec::new();
         let mut statics: Vec<Ty> = Vec::new();
+        let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
+        // A binding's projections normalize under the impl's bounds
+        // (`type D = Seq<<Self as IntoIterator>::IntoIter>` with
+        // `D: De`): the goal is about the type they stand for.
+        let rewrite = |p: &mut Program, t: Ty| {
+            let t = rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys);
+            normalize_global_in(p, &env, t)
+        };
         for &pred in &trec.generics.predicates {
             let pred = subst_predicate(&mut p.tys, pred, &subst_args);
             // `trait Tr: 'static`: the impl's Self type must be `'static`;
@@ -13970,7 +13985,7 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
             let new_args: Vec<GenericArg> = old_args
                 .iter()
                 .map(|&g| match g {
-                    GenericArg::Ty(t) => GenericArg::Ty(rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys)),
+                    GenericArg::Ty(t) => GenericArg::Ty(rewrite(p, t)),
                     other => other,
                 })
                 .collect();
@@ -13981,7 +13996,7 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
             let new_bindings: Vec<(DefId, GenericArg)> = old_bindings
                 .into_iter()
                 .map(|(d, g)| match g {
-                    GenericArg::Ty(t) => (d, GenericArg::Ty(rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys))),
+                    GenericArg::Ty(t) => (d, GenericArg::Ty(rewrite(p, t))),
                     other => (d, other),
                 })
                 .collect();
@@ -13991,7 +14006,6 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
         if goals.is_empty() && statics.is_empty() {
             continue;
         }
-        let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
         let dyn_self = p.gx.static_dyn_impls.contains(&rec.def);
         if statics.iter().any(|&t| !crate::check::object::header_type_static(p, &env, t, dyn_self)) {
             let tname = p.display_path(trec.name);
@@ -15197,6 +15211,21 @@ fn check_wf_item(p: &mut Program, adt_idx: &FxMap<DefId, usize>, (tys, values, g
 /// elements, `&str` and `&[T]`. A `Default` goal on those decomposes
 /// to its elements (`LinkStore<K, [SymbolTable; 2]>` with `V: Default`).
 fn prove_wf_goal(p: &mut Program, env: &[Predicate], goal: TraitRef) -> bool {
+    // A projection in the goal (`<BTreeMap<K, V> as IntoIterator>::IntoIter:
+    // Iterator`) is proved as the type it normalizes to.
+    let goal = if p.tys.args(goal.args).iter().any(|g| g.as_ty().is_some_and(|t| p.tys.flags(t).contains_projection())) {
+        let args: Vec<GenericArg> = p.tys.args(goal.args).to_vec();
+        let args: Vec<GenericArg> = args
+            .into_iter()
+            .map(|g| match g {
+                GenericArg::Ty(t) => GenericArg::Ty(normalize_global_in(p, env, t)),
+                other => other,
+            })
+            .collect();
+        TraitRef { args: p.tys.intern_args(&args), ..goal }
+    } else {
+        goal
+    };
     let &[GenericArg::Ty(t)] = p.tys.args(goal.args) else { return prove_goal(p, env, goal) };
     if goal.def != p.gx.lang.default {
         return prove_goal(p, env, goal);
