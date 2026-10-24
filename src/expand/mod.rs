@@ -2061,11 +2061,13 @@ impl<'a> Expander<'a> {
         fn walk(st: &mut Expander, trees: &[Tt], module: &mut Vec<Sym>, at_module_list: bool, uses: &mut Vec<UseSite>) -> Result<(), Diag> {
             let mut i = 0;
             let mut exported = false;
+            let mut local_inner = false;
             let mut cfg_off = false;
             while i < trees.len() {
                 if let Some(attr) = attr_at(trees, i, st.ctx.interner) {
                     if attr.path == "macro_export" {
                         exported = true;
+                        local_inner = is_local_inner(&attr, st.ctx.interner);
                     }
                     if attr.path == "cfg" {
                         cfg_off = !builtin::eval_cfg(&attr.inner, &st.ctx.cfg, st, attr.span)?;
@@ -2104,12 +2106,16 @@ impl<'a> Expander<'a> {
                         check_def_form(trees, &def)?;
                         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &st.strings, st.ctx.interner)?;
                         compiled.local_def = !at_module_list;
+                        if local_inner {
+                            local_inner_calls(&mut compiled);
+                        }
                         let idx = st.register(Arc::new(compiled), exported, false);
                         if at_module_list {
                             st.module_defs.insert((module.clone(), def.name), idx);
                         }
                     }
                     exported = false;
+                    local_inner = false;
                     cfg_off = false;
                     i = def.end;
                     continue;
@@ -2119,6 +2125,7 @@ impl<'a> Expander<'a> {
                 // on a plain item must not leak onto a macro
                 // definition that comes later in the same list.
                 exported = false;
+                local_inner = false;
                 cfg_off = false;
                 if tok_at(trees, i).map(|t| t.tok) == Some(Tok::Mod)
                     && matches!(tok_at(trees, i + 1).map(|t| t.tok), Some(Tok::Ident(_)))
@@ -2982,6 +2989,38 @@ fn check_macro_export_input(trees: &[Tt], attr: &AttrInfo, leveled: bool, intern
         "valid forms for the attribute are `macro_export` and `macro_export(local_inner_macros)`",
         "Write `#[macro_export]` or `#[macro_export(local_inner_macros)]` (rustc `invalid_macro_export_arguments`).",
     ))
+}
+
+/// True for `#[macro_export(local_inner_macros)]`.
+fn is_local_inner(attr: &AttrInfo, interner: &Interner) -> bool {
+    attr.inner.iter().any(|t| matches!(t, Tt::Tok(x) if seg_text(x.tok, interner).as_deref() == Some("local_inner_macros")))
+}
+
+/// `local_inner_macros`: a single-segment macro call in the templates
+/// (`helper!`) resolves as `$crate::helper!`, so the templates say so.
+fn local_inner_calls(def: &mut MacroDef) {
+    fn rewrite(trees: &[Tt]) -> Vec<Tt> {
+        let mut out: Vec<Tt> = Vec::new();
+        for (i, tree) in trees.iter().enumerate() {
+            if let Tt::Tok(t) = tree
+                && matches!(t.tok, Tok::Ident(_))
+                && tok_at(trees, i + 1).is_some_and(|n| n.tok == Tok::Bang)
+                && !matches!(out.last(), Some(Tt::Tok(p)) if matches!(p.tok, Tok::PathSep | Tok::Dollar))
+            {
+                for tok in [Tok::Dollar, Tok::Crate, Tok::PathSep] {
+                    out.push(Tt::Tok(Token { tok, span: t.span }));
+                }
+            }
+            match tree {
+                Tt::Delim(d, inner, span) => out.push(Tt::Delim(*d, rewrite(inner), *span)),
+                t => out.push(t.clone()),
+            }
+        }
+        out
+    }
+    for arm in &mut def.arms {
+        arm.template = rewrite(&arm.template);
+    }
 }
 
 /// A `macro_rules! name <group>` definition found in a tree list.
@@ -3947,7 +3986,7 @@ impl<'a> Expander<'a> {
             }
             // A macro definition never reaches the parser.
             if let Some(def) = macro_rules_at(&trees, i, self.ctx.interner) {
-                self.define_macro(&trees, &def, false, !item_list)?;
+                self.define_macro(&trees, &def, false, false, !item_list)?;
                 i = def.end;
                 pending_macro_use = false;
                 continue;
@@ -4418,6 +4457,7 @@ impl<'a> Expander<'a> {
         // test build drops the same way, as in rustc: it never reaches
         // name resolution.
         let mut exported = false;
+        let mut local_inner = false;
         let mut macro_use_attr = false;
         for (attr, attr_start) in &kept {
             let mut off = false;
@@ -4490,6 +4530,7 @@ impl<'a> Expander<'a> {
                 "macro_export" => {
                     check_macro_export_input(trees, &attr, export_leveled, self.ctx.interner)?;
                     exported = true;
+                    local_inner = is_local_inner(&attr, self.ctx.interner);
                 }
                 "macro_use" => macro_use_attr = true,
                 _ => {}
@@ -4532,7 +4573,7 @@ impl<'a> Expander<'a> {
         }
         if exported || macro_rules_at(trees, after, self.ctx.interner).is_some() {
             if let Some(def) = macro_rules_at(trees, after, self.ctx.interner) {
-                self.define_macro(trees, &def, exported, !item_list)?;
+                self.define_macro(trees, &def, exported, local_inner, !item_list)?;
                 return Ok(def.end);
             }
         }
@@ -4554,7 +4595,7 @@ impl<'a> Expander<'a> {
     }
 
     /// Compiles and registers the `macro_rules!` definition at `def`.
-    fn define_macro(&mut self, trees: &[Tt], def: &DefStart, exported: bool, local_def: bool) -> Result<(), Diag> {
+    fn define_macro(&mut self, trees: &[Tt], def: &DefStart, exported: bool, local_inner: bool, local_def: bool) -> Result<(), Diag> {
         // A `#[macro_export]` definition an expansion produced is only
         // a textual macro: rustc keeps it out of the crate root path
         // namespace ("macro-expanded macro_export macros cannot be
@@ -4579,6 +4620,9 @@ impl<'a> Expander<'a> {
         }
         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
         compiled.local_def = local_def;
+        if local_inner {
+            local_inner_calls(&mut compiled);
+        }
         let idx = self.register(Arc::new(compiled), exported, true);
         self.note_late_export(export_attr, def.name, idx);
         Ok(())

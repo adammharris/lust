@@ -2698,6 +2698,44 @@ fn rewrite_dollar_crate(tokens: &[crate::lexer::Token], magic: Sym) -> Vec<crate
         }
         out
     }
+    map_templates(tokens, &|t| rewrite(t, magic))
+}
+
+/// `#[macro_export(local_inner_macros)]`: a single-segment macro call in
+/// the definition's templates (`helper!`) resolves as `$crate::helper!`,
+/// so the rewrite writes that path (serde's `forward_to_deserialize_any!`
+/// calls its helper macros this way).
+fn local_inner_calls(tokens: &[crate::lexer::Token]) -> Vec<crate::lexer::Token> {
+    use crate::lexer::{Tok, Token, TokenTree};
+    fn rewrite(trees: &[TokenTree]) -> Vec<TokenTree> {
+        let mut out: Vec<TokenTree> = Vec::new();
+        for (i, tree) in trees.iter().enumerate() {
+            if let TokenTree::Token(t) = tree
+                && matches!(t.tok, Tok::Ident(_))
+                && matches!(trees.get(i + 1), Some(TokenTree::Token(n)) if n.tok == Tok::Bang)
+                && !matches!(out.last(), Some(TokenTree::Token(p)) if matches!(p.tok, Tok::PathSep | Tok::Dollar))
+            {
+                for tok in [Tok::Dollar, Tok::Crate, Tok::PathSep] {
+                    out.push(TokenTree::Token(Token { tok, span: t.span }));
+                }
+            }
+            match tree {
+                TokenTree::Delim(d, inner, span) => out.push(TokenTree::Delim(*d, rewrite(inner), *span)),
+                t => out.push(t.clone()),
+            }
+        }
+        out
+    }
+    map_templates(tokens, &rewrite)
+}
+
+/// Applies `f` to each arm's template group of one macro definition
+/// token slice (`macro_rules ! name <group>`), leaving its matchers.
+fn map_templates(
+    tokens: &[crate::lexer::Token],
+    f: &dyn Fn(&[crate::lexer::TokenTree]) -> Vec<crate::lexer::TokenTree>,
+) -> Vec<crate::lexer::Token> {
+    use crate::lexer::TokenTree;
     let (trees, balanced) = crate::lexer::build_trees(tokens);
     if !balanced {
         return tokens.to_vec();
@@ -2716,7 +2754,7 @@ fn rewrite_dollar_crate(tokens: &[crate::lexer::Token], magic: Sym) -> Vec<crate
                     if let Some(arrow) = body.get(j + 1) {
                         arms.push(arrow.clone());
                     }
-                    arms.push(TokenTree::Delim(*td, rewrite(template, magic), *tspan));
+                    arms.push(TokenTree::Delim(*td, f(template), *tspan));
                     j += 3;
                 }
                 _ => {
@@ -2892,6 +2930,7 @@ impl MacroEnv {
                     });
                     own_exported.push(m.exported);
                     let (tokens, strings) = own_def_strings(&lexed.tokens[lo..hi], &lexed.strings);
+                    let tokens = if m.local_inner { local_inner_calls(&tokens) } else { tokens };
                     owned.push(OwnedMacroSource { name: m.name, tokens, strings: std::sync::Arc::new(strings), magic: job.magic, path: Vec::new() });
                 }
             };
