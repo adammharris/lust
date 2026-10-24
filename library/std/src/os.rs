@@ -261,6 +261,14 @@ pub mod fd {
     }
 }
 
+/// `std::os::raw`: the C type aliases of `std::ffi` (but `c_void`).
+pub mod raw {
+    pub use crate::ffi::{
+        c_char, c_double, c_float, c_int, c_long, c_longlong, c_schar, c_short, c_uchar, c_uint, c_ulong, c_ulonglong,
+        c_ushort,
+    };
+}
+
 pub mod unix {
     /// Unix-specific extensions to `std::ffi`: `OsStr` and
     /// `OsString` as raw bytes.

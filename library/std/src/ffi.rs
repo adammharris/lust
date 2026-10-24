@@ -1,7 +1,8 @@
 // `std::ffi` (W-SHIM): `OsStr` and `OsString` as on Unix, raw bytes
 // with no encoding promise, plus `CStr` (tf-adapters: the borrowed
-// NUL-terminated form rustix `RawDir` names return). `CString`, the
-// `c_*` type aliases, and `FromBytesUntilNulError` forms are not here.
+// NUL-terminated form rustix `RawDir` names return), and the `c_*` type
+// aliases but `c_void`. `CString` and the `FromBytesUntilNulError` forms
+// are not here.
 //
 // `OsStr` is an unsized newtype over `[u8]` (the compiler lays it out
 // as its field; shipped source may turn `&[u8]` into `&OsStr`).
@@ -509,3 +510,51 @@ impl PartialEq for CStr {
 }
 
 impl Eq for CStr {}
+
+// The C type aliases, as core defines them (`core::ffi::primitives`):
+// `c_char` is unsigned on the Linux targets of these architectures, and
+// `c_long` is 64 bits on 64-bit targets but Windows.
+#[cfg(all(
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "s390x"
+    ),
+    not(any(target_vendor = "apple", target_os = "windows"))
+))]
+pub type c_char = u8;
+#[cfg(not(all(
+    any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "s390x"
+    ),
+    not(any(target_vendor = "apple", target_os = "windows"))
+)))]
+pub type c_char = i8;
+pub type c_schar = i8;
+pub type c_uchar = u8;
+pub type c_short = i16;
+pub type c_ushort = u16;
+pub type c_int = i32;
+pub type c_uint = u32;
+#[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
+pub type c_long = i64;
+#[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
+pub type c_ulong = u64;
+#[cfg(not(all(target_pointer_width = "64", not(target_os = "windows"))))]
+pub type c_long = i32;
+#[cfg(not(all(target_pointer_width = "64", not(target_os = "windows"))))]
+pub type c_ulong = u32;
+pub type c_longlong = i64;
+pub type c_ulonglong = u64;
+pub type c_float = f32;
+pub type c_double = f64;

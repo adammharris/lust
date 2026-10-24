@@ -1147,6 +1147,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet, Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetRef), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetMut), Builtin::Sync(crate::check::sync::SyncOp::ArcWeakUpgrade),
     Builtin::RefCellBorrow, Builtin::RefCellBorrowMut,
     Builtin::VecAsSlice, Builtin::VecAsMutSlice, Builtin::VecLen, Builtin::VecIsEmpty, Builtin::SliceLen, Builtin::SliceIsEmpty,
+    Builtin::SliceToVec,
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
@@ -4236,6 +4237,12 @@ impl<'p> Ctx<'p> {
             // (ts-rust `owned_store_js_doc(file, host, <[Node]>::len)`).
             TyKind::Slice(_) if name == k.len => (B::SliceLen, Autoref::Ref, vec![], USIZE),
             TyKind::Slice(_) if name == k.is_empty => (B::SliceIsEmpty, Autoref::Ref, vec![], BOOL),
+            // `<[T]>::to_vec` as a value (`res.map(<[u8]>::to_vec)`): `T: Clone`
+            // is re-tested at finish, as for the method call.
+            TyKind::Slice(e) if name == k.to_vec => {
+                self.deferred_clone.push((e, Span::default()));
+                (B::SliceToVec, Autoref::Ref, vec![], self.tys.mk_vec(e))
+            }
             // `Vec::as_slice` and kin as values (`opt.map(Vec::as_slice)`).
             _ if let Some(e) = self.tys.vec_elem(self_ty) => match self.name(name) {
                 "as_slice" => {
