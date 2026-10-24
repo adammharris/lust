@@ -1,6 +1,4 @@
-// expect: L0203
-// Stated cut (L0203): an associated type in a trait with lifetime params.
-// Valid Rust.
+// An associated type in a trait with lifetime params.
 trait Source<'a> {
     type Item;
     fn first(&self) -> Option<&'a u8>;

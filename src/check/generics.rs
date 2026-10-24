@@ -5160,15 +5160,43 @@ pub(crate) fn bound_predicates(
                 errs.push(d);
                 return;
             }
-            // The parser rewrote a binder's uses to elided lifetimes
-            // (`parser::hrtb`); one it could not rewrite stays written and
-            // fails to resolve. So no region here is bound by it.
-            match resolve_trait_ref(ast, interner, known, cx, tys, scope, lhs, trait_ref, span) {
+            // The parser rewrote a binder's uses in `Fn` sugar to elided
+            // lifetimes (`parser::hrtb`). A binder lifetime in angle args
+            // (`T: for<'de> Deserialize<'de>`) is the bound's own region:
+            // erased here, a fresh one at each use in region checking.
+            let bscope = binder_scope(scope, binder);
+            match resolve_trait_ref(ast, interner, known, cx, tys, &bscope, lhs, trait_ref, span) {
                 Ok(tr) => out.push(Predicate::Trait(Binder::plain(tr))),
                 Err(d) => errs.push(d),
             }
         }
     }
+}
+
+/// `scope` with a bound's `for<..>` binder lifetimes declared, each its
+/// own `Region::Bound` (higher-ranked: a fresh region at each use).
+fn binder_scope(scope: &Scope, binder: &[ast::Lifetime]) -> Scope {
+    let mut s = scope.clone();
+    for (i, lt) in binder.iter().enumerate() {
+        s.alias_lifetimes.push((lt.name, Region::Bound(i as u32)));
+    }
+    s
+}
+
+/// True when every lifetime arg of a trait bound is one of its own
+/// `for<..>` binder's (`for<'de> Deserialize<'de>`), and it has one.
+fn lifetimes_all_bound(binder: &[ast::Lifetime], tref: &ast::TraitRefExpr) -> bool {
+    let Some(GenericArgs::Angle(args)) = tref.path.last().map(|s| &s.args) else { return false };
+    let mut any = false;
+    for a in args {
+        if let AstArg::Lifetime(lt) = a {
+            if !binder.iter().any(|b| b.name == lt.name) {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
 }
 
 /// The elaborated param env of one item from its written
@@ -5547,7 +5575,10 @@ pub fn build_trait_generics(
         ast::WherePred::Type { bounds, .. } => bounds.as_slice(),
         _ => &[],
     })) {
-        if let TraitBound::Trait { trait_ref, .. } = b
+        // A higher-ranked one (`trait DeserializeOwned: for<'de>
+        // Deserialize<'de>`) holds for every lifetime: nothing to replay.
+        if let TraitBound::Trait { trait_ref, binder, .. } = b
+            && !lifetimes_all_bound(binder, trait_ref)
             && let Some(lt_span) = trait_ref_lifetime_span(trait_ref)
         {
             errs.push(Diag::new(
@@ -6259,16 +6290,10 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
             .collect();
         if !lts.is_empty() {
             p.gx.adt_lifetimes.insert(def, lts);
-            // A projection through such a trait would carry the trait's
-            // regions in a type that has no slots for them: a stated cut.
-            if let Some(at) = tdef.types.first() {
-                errs.push(Diag::new(
-                    "L0203",
-                    at.name_span,
-                    "associated types in a trait with lifetime parameters are not supported yet",
-                    "Move the lifetime to the methods, or make the type a generic parameter of the trait.",
-                ));
-            }
+            // Its associated types are projections whose bindings may hold
+            // the trait's lifetimes (`Value = &'de str`): the borrow checker
+            // reads those from the bound or impl header that fixes them
+            // (`TraitLts`, `ImplHead`).
         }
         // Associated items: types live in the type namespace, consts and
         // methods in the value namespace. A second item of one name in one
@@ -6913,8 +6938,8 @@ fn trait_lts_in(interner: &Interner, known: &Known, cx: &ResolveCx, scope: &Scop
     let mut out = Vec::new();
     for &(j, bounds) in bounded {
         for b in bounds {
-            if let TraitBound::Trait { trait_ref, .. } = b
-                && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, scope, trait_ref)
+            if let TraitBound::Trait { trait_ref, binder, .. } = b
+                && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, &binder_scope(scope, binder), trait_ref)
             {
                 out.push(crate::borrowck::TraitLts { param: j, trait_def, lifetimes });
             }
@@ -7525,6 +7550,14 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
             mscope.param_tys.extend(own_scope.param_tys.iter().copied());
+            // `V::Value` for the method's own `V: Visitor<'de>` (and
+            // `V::Item` for `V: Iterator`): the method's bounds join the
+            // trait's sources (`Self::Value` among them).
+            {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                let own = assoc_srcs_of(&cx, &p.tys, &own_generics.predicates);
+                mscope.assoc_srcs.extend(own);
+            }
             let (params, ret, ret_borrows_from, combined, mscope, region_sig, _) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(&p.ast, &p.interner, &p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)

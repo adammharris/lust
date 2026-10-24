@@ -3185,8 +3185,11 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
   fn pointer or `dyn` type; lifetimes in a dyn type's trait args;
   an elided (`'_` or missing) lifetime arg of a trait,
   lifetime args in a trait's own bounds (supertraits,
-  `Self` where-clauses), and associated types in a trait
-  with lifetime params; `T: 'a` bounds on named lifetimes;
+  `Self` where-clauses) other than a higher-ranked
+  supertrait (`trait DeserializeOwned: for<'de>
+  Deserialize<'de>`); a projection naming a trait lifetime
+  on a concrete type (`<S as Tr<'a>>::X` in a signature);
+  `T: 'a` bounds on named lifetimes;
   inside a closure, a call through a type param's `Fn`
   bound whose argument names a lifetime of the enclosing
   fn, or passing such a param on to a generic fn (the

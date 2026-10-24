@@ -987,7 +987,8 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
             let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             generics::trait_lts_of(ast, interner, known, &cx, &ks, &imp.generics, &imp.where_clause)
         };
-        p.regions.impl_heads.insert(impl_def, crate::borrowck::ImplHead { self_ty: self_r, trait_lifetimes: trait_lts.clone(), where_lts });
+        let facts = scope.region_facts.clone();
+        p.regions.impl_heads.insert(impl_def, crate::borrowck::ImplHead { self_ty: self_r, trait_lifetimes: trait_lts.clone(), where_lts, facts });
     }
     // The header's anonymous lifetimes join the impl's params, so the
     // methods' own lifetimes number after them.
