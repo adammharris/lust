@@ -7209,6 +7209,22 @@ impl Rewrite<'_> {
                     }
                 }
             }
+            // A path through a module's std alias (`use crate::lib::fmt::
+            // Write;` with `pub use std::fmt;` in `lib`) reads as the
+            // alias's std path, as at module level (`through_std_alias`).
+            if let ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } = &imp.kind
+                && let Some(&first) = path.first()
+                && (kw(first) || !self.import_seg(first, Namespace::Type, module, scopes).1)
+            {
+                let limit = if matches!(imp.kind, ImportKind::Single { .. }) { path.len() - 1 } else { path.len() };
+                if let Some((full, _)) = self.tables.std_alias_walk(module, path, limit, imp.leading_colon, self.interner) {
+                    match &mut imp.kind {
+                        ImportKind::Single { path, .. } | ImportKind::CheckPath { path } | ImportKind::Glob { path } => *path = full,
+                        ImportKind::BadLeading { .. } => {}
+                    }
+                    imp.leading_colon = true;
+                }
+            }
             // A path through a block type item (`use E::V;` for an
             // enum of this or an enclosing block) binds a local use.
             if !imp.leading_colon
