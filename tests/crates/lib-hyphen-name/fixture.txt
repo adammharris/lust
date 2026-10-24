@@ -1,0 +1,3 @@
+# `--lib` names the package (`lib-hyphen-name`); Cargo's lib target is
+# `lib_hyphen_name`.
+lib=1

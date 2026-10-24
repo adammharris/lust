@@ -1,0 +1,5 @@
+# A dependency re-exported under a new name (`pub use dep_kit as kit;`,
+# as fig-core does with fig-kit): paths walk into it through the alias.
+[workspace]
+members = ["kit", "core", "app"]
+resolver = "2"

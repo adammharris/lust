@@ -940,6 +940,10 @@ pub fn select_unit(
                 && (t.kind.iter().any(|k| k == target_kind) || target_kind == "lib" && t.kind.iter().any(|k| k == "lib" || k == "rlib"))
         })
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
+        // A package has at most one lib, and `--lib` names it by the package
+        // name: Cargo's lib target is `fig_kit` for package `fig-kit`, or
+        // whatever `[lib] name` says.
+        .or_else(|| (target_kind == "lib").then(|| pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib"))).flatten())
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
     let check_map = if simple_graph { None } else { unit_features_via_check(req, graph) };
@@ -1214,6 +1218,25 @@ mod tests {
         assert!(unit.package_id.contains("hello 0.1.0"), "{}", unit.package_id);
         check_edition(&unit).unwrap();
         check_lints(&graph, &unit).unwrap();
+    }
+
+    #[test]
+    fn lib_of_a_hyphenated_package() {
+        // `--lib` names the target by its package, `my-lib`; Cargo's lib
+        // target is `my_lib`.
+        let dir = std::env::temp_dir().join(format!("lust-cargo-hyphen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"my-lib\"\nversion = \"0.1.0\"\nedition = \"2024\"\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        let req = GraphRequest { manifest_path: dir.join("Cargo.toml"), default_features: true, ..Default::default() };
+        let graph = load_graph(&req).expect("metadata");
+        let interner = crate::intern::Interner::default();
+        let env = CfgEnv::new("", &[], false, crate::protocol::ProfileFlags::DEV);
+        let unit = select_unit(&graph, &req, "lib", "my-lib", &env, &interner, false).expect("my-lib lib unit");
+        assert_eq!(unit.target.name, "my_lib");
+        assert!(select_unit(&graph, &req, "bin", "my-lib", &env, &interner, false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

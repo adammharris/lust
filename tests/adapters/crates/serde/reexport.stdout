@@ -1,0 +1,8 @@
+Ok(42)
+Ok("text")
+Ok("borrow")
+Err("invalid value: integer `300`, expected u8")
+Err("invalid type: unit variant, expected newtype variant")
+Err(Error("invalid type: unit variant, expected newtype variant"))
+Ok("Ok")
+ser side -1

@@ -6,14 +6,14 @@
 //
 // The compiler treats `PhantomData<T>` as holding a `T` for auto
 // traits, unused-parameter checks, and regions, while its value is
-// zero-sized (`Program::is_phantom_adt`). Not here yet: `T: ?Sized`.
+// zero-sized (`Program::is_phantom_adt`).
 
 /// A zero-sized type that acts as if it owns a `T`. Std's impls have no
 /// bounds on `T`; the derives here give the same answers, because the
 /// struct has no fields (lust derives on a generic Adt ask only the
 /// fields).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct PhantomData<T>;
+pub struct PhantomData<T: ?Sized>;
 
 // Lust std source, adapted from rust-lang/rust 1.99 `core/src/marker.rs`
 // (`impl Hash`): no bound on `T`, and it writes nothing. `Debug`
@@ -22,6 +22,6 @@ pub struct PhantomData<T>;
 // lust can print (`check::any::type_name_of`), and no instance is made
 // for the others.
 
-impl<T> core::hash::Hash for PhantomData<T> {
+impl<T: ?Sized> core::hash::Hash for PhantomData<T> {
     fn hash<H: core::hash::Hasher>(&self, _: &mut H) {}
 }

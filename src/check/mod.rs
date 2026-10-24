@@ -1147,6 +1147,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet, Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetRef), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetMut), Builtin::Sync(crate::check::sync::SyncOp::ArcWeakUpgrade),
     Builtin::RefCellBorrow, Builtin::RefCellBorrowMut,
     Builtin::VecAsSlice, Builtin::VecAsMutSlice, Builtin::VecLen, Builtin::VecIsEmpty, Builtin::SliceLen, Builtin::SliceIsEmpty,
+    Builtin::SliceToVec,
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
@@ -4236,6 +4237,12 @@ impl<'p> Ctx<'p> {
             // (ts-rust `owned_store_js_doc(file, host, <[Node]>::len)`).
             TyKind::Slice(_) if name == k.len => (B::SliceLen, Autoref::Ref, vec![], USIZE),
             TyKind::Slice(_) if name == k.is_empty => (B::SliceIsEmpty, Autoref::Ref, vec![], BOOL),
+            // `<[T]>::to_vec` as a value (`res.map(<[u8]>::to_vec)`): `T: Clone`
+            // is re-tested at finish, as for the method call.
+            TyKind::Slice(e) if name == k.to_vec => {
+                self.deferred_clone.push((e, Span::default()));
+                (B::SliceToVec, Autoref::Ref, vec![], self.tys.mk_vec(e))
+            }
             // `Vec::as_slice` and kin as values (`opt.map(Vec::as_slice)`).
             _ if let Some(e) = self.tys.vec_elem(self_ty) => match self.name(name) {
                 "as_slice" => {
@@ -7445,7 +7452,7 @@ impl<'p> Ctx<'p> {
                 TyKind::Dyn(b, _) => self.tys.dyn_bounds(b).auto,
                 _ => AutoTraits::default(),
             };
-            if (want.send && !have.send) || (want.sync && !have.sync) || (want.unpin && !have.unpin) {
+            if !have.covers(&want) {
                 self.mismatch(span, expected, found);
                 return None;
             }
@@ -7485,7 +7492,7 @@ impl<'p> Ctx<'p> {
             _ => AutoTraits::default(),
         };
         let lang = p.gx.lang;
-        for (on, def) in [(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)] {
+        for (on, def) in self.dyn_auto_goals(want) {
             if on {
                 let args = self.tys.intern_args(&[GenericArg::Ty(x)]);
                 self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
@@ -7612,11 +7619,18 @@ impl<'p> Ctx<'p> {
         let to_static = object::dyn_is_static(p, &self.tys, y);
         if let Some(from) = object::principal_of(&self.tys, x) {
             let have = object::dyn_auto(p, &self.tys, x);
-            let auto_ok = (!want.send || have.send) && (!want.sync || have.sync) && (!want.unpin || have.unpin);
+            let auto_ok = have.covers(&want);
             let path_ok = if from.def == to.def {
                 self.unify_args(from.args, to.args) && self.unify_bindings(from.bindings, to.bindings)
             } else {
+                // An upcast keeps each associated type the source binds
+                // (`dyn Sub<Out = u8>` to `dyn Base<Out = u8>`).
                 object::upcast_path(p, &mut self.tys, from, to).is_some()
+                    && self.tys.bindings(to.bindings).to_vec().into_iter().all(|(assoc, g)| match g {
+                        GenericArg::Ty(want) => crate::traits::solve::dyn_assoc_binding(&mut self.tys, &p.gx.index, from, assoc)
+                            .is_some_and(|have| self.unify(have, want)),
+                        _ => false,
+                    })
             };
             if !auto_ok || !path_ok {
                 self.mismatch(span, expected, found);
@@ -7697,7 +7711,7 @@ impl<'p> Ctx<'p> {
         }
         let tr = object::with_self(&mut self.tys, to, x);
         self.obl.push_trait_at(tr, span, 0);
-        for (on, def) in [(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)] {
+        for (on, def) in self.dyn_auto_goals(want) {
             if on {
                 let args = self.tys.intern_args(&[GenericArg::Ty(x)]);
                 self.obl.push_trait_at(TraitRef { def, args, bindings: EMPTY_BINDINGS }, span, 0);
@@ -7707,6 +7721,20 @@ impl<'p> Ctx<'p> {
         self.vtable_sites.push((x, y, span));
         Some(Coerce::Unsize(expected))
     }
+    /// The trait goals a value unsized to a dyn type with auto bits `want`
+    /// must meet: each bit with its trait (an unwind trait lust's std does
+    /// not have is no goal).
+    fn dyn_auto_goals(&self, want: AutoTraits) -> Vec<(bool, DefId)> {
+        let lang = self.p.gx.lang;
+        let mut out = vec![(want.send, lang.send), (want.sync, lang.sync), (want.unpin, lang.unpin)];
+        for (on, refs) in [(want.unwind_safe, false), (want.ref_unwind_safe, true)] {
+            if on && let Some(d) = unwind::unwind_trait_def(self.p, refs) {
+                out.push((true, d));
+            }
+        }
+        out
+    }
+
     /// A method found through a user `Deref` impl of the receiver
     /// (rustc's autoderef, ARCH 2.10; `SmallVec` derefs to `[T]`): when
     /// nothing answers on `base` (the receiver after `before` builtin
@@ -8135,7 +8163,24 @@ impl<'p> Ctx<'p> {
     /// lust knows lives for `'static`.
     fn static_borrow(&self, e: ExprId) -> bool {
         match self.p.ast.expr(e) {
-            Expr::Ref { raw: false, expr, .. } => matches!(self.out.expr_res[self.ei(*expr)], Res::Static(_)),
+            Expr::Ref { raw: false, expr, .. } if matches!(self.out.expr_res[self.ei(*expr)], Res::Static(_)) => true,
+            Expr::Ref { raw: false, mutable: false, expr } => self.is_place(*expr),
+            _ => false,
+        }
+    }
+
+    /// True for a place expression the borrow checker follows: a local
+    /// or static, a field of a place, or a deref of any expression. A
+    /// shared borrow of one coerced to `&'static dyn Tr` needs no proof
+    /// here (`static_borrow`): the borrow checker relates the borrow's
+    /// region to `'static` (`&**held` with `held: &'static Arc<dyn Tr>`
+    /// holds; a borrow of a local is L0306, of a parameter's pointee
+    /// L0733), as for any `&'static T` target.
+    fn is_place(&self, e: ExprId) -> bool {
+        match self.p.ast.expr(e) {
+            Expr::Path(_) => matches!(self.out.expr_res[self.ei(e)], Res::Local(_) | Res::Static(_)),
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => self.is_place(*base),
+            Expr::Deref(_) => true,
             _ => false,
         }
     }

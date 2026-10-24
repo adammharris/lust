@@ -1785,6 +1785,13 @@ impl<'a> Parser<'a> {
                     out.attrs.push(attr);
                     continue;
                 }
+                // `#[diagnostic::on_unimplemented(..)]` and the rest of the
+                // `diagnostic` namespace only shape rustc's messages; an
+                // unknown or misplaced one is a warning there too.
+                if name_text == "diagnostic" && path.len() == 2 {
+                    out.attrs.push(attr);
+                    continue;
+                }
                 return Err(Diag::new(
                     "L0402",
                     name_span,
@@ -2629,7 +2636,7 @@ impl<'a> Parser<'a> {
         if !binder.is_empty()
             && let Some(GenericArgs::Parenthesized { inputs, output }) = path.last().map(|s| s.args.clone())
         {
-            self.canon_binder(&binder, &inputs, output)?;
+            self.canon_binder(&binder, &inputs, output, false)?;
         }
         Ok(TraitBound::Trait { binder, trait_ref: TraitRefExpr { path }, maybe })
     }
@@ -3374,7 +3381,7 @@ impl<'a> Parser<'a> {
                 if let Some(TraitBound::Trait { trait_ref, .. }) = bounds.first()
                     && let Some(GenericArgs::Parenthesized { inputs, output }) = trait_ref.path.last().map(|s| s.args.clone())
                 {
-                    self.canon_binder(&binder, &inputs, output)?;
+                    self.canon_binder(&binder, &inputs, output, false)?;
                 }
                 // A trailing lifetime bound is the dyn lifetime.
                 let lifetime = match bounds.last() {
@@ -3495,14 +3502,14 @@ impl<'a> Parser<'a> {
                     return Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types other than fn pointers"));
                 };
                 let (inputs, ret): (Vec<TyId>, Option<TyId>) = (inputs.iter().map(|p| p.ty).collect(), *ret);
-                self.canon_binder(&binder, &inputs, ret)?;
+                self.canon_binder(&binder, &inputs, ret, true)?;
                 if let TyExpr::FnPtr { binder: b, .. } = &mut self.ast.tys[t.0 as usize] {
                     *b = binder;
                 }
                 Ok(t)
             }
             Tok::For => Err(not_yet(C_TRAIT, start, "higher-ranked (`for<..>`) types and bounds")),
-            Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+            Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower if self.cfg_syntax && self.at_path_macro_call() => {
                 let (span, _) = self.skip_macro_invocation()?;
                 Ok(self.push_ty(TyExpr::Unit, span))
             }
@@ -4113,7 +4120,7 @@ impl<'a> Parser<'a> {
                     Pat::QPath { self_ty, trait_path, segs }
                 }
             }
-            Tok::Ident(_) | Tok::SelfUpper if self.cfg_syntax && self.at_path_macro_call() => {
+            Tok::Ident(_) | Tok::SelfUpper | Tok::Crate | Tok::Super | Tok::SelfLower if self.cfg_syntax && self.at_path_macro_call() => {
                 self.skip_macro_invocation()?;
                 Pat::Wild
             }
@@ -5081,6 +5088,9 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Bool(false)
             }
+            // `crate::err!(..)` in cfg-disabled code (active code reaches
+            // the parser expanded).
+            Tok::Crate | Tok::Super | Tok::SelfLower if self.cfg_syntax && self.at_path_macro_call() => return self.cfg_macro_expr(),
             Tok::Crate | Tok::Super | Tok::PathSep => {
                 let path = self.path(false)?;
                 if self.peek() == Tok::LBrace && !no_struct {

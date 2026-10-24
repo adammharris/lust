@@ -5759,7 +5759,7 @@ impl Ex<'_, '_> {
     /// once_with.rs). `FromFn` and `Successors` are not.
     fn std_trusted_len(&self, t: Ty) -> bool {
         let Some(a) = self.body.tys.local_adt(t) else { return false };
-        self.p.is_std_adt(a) && matches!(self.p.display_path(self.p.adt(a).name).as_str(), "core::iter::Once" | "core::iter::OnceWith")
+        self.p.is_std_adt(a) && matches!(self.p.display_path(self.p.adt(a).name).as_str(), "core::iter::Once" | "core::iter::OnceWith" | "core::iter::Repeat" | "core::iter::RepeatWith")
     }
 
     /// `dest = itp.start_bound()` (or `end_bound`), a `Bound<&T>`

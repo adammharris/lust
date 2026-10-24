@@ -1,4 +1,4 @@
-// expect: L0705
+// expect: L0306
 // rustc E0597: a `&'static dyn T` element needs a 'static reference.
 trait T { fn read(&self) -> u32; }
 struct S { n: u32 }

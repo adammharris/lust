@@ -1,0 +1,3 @@
+bin=app
+root=app/src/main.rs
+manifest=app/Cargo.toml

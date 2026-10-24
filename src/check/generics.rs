@@ -1852,14 +1852,20 @@ fn dyn_args_have_regions(ast: &Ast, interner: &Interner, path: &[ast::PathSeg]) 
 /// may sit anywhere. L0203 for the cut forms: two such lifetimes, one
 /// inside a nested fn pointer, `dyn`, `impl`, or `Fn` sugar type, and a
 /// `'static` that is not on a reference.
-fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId) -> Result<Option<ast::Lifetime>, Diag> {
+fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId, binder: &[ast::Lifetime]) -> Result<Option<ast::Lifetime>, Diag> {
     struct W<'x> {
         ast: &'x Ast,
         interner: &'x Interner,
+        binder: &'x [ast::Lifetime],
         found: Option<ast::Lifetime>,
     }
     impl W<'_> {
         fn note(&mut self, lt: ast::Lifetime, plain: bool, on_ref: bool) -> Result<(), Diag> {
+            // A kept `for<..>` binder's lifetime (`FnSig::binders`) in a
+            // plain place; elsewhere it stays undeclared (L0203).
+            if plain && self.binder.iter().any(|b| b.name == lt.name) {
+                return Ok(());
+            }
             let cut = |why: &str| {
                 Diag::new(
                     "L0203",
@@ -1937,11 +1943,107 @@ fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId) -> Result<Opt
         }
     }
     let TyExpr::FnPtr { inputs, ret, .. } = ast.ty(id) else { return Ok(None) };
-    let mut w = W { ast, interner, found: None };
+    let mut w = W { ast, interner, binder, found: None };
     for t in inputs.iter().map(|p| p.ty).chain(*ret) {
         w.ty(t, true)?;
     }
     Ok(w.found)
+}
+
+/// The marker region of kept binder lifetime `i` (`fn_ptr_binders`).
+fn binder_marker(i: usize) -> Region {
+    Region::Placeholder(u32::MAX - 1 - i as u32)
+}
+
+/// True when fn pointer type `id` writes a lifetime of its `for<..>`
+/// binder on a reference or a type arg of its inputs or output: the
+/// parser kept the binder (`parser::hrtb`), as elision cannot say it.
+fn fn_ptr_kept_binder(ast: &Ast, binder: &[ast::Lifetime], id: ast::TyId) -> bool {
+    fn ty(ast: &Ast, binder: &[ast::Lifetime], t: ast::TyId) -> bool {
+        let named = |lt: &ast::Lifetime| binder.iter().any(|b| b.name == lt.name);
+        match ast.ty(t) {
+            TyExpr::Ref { lifetime, inner, .. } => lifetime.as_ref().is_some_and(named) || ty(ast, binder, *inner),
+            TyExpr::Tuple(elems) => elems.iter().any(|&e| ty(ast, binder, e)),
+            TyExpr::Paren(i) | TyExpr::Slice(i) | TyExpr::Array { inner: i, .. } | TyExpr::Ptr { inner: i, .. } => ty(ast, binder, *i),
+            TyExpr::Path(segs) => segs.iter().any(|s| match &s.args {
+                GenericArgs::Angle(a) => a.iter().any(|g| match g {
+                    AstArg::Lifetime(lt) => named(lt),
+                    AstArg::Type(t) => ty(ast, binder, *t),
+                    _ => false,
+                }),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+    let TyExpr::FnPtr { inputs, ret, .. } = ast.ty(id) else { return false };
+    !binder.is_empty() && inputs.iter().map(|p| p.ty).chain(*ret).any(|t| ty(ast, binder, t))
+}
+
+/// `FnSig::binders` of a fn pointer type whose `for<..>` binder the
+/// parser kept: its inputs `in_tys` and output `ret` resolve again with
+/// regions kept, each binder lifetime its marker (`scope` has them), and
+/// each slot of the erased signature (`ins`, `out`) where a marker lands
+/// again after its first input slot names that slot. An output slot that
+/// is elided, or a binder lifetime the inputs do not write (rustc E0581),
+/// is L0203; so is a binder slot past the sixteenth.
+#[allow(clippy::too_many_arguments)]
+fn fn_ptr_binders(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    cx: &ResolveCx,
+    tys: &mut impl TyIntern,
+    scope: &Scope,
+    binder: &[ast::Lifetime],
+    in_tys: &[ast::TyId],
+    ret: Option<ast::TyId>,
+    ins: &[Ty],
+    out: Ty,
+) -> Result<u64, Diag> {
+    let span = binder.first().map_or_else(Span::default, |l| l.span);
+    let cut = |why: &str| Diag::new("L0203", span, format!("this `for<..>` lifetime is not supported yet: {why}"), "Elide it, or use a generic `F: Fn(..)` parameter.");
+    let mut ts = scope.clone();
+    ts.fn_ptr_free = false;
+    ts.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
+    let mut twin_ins = Vec::with_capacity(in_tys.len());
+    for &t in in_tys {
+        twin_ins.push(resolve_scoped(ast, interner, known, cx, tys, t, &ts)?);
+    }
+    let twin_out = match ret {
+        Some(r) => resolve_scoped(ast, interner, known, cx, tys, r, &ts)?,
+        None => UNIT,
+    };
+    let mut slots: Vec<Region> = Vec::new();
+    if !twin_ins.iter().zip(ins).all(|(&r, &e)| crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, r, e, &mut slots)) {
+        return Err(cut("lust cannot place it in the signature"));
+    }
+    let n_in = slots.len();
+    if !crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, twin_out, out, &mut slots) {
+        return Err(cut("lust cannot place it in the signature"));
+    }
+    let markers: Vec<Region> = (0..binder.len()).map(binder_marker).collect();
+    let mut first: Vec<Option<usize>> = vec![None; binder.len()];
+    let mut map = 0u64;
+    for (k, r) in slots.into_iter().enumerate() {
+        let Some(i) = markers.iter().position(|&m| m == r) else {
+            if k >= n_in && r == Region::Bound(0) {
+                return Err(cut("the output elides a lifetime next to a binder elision cannot write"));
+            }
+            continue;
+        };
+        match first[i] {
+            None if k >= n_in => return Err(cut("the output uses it, but no input does")),
+            None => first[i] = Some(k),
+            Some(j) => {
+                if k >= 16 {
+                    return Err(cut("the signature has more than 16 region places"));
+                }
+                map |= ((j + 1) as u64) << (4 * k);
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// `FnSig::own_out` and `FnSig::out_slots` of a fn pointer type with
@@ -3588,8 +3690,19 @@ pub fn resolve_scoped(
             // A fn pointer's elided lifetimes are its own (late-bound), a
             // written `&'static` is kept (`Scope::static_refs`), and one
             // lifetime of the enclosing item is its free region (W-BORROW3,
-            // `FnSig::free_slots`). Other written lifetimes are L0203.
-            let free = fn_ptr_free_name(ast, interner, id)?;
+            // `FnSig::free_slots`). A `for<..>` binder the parser kept
+            // written (`parser::hrtb`) is `FnSig::binders`. Other written
+            // lifetimes are L0203.
+            let kept = fn_ptr_kept_binder(ast, binder, id);
+            let free = fn_ptr_free_name(ast, interner, id, binder)?;
+            if let (true, Some(lt)) = (kept, free) {
+                return Err(Diag::new(
+                    "L0203",
+                    lt.span,
+                    "a fn pointer type with both a `for<..>` binder and a lifetime of the enclosing item is not supported yet",
+                    "Name only binder lifetimes in the fn pointer type, or elide them.",
+                ));
+            }
             if free.is_some() && !scope.fn_ptr_free {
                 return Err(Diag::new(
                     "L0203",
@@ -3599,7 +3712,14 @@ pub fn resolve_scoped(
                 ));
             }
             let in_tys: Vec<ast::TyId> = inputs.iter().map(|p| p.ty).collect();
-            sugar_elision(ast, interner, known, cx, tys, scope, &in_tys, *ret)?;
+            // The kept binder's lifetimes, each its own marker region.
+            let mut bscope = scope.clone();
+            if kept {
+                for (i, lt) in binder.iter().enumerate() {
+                    bscope.alias_lifetimes.insert(0, (lt.name, binder_marker(i)));
+                }
+            }
+            sugar_elision(ast, interner, known, cx, tys, &bscope, &in_tys, *ret)?;
             let free_region = match free {
                 Some(lt) => Some((lt, scope_region(interner, scope, Some(lt), lt.span)?)),
                 None => None,
@@ -3607,6 +3727,11 @@ pub fn resolve_scoped(
             let outer = scope;
             let mut erased = scope.erased();
             erased.static_refs = true;
+            if kept {
+                for lt in binder {
+                    erased.alias_lifetimes.insert(0, (lt.name, Region::Erased));
+                }
+            }
             let scope = &erased;
             let mut ins = Vec::with_capacity(inputs.len());
             for p in inputs {
@@ -3620,9 +3745,11 @@ pub fn resolve_scoped(
                 Some((lt, r)) => (fn_ptr_free_mask(ast, interner, known, cx, tys, outer, &in_tys, *ret, lt, &ins, out)?, r),
                 None => (0, Region::Erased),
             };
-            let (own_out, out_slots) = if free_slots == 0 { fn_ptr_own_output(ast, interner, known, cx, tys, outer, &in_tys, *ret, out) } else { (0, u8::MAX) };
+            let binders = if kept { fn_ptr_binders(ast, interner, known, cx, tys, &bscope, binder, &in_tys, *ret, &ins, out)? } else { 0 };
+            let (own_out, out_slots) =
+                if free_slots == 0 && binders == 0 { fn_ptr_own_output(ast, interner, known, cx, tys, outer, &in_tys, *ret, out) } else { (0, u8::MAX) };
             let inputs = tys.intern_tys(&ins);
-            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, out_slots, ..FnSig::plain(inputs, out) }));
+            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, out_slots, binders, ..FnSig::plain(inputs, out) }));
             Ok(tys.intern(TyKind::FnPtr(sig)))
         }
         TyExpr::QPath { self_ty, trait_path, segs } => {
@@ -3810,6 +3937,18 @@ fn resolve_dyn(
                     ));
                 }
                 let trait_def = trait_def_of_path(cx, interner, known, &trait_ref.path, span)?;
+                // std's `UnwindSafe` / `RefUnwindSafe`: auto traits too.
+                match std_unwind_trait(cx, interner, trait_def) {
+                    Some(false) => {
+                        auto.unwind_safe = true;
+                        continue;
+                    }
+                    Some(true) => {
+                        auto.ref_unwind_safe = true;
+                        continue;
+                    }
+                    None => {}
+                }
                 if cx.lang.is_auto(trait_def) {
                     if trait_def == cx.lang.send {
                         auto.send = true;
@@ -3855,11 +3994,33 @@ fn resolve_dyn(
                         "Use a reference to an owned type, or a generic `F: Fn(..)` parameter.",
                     ));
                 }
+                // Every associated type of the principal and its
+                // supertraits is bound (rustc E0191): the object type
+                // has no impl to read an unbound one from.
+                // One binding per associated type (rustc E0719; a
+                // generic bound may repeat one).
+                let binds = tys.bindings(tr.bindings);
+                if let Some(i) = (1..binds.len()).find(|&i| binds[..i].iter().any(|(d, _)| *d == binds[i].0)) {
+                    let name = cx.index.trait_of_assoc(binds[i].0).and_then(|t| cx.index.trait_record(t)).and_then(|r| r.assoc_items.iter().find(|(d, _, _)| *d == binds[i].0).map(|(_, n, _)| *n));
+                    let name = name.map_or("?", |n| interner.get(n)).to_string();
+                    return Err(Diag::new(
+                        "L0106",
+                        span,
+                        format!("the value of the associated type `{name}` is already specified"),
+                        "Keep one binding of each associated type.",
+                    ));
+                }
+                if !fn_family && let Some(name) = unbound_dyn_assoc(cx, tys, trait_def, tr.bindings) {
+                    let tname = interner.get(seg.name).to_string();
+                    return Err(Diag::new(
+                        "L0110",
+                        span,
+                        format!("the value of the associated type `{}` in `dyn {tname}` must be specified", interner.get(name)),
+                        format!("Bind it: `dyn {tname}<{} = T>`.", interner.get(name)),
+                    ));
+                }
                 // The `Fn(..) -> R` sugar binds `Output`; other bindings
                 // are not supported yet.
-                if !fn_family && !tys.bindings(tr.bindings).is_empty() {
-                    return Err(dyn_not_yet(span, "associated type bindings in `dyn` types"));
-                }
                 principal = Some(Binder::plain(tr));
             }
         }
@@ -3867,11 +4028,50 @@ fn resolve_dyn(
     // `dyn Send`, `dyn Send + Sync`: no principal, only auto traits. Its
     // vtable holds drop, size, and align (`object::vtable_key`). No trait
     // at all (`dyn 'a`) is rustc E0224.
-    if principal.is_none() && !(auto.send || auto.sync || auto.unpin) {
+    if principal.is_none() && auto.is_empty() {
         return Err(Diag::new("L0110", span, "at least one trait is required for an object type", "Write a trait after `dyn`."));
     }
     let bounds_id = tys.intern_dyn_bounds(DynBounds { principal, supertraits: Box::new([]), auto });
     Ok(tys.intern(TyKind::Dyn(bounds_id, region)))
+}
+
+/// The first associated type of `trait_def` or a supertrait (through
+/// `Self` supertrait predicates) that neither `bindings` nor a
+/// supertrait bound (`trait Sub: Base<Out = u8>`) gives a type.
+fn unbound_dyn_assoc(cx: &ResolveCx, tys: &impl TyIntern, trait_def: DefId, bindings: BindingsId) -> Option<Sym> {
+    let mut bound: Vec<DefId> = tys.bindings(bindings).iter().map(|(d, _)| *d).collect();
+    let mut wanted: Vec<(DefId, Sym)> = Vec::new();
+    let mut seen: Vec<DefId> = Vec::new();
+    let mut stack = vec![trait_def];
+    while let Some(def) = stack.pop() {
+        if seen.contains(&def) {
+            continue;
+        }
+        seen.push(def);
+        let Some(rec) = cx.index.trait_record(def) else { continue };
+        wanted.extend(rec.assoc_items.iter().filter(|(_, _, is_type)| *is_type).map(|&(d, n, _)| (d, n)));
+        for pred in &rec.generics.predicates {
+            let Predicate::Trait(b) = pred else { continue };
+            let is_self = tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| tys.kind(t) == TyKind::Param(ParamId(0)));
+            if is_self {
+                bound.extend(tys.bindings(b.value.bindings).iter().map(|(d, _)| *d));
+                stack.push(b.value.def);
+            }
+        }
+    }
+    wanted.into_iter().find(|(d, _)| !bound.contains(d)).map(|(_, n)| n)
+}
+
+/// For std's `UnwindSafe` (false) and `RefUnwindSafe` (true), by the
+/// trait's flat name in the spliced `std::panic` module (src/stdmods.rs;
+/// `check::unwind::unwind_trait` once the program exists); None for any
+/// other trait.
+fn std_unwind_trait(cx: &ResolveCx, interner: &Interner, def: DefId) -> Option<bool> {
+    match interner.get(cx.index.trait_record(def)?.name) {
+        "__lust_std_panic$UnwindSafe" => Some(false),
+        "__lust_std_panic$RefUnwindSafe" => Some(true),
+        _ => None,
+    }
 }
 
 /// True when a `dyn Fn*` principal's inputs or output hold a builtin Adt
@@ -4960,15 +5160,43 @@ pub(crate) fn bound_predicates(
                 errs.push(d);
                 return;
             }
-            // The parser rewrote a binder's uses to elided lifetimes
-            // (`parser::hrtb`); one it could not rewrite stays written and
-            // fails to resolve. So no region here is bound by it.
-            match resolve_trait_ref(ast, interner, known, cx, tys, scope, lhs, trait_ref, span) {
+            // The parser rewrote a binder's uses in `Fn` sugar to elided
+            // lifetimes (`parser::hrtb`). A binder lifetime in angle args
+            // (`T: for<'de> Deserialize<'de>`) is the bound's own region:
+            // erased here, a fresh one at each use in region checking.
+            let bscope = binder_scope(scope, binder);
+            match resolve_trait_ref(ast, interner, known, cx, tys, &bscope, lhs, trait_ref, span) {
                 Ok(tr) => out.push(Predicate::Trait(Binder::plain(tr))),
                 Err(d) => errs.push(d),
             }
         }
     }
+}
+
+/// `scope` with a bound's `for<..>` binder lifetimes declared, each its
+/// own `Region::Bound` (higher-ranked: a fresh region at each use).
+fn binder_scope(scope: &Scope, binder: &[ast::Lifetime]) -> Scope {
+    let mut s = scope.clone();
+    for (i, lt) in binder.iter().enumerate() {
+        s.alias_lifetimes.push((lt.name, Region::Bound(i as u32)));
+    }
+    s
+}
+
+/// True when every lifetime arg of a trait bound is one of its own
+/// `for<..>` binder's (`for<'de> Deserialize<'de>`), and it has one.
+fn lifetimes_all_bound(binder: &[ast::Lifetime], tref: &ast::TraitRefExpr) -> bool {
+    let Some(GenericArgs::Angle(args)) = tref.path.last().map(|s| &s.args) else { return false };
+    let mut any = false;
+    for a in args {
+        if let AstArg::Lifetime(lt) = a {
+            if !binder.iter().any(|b| b.name == lt.name) {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
 }
 
 /// The elaborated param env of one item from its written
@@ -5347,7 +5575,10 @@ pub fn build_trait_generics(
         ast::WherePred::Type { bounds, .. } => bounds.as_slice(),
         _ => &[],
     })) {
-        if let TraitBound::Trait { trait_ref, .. } = b
+        // A higher-ranked one (`trait DeserializeOwned: for<'de>
+        // Deserialize<'de>`) holds for every lifetime: nothing to replay.
+        if let TraitBound::Trait { trait_ref, binder, .. } = b
+            && !lifetimes_all_bound(binder, trait_ref)
             && let Some(lt_span) = trait_ref_lifetime_span(trait_ref)
         {
             errs.push(Diag::new(
@@ -5972,6 +6203,10 @@ pub fn ty_uses_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
             tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| ty_uses_param(tys, e, idx)))
         }
+        // The principal's args and bindings (`dyn Rule<Out = O>`).
+        TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| {
+            tys.args(pr.value.args).iter().chain(tys.bindings(pr.value.bindings).iter().map(|(_, g)| g)).any(|g| g.as_ty().is_some_and(|e| ty_uses_param(tys, e, idx)))
+        }),
         _ => false,
     }
 }
@@ -6055,16 +6290,10 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
             .collect();
         if !lts.is_empty() {
             p.gx.adt_lifetimes.insert(def, lts);
-            // A projection through such a trait would carry the trait's
-            // regions in a type that has no slots for them: a stated cut.
-            if let Some(at) = tdef.types.first() {
-                errs.push(Diag::new(
-                    "L0203",
-                    at.name_span,
-                    "associated types in a trait with lifetime parameters are not supported yet",
-                    "Move the lifetime to the methods, or make the type a generic parameter of the trait.",
-                ));
-            }
+            // Its associated types are projections whose bindings may hold
+            // the trait's lifetimes (`Value = &'de str`): the borrow checker
+            // reads those from the bound or impl header that fixes them
+            // (`TraitLts`, `ImplHead`).
         }
         // Associated items: types live in the type namespace, consts and
         // methods in the value namespace. A second item of one name in one
@@ -6709,8 +6938,8 @@ fn trait_lts_in(interner: &Interner, known: &Known, cx: &ResolveCx, scope: &Scop
     let mut out = Vec::new();
     for &(j, bounds) in bounded {
         for b in bounds {
-            if let TraitBound::Trait { trait_ref, .. } = b
-                && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, scope, trait_ref)
+            if let TraitBound::Trait { trait_ref, binder, .. } = b
+                && let Some((trait_def, lifetimes)) = trait_ref_lts(interner, known, cx, &binder_scope(scope, binder), trait_ref)
             {
                 out.push(crate::borrowck::TraitLts { param: j, trait_def, lifetimes });
             }
@@ -7223,6 +7452,13 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 for b in &at_bounds {
                     bound_predicates(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &scope, proj, b, &mut preds, &mut relaxed, errs);
                 }
+                // Its bounds on traits with lifetime params, with the
+                // lifetimes written (`RegionTables::assoc_lts`).
+                let lts: Vec<(DefId, Vec<Region>)> =
+                    trait_lts_in(&p.interner, &p.known, &cx, &scope, &[(0, &at_bounds[..])]).into_iter().map(|b| (b.trait_def, b.lifetimes)).collect();
+                if !lts.is_empty() {
+                    p.regions.assoc_lts.insert(assoc_def, lts);
+                }
                 // An associated type has an implicit `Sized` bound
                 // unless the trait writes `type A: ?Sized` (rustc
                 // E0277 on an unsized binding at the impl).
@@ -7321,6 +7557,14 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             mscope.type_params.extend(own_scope.type_params.iter().copied());
             mscope.const_params.extend(own_scope.const_params.iter().copied());
             mscope.param_tys.extend(own_scope.param_tys.iter().copied());
+            // `V::Value` for the method's own `V: Visitor<'de>` (and
+            // `V::Item` for `V: Iterator`): the method's bounds join the
+            // trait's sources (`Self::Value` among them).
+            {
+                let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+                let own = assoc_srcs_of(&cx, &p.tys, &own_generics.predicates);
+                mscope.assoc_srcs.extend(own);
+            }
             let (params, ret, ret_borrows_from, combined, mscope, region_sig, _) = {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 resolve_fn_sig(&p.ast, &p.interner, &p.known, &mut p.tys, &cx, fdef, combined, &mscope, scope.self_ty, None, errs)
@@ -7815,6 +8059,9 @@ pub fn ty_uses_const_param(tys: &impl TyIntern, t: Ty, idx: u32) -> bool {
         TyKind::Array(e, n) => in_const(n) || ty_uses_const_param(tys, e, idx),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| ty_uses_const_param(tys, e, idx)),
         TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => in_args(a),
+        TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_some_and(|pr| {
+            in_args(pr.value.args) || tys.bindings(pr.value.bindings).iter().any(|(_, g)| g.as_ty().is_some_and(|e| ty_uses_const_param(tys, e, idx)))
+        }),
         _ => false,
     }
 }
@@ -9329,10 +9576,10 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let err_proj = p.tys.intern(TyKind::Projection(AssocId(lang.assoc_try_from_error), err_args));
         let g = pred(p, lang.try_from);
         insert_synthetic(p, &mut ordinal, lang.try_into, p0, &[p1], g, vec![(lang.assoc_try_into_error, err_proj)], Synthetic::Lang, false, span);
-        // core's `Display` for its conversion errors (the text is
-        // `display_glue_body`'s): a record, so the source `Error`
-        // impls in library/core/src/error.rs meet their supertrait.
-        for def in [try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def(), try_from_slice_error_def()] {
+        // core's `Display` for its conversion errors and `fmt::Error`
+        // (the text is `display_glue_body`'s): a record, so the source
+        // `Error` impls in library/core/src/error.rs meet their supertrait.
+        for def in [fmt_error_def(), try_from_int_error_def(), char_try_from_error_def(), try_from_char_error_def(), infallible_def(), parse_int_error_def(), parse_float_error_def(), parse_bool_error_def(), parse_char_error_def(), try_from_slice_error_def()] {
             let t = p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
             insert_synthetic(p, &mut ordinal, lang.display, t, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
@@ -13303,6 +13550,12 @@ fn prove_trait_ref(
     if index.dyn_object_impl_holds(&mut cx.tys, tr) {
         return true;
     }
+    // std's `UnwindSafe` / `RefUnwindSafe` by their table
+    // (check/unwind.rs), as body checking answers them.
+    if let Some(refs) = crate::check::unwind::unwind_trait(p, tr.def) {
+        let Some(t) = self_resolved else { return false };
+        return crate::check::unwind::unwind_safe(p, &mut cx.tys, env, refs, t, &mut Vec::new()) == Some(true);
+    }
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {
         let Some(t) = self_resolved else { return false };
@@ -13708,6 +13961,14 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
         let self_ty = subst_args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
         let mut goals: Vec<TraitRef> = Vec::new();
         let mut statics: Vec<Ty> = Vec::new();
+        let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
+        // A binding's projections normalize under the impl's bounds
+        // (`type D = Seq<<Self as IntoIterator>::IntoIter>` with
+        // `D: De`): the goal is about the type they stand for.
+        let rewrite = |p: &mut Program, t: Ty| {
+            let t = rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys);
+            normalize_global_in(p, &env, t)
+        };
         for &pred in &trec.generics.predicates {
             let pred = subst_predicate(&mut p.tys, pred, &subst_args);
             // `trait Tr: 'static`: the impl's Self type must be `'static`;
@@ -13724,7 +13985,7 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
             let new_args: Vec<GenericArg> = old_args
                 .iter()
                 .map(|&g| match g {
-                    GenericArg::Ty(t) => GenericArg::Ty(rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys)),
+                    GenericArg::Ty(t) => GenericArg::Ty(rewrite(p, t)),
                     other => other,
                 })
                 .collect();
@@ -13735,7 +13996,7 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
             let new_bindings: Vec<(DefId, GenericArg)> = old_bindings
                 .into_iter()
                 .map(|(d, g)| match g {
-                    GenericArg::Ty(t) => (d, GenericArg::Ty(rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys))),
+                    GenericArg::Ty(t) => (d, GenericArg::Ty(rewrite(p, t))),
                     other => (d, other),
                 })
                 .collect();
@@ -13745,7 +14006,6 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&
         if goals.is_empty() && statics.is_empty() {
             continue;
         }
-        let env = elaborate_env(&mut p.tys, &p.gx.index, &rec.generics.predicates);
         let dyn_self = p.gx.static_dyn_impls.contains(&rec.def);
         if statics.iter().any(|&t| !crate::check::object::header_type_static(p, &env, t, dyn_self)) {
             let tname = p.display_path(trec.name);
@@ -14951,6 +15211,21 @@ fn check_wf_item(p: &mut Program, adt_idx: &FxMap<DefId, usize>, (tys, values, g
 /// elements, `&str` and `&[T]`. A `Default` goal on those decomposes
 /// to its elements (`LinkStore<K, [SymbolTable; 2]>` with `V: Default`).
 fn prove_wf_goal(p: &mut Program, env: &[Predicate], goal: TraitRef) -> bool {
+    // A projection in the goal (`<BTreeMap<K, V> as IntoIterator>::IntoIter:
+    // Iterator`) is proved as the type it normalizes to.
+    let goal = if p.tys.args(goal.args).iter().any(|g| g.as_ty().is_some_and(|t| p.tys.flags(t).contains_projection())) {
+        let args: Vec<GenericArg> = p.tys.args(goal.args).to_vec();
+        let args: Vec<GenericArg> = args
+            .into_iter()
+            .map(|g| match g {
+                GenericArg::Ty(t) => GenericArg::Ty(normalize_global_in(p, env, t)),
+                other => other,
+            })
+            .collect();
+        TraitRef { args: p.tys.intern_args(&args), ..goal }
+    } else {
+        goal
+    };
     let &[GenericArg::Ty(t)] = p.tys.args(goal.args) else { return prove_goal(p, env, goal) };
     if goal.def != p.gx.lang.default {
         return prove_goal(p, env, goal);

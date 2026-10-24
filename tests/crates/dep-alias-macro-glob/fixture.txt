@@ -1,0 +1,4 @@
+# `use util as u; use u::*;` with macros in `util`: rejected (rustc reports
+# the glob macros ambiguous with the builtins, E0659).
+bin=scen
+expect=L0820

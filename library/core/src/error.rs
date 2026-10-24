@@ -123,6 +123,9 @@ impl Error for core::char::CharTryFromError {}
 impl Error for core::char::TryFromCharError {}
 impl Error for core::convert::Infallible {}
 
+// core's `Error` for `fmt::Error`.
+impl Error for core::fmt::Error {}
+
 // std's `Error` for `io::Error` (written in std::io in std; here so
 // the trait path resolves in this splice): `source` is the boxed
 // payload of a custom error, which lust does not take at

@@ -167,7 +167,7 @@ pub const STD_MODULES: &[StdModule] = &[
         krate: ShippedCrate::Core,
         paths: &[("core", "iter"), ("std", "iter")],
         full: false,
-        triggers: &["once", "once_with", "from_fn", "successors", "Once", "OnceWith", "FromFn", "Successors"],
+        triggers: &["once", "once_with", "from_fn", "successors", "repeat", "repeat_with", "Once", "OnceWith", "FromFn", "Successors", "Repeat", "RepeatWith"],
     },
     StdModule {
         name: "__lust_std_backtrace",

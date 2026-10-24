@@ -5,7 +5,9 @@
 //! lifetimes say exactly that (each binder lifetime once in the inputs;
 //! in the output only when it is the one input lifetime) is rewritten
 //! here to the elided form: `for<'a> fn(&'a N) -> Option<L<'a>>` becomes
-//! `fn(&N) -> Option<L<'_>>`. Any other binder is L0203. The binder list
+//! `fn(&N) -> Option<L<'_>>`. Any other binder on a plain fn pointer type
+//! stays written, and check records which region slots share a binder
+//! (`FnSig::binders`); on `Fn` sugar it is L0203. The binder list
 //! stays in the AST so check can reject a name that shadows a lifetime
 //! in scope (rustc E0496); a binder lifetime used where this rewrite does
 //! not look (a nested fn pointer or `dyn` type) stays written and
@@ -41,8 +43,14 @@ struct Scan {
 impl Parser<'_> {
     /// Rewrites the uses of `binder` in a signature (`inputs`, `output`)
     /// to elided lifetimes, or fails when the binder means more than
-    /// elision does.
-    pub(super) fn canon_binder(&mut self, binder: &[Lifetime], inputs: &[TyId], output: Option<TyId>) -> PResult<()> {
+    /// elision does. With `keep`, a binder that means more (a lifetime
+    /// used in two inputs, or an output lifetime that is not the one
+    /// input's: `for<'s> fn(&mut Ctx<'s>, &'s [u8]) -> &'s [u8]`) stays
+    /// written instead, every binder lifetime of it; check reads which
+    /// slots share a binder (`FnSig::binders`). Only a plain fn pointer
+    /// type keeps one: `Fn` sugar and `dyn Fn` bound their binders
+    /// elsewhere.
+    pub(super) fn canon_binder(&mut self, binder: &[Lifetime], inputs: &[TyId], output: Option<TyId>, keep: bool) -> PResult<()> {
         if binder.is_empty() {
             return Ok(());
         }
@@ -67,17 +75,21 @@ impl Parser<'_> {
             self.scan_binder(t, &names, &mut outs);
         }
         let mut seen = vec![false; names.len()];
+        let mut cut: Option<Diag> = None;
         for &(i, _) in &ins.uses {
             if seen[i] {
-                return Err(binder_cut(binder[i].span, "it is used in two places of the inputs"));
+                cut = cut.or(Some(binder_cut(binder[i].span, "it is used in two places of the inputs")));
             }
             seen[i] = true;
         }
         for &(i, _) in &outs.uses {
             let elided = !ins.opaque && ins.lts == 1 && ins.last_binder == Some(i);
             if !elided {
-                return Err(binder_cut(binder[i].span, "the output uses it, but it is not the one input lifetime"));
+                cut = cut.or(Some(binder_cut(binder[i].span, "the output uses it, but it is not the one input lifetime")));
             }
+        }
+        if let Some(d) = cut {
+            return if keep { Ok(()) } else { Err(d) };
         }
         let anon = self.interner.intern("_");
         for (_, site) in ins.uses.into_iter().chain(outs.uses) {

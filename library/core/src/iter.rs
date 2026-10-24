@@ -1,15 +1,17 @@
 // `core::iter` overlay (docs/ARCH.md section 3.1; W-STD-C): the sources
-// `once`, `once_with`, `from_fn`, `successors` and their iterator types.
-// The other `core::iter` items (`repeat`, `empty`, `zip`, the adapters, the
-// iterator traits) stay compiler-known; `std::iter::X` and `core::iter::X`
-// walk into this module only for the names it defines (`STD_MODULES` in
-// src/stdmods.rs).
+// `once`, `once_with`, `from_fn`, `successors`, `repeat`, `repeat_with` and
+// their iterator types. The other `core::iter` items (`repeat_n`, `empty`,
+// `zip`, the adapters, the iterator traits) stay compiler-known;
+// `std::iter::X` and `core::iter::X` walk into this module only for the
+// names it defines (`STD_MODULES` in src/stdmods.rs).
 //
 // Lust std source, adapted from rust-lang/rust 1.99
-// `core/src/iter/sources/{once,once_with,from_fn,successors}.rs`. Not
-// here: `FusedIterator` and `TrustedLen` (lust has no such traits, so a
-// bound on them rejects; lowering knows which of these types std marks
-// `TrustedLen`, src/lower/iter.rs `std_trusted_len`). `Once<T>` holds
+// `core/src/iter/sources/{once,once_with,from_fn,successors,repeat,
+// repeat_with}.rs`. Not here: `FusedIterator` and `TrustedLen` (lust
+// has no such traits, so a bound on them rejects; lowering knows which
+// of these types std marks `TrustedLen`, src/lower/iter.rs
+// `std_trusted_len`), and `Repeat::nth` (lust's `Iterator` has no such
+// override; the default gives the same item). `Once<T>` holds
 // `Option<T>` where core holds an `option::IntoIter<T>`; its Debug text
 // writes core's nesting by hand
 // (`Once { inner: IntoIter { inner: Item { opt: Some(1) } } }`).
@@ -186,5 +188,66 @@ where
 impl<T: core::fmt::Debug, F> core::fmt::Debug for Successors<T, F> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Successors").field("next", &self.next).finish()
+    }
+}
+
+/// Creates an iterator that repeats an element endlessly, cloning it
+/// (`core/src/iter/sources/repeat.rs`).
+pub fn repeat<T: Clone>(elt: T) -> Repeat<T> {
+    Repeat { element: elt }
+}
+
+/// An iterator that repeats an element endlessly (`repeat`).
+#[derive(Clone, Debug)]
+pub struct Repeat<A> {
+    element: A,
+}
+
+impl<A: Clone> Iterator for Repeat<A> {
+    type Item = A;
+
+    fn next(&mut self) -> Option<A> {
+        Some(self.element.clone())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (usize::MAX, None)
+    }
+}
+
+impl<A: Clone> DoubleEndedIterator for Repeat<A> {
+    fn next_back(&mut self) -> Option<A> {
+        Some(self.element.clone())
+    }
+}
+
+/// Creates an iterator that repeats elements endlessly by calling the
+/// closure (`core/src/iter/sources/repeat_with.rs`).
+pub fn repeat_with<A, F: FnMut() -> A>(repeater: F) -> RepeatWith<F> {
+    RepeatWith { repeater }
+}
+
+/// An iterator that repeats elements endlessly by calling a closure
+/// (`repeat_with`).
+#[derive(Copy, Clone)]
+pub struct RepeatWith<F> {
+    repeater: F,
+}
+
+impl<F> core::fmt::Debug for RepeatWith<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RepeatWith").finish_non_exhaustive()
+    }
+}
+
+impl<A, F: FnMut() -> A> Iterator for RepeatWith<F> {
+    type Item = A;
+
+    fn next(&mut self) -> Option<A> {
+        Some((self.repeater)())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (usize::MAX, None)
     }
 }

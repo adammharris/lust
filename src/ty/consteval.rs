@@ -583,6 +583,7 @@ fn const_ty_fits<T: TyIntern>(tys: &T, vt: Ty, ty: Ty, site: bool) -> bool {
             a.is_unsafe == b.is_unsafe
                 && a.extern_c == b.extern_c
                 && b.free_slots == 0
+                && a.binders == b.binders
                 && ai.len() == bi.len()
                 && ai.iter().zip(bi).all(|(&x, &y)| same_but_regions(tys, x, y) && static_marks_fit(tys, x, y, true, false))
                 && same_but_regions(tys, a.output, b.output)

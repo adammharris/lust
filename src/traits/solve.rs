@@ -636,17 +636,29 @@ impl Solver {
                 env_hits.push(i);
             }
         }
-        // Hits that name one trait ref once their variables resolve are
-        // one piece of evidence (an opaque's bounds noted before and
-        // after its args were inferred).
+        // Hits that name one trait ref once their variables resolve and
+        // their projections normalize are one piece of evidence (an
+        // opaque's bounds noted before and after its args were inferred;
+        // `S::E: Tr` next to `<S::Seq as SeqT>::E: Tr` from
+        // `type Seq: SeqT<E = Self::E>`).
         if env_hits.len() > 1 {
-            let key = |cx: &mut C, i: usize| -> Option<Vec<GenericArg>> {
+            let key = |solver: &mut Solver, cx: &mut C, i: usize| -> Option<Vec<GenericArg>> {
                 let Predicate::Trait(b) = env[i] else { return None };
                 let args: Vec<GenericArg> = cx.tys().args(b.value.args).to_vec();
-                Some(args.into_iter().map(|g| match g { GenericArg::Ty(t) => GenericArg::Ty(cx.deep_resolve(t)), g => g }).collect())
+                Some(
+                    args.into_iter()
+                        .map(|g| match g {
+                            GenericArg::Ty(t) => {
+                                let t = cx.deep_resolve(t);
+                                GenericArg::Ty(solver.normalize_inner(cx, index, env, t, 0))
+                            }
+                            g => g,
+                        })
+                        .collect(),
+                )
             };
-            let first = key(cx, env_hits[0]);
-            if first.is_some() && env_hits[1..].iter().all(|&i| key(cx, i) == first) {
+            let first = key(self, cx, env_hits[0]);
+            if first.is_some() && env_hits[1..].iter().all(|&i| key(self, cx, i) == first) {
                 env_hits.truncate(1);
             }
         }
@@ -925,6 +937,35 @@ pub fn elaborate_in(tys: &mut impl TyIntern, index: &ImplIndex, written: &[Predi
     out
 }
 
+/// The type a dyn principal gives associated type `assoc`: its own
+/// binding (keyed by the assoc def, so a supertrait's assoc too), or
+/// one a supertrait bound fixes (`trait Sub: Base<Out = u8>`).
+pub fn dyn_assoc_binding(tys: &mut impl TyIntern, index: &ImplIndex, principal: TraitRef, assoc: DefId) -> Option<Ty> {
+    let mut work = vec![principal];
+    let mut seen: Vec<TraitRef> = Vec::new();
+    while let Some(tr) = work.pop() {
+        if seen.contains(&tr) {
+            continue;
+        }
+        seen.push(tr);
+        if let Some(t) = tys.bindings(tr.bindings).iter().find(|(d, _)| *d == assoc).and_then(|(_, g)| g.as_ty()) {
+            return Some(t);
+        }
+        for pred in index.supertraits_of(tys, &tr) {
+            match pred {
+                Predicate::Trait(b) if b.count == 0 && tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(DYN_SELF) => work.push(b.value),
+                Predicate::AssocEq(b)
+                    if b.count == 0 && b.value.assoc == assoc && tys.args(b.value.trait_args).first().and_then(|g| g.as_ty()) == Some(DYN_SELF) =>
+                {
+                    return Some(b.value.ty);
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 /// Normalizes one type (section 2.5): rewrites projections through
 /// the impl selection picks, through param-env associated
 /// equalities, and recurses. A projection that cannot rewrite
@@ -951,6 +992,15 @@ impl Solver {
                         cx.tys().kind(deep),
                         TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) | TyKind::Dyn(..) | TyKind::Ref(..) | TyKind::Adt(..)
                     ) && let Some(out) = cx.closure_output(assoc.0, deep)
+                    {
+                        return self.normalize_inner(cx, index, env, out, depth + 1);
+                    }
+                    // `<dyn Tr<A = X> as Tr>::A` is the binding the dyn
+                    // type writes (the builtin object impl has no record
+                    // to read it from).
+                    if let TyKind::Dyn(b, _) = cx.tys().kind(deep)
+                        && let Some(pr) = cx.tys().dyn_bounds(b).principal
+                        && let Some(out) = dyn_assoc_binding(cx.tys(), index, pr.value, assoc.0)
                     {
                         return self.normalize_inner(cx, index, env, out, depth + 1);
                     }
@@ -1030,6 +1080,26 @@ impl Solver {
                 let output = self.normalize_inner(cx, index, env, b.value.output, depth + 1);
                 let sig = cx.tys().intern_sig(Binder { count: b.count, value: FnSig { inputs, output, ..b.value } });
                 cx.tys().intern(TyKind::FnPtr(sig))
+            }
+            // `dyn Tr<A = <X as U>::B>`: the principal's args and
+            // bindings (`RuleExt::boxed` returns `Box<dyn Rule<Out =
+            // Self::Out>>`).
+            TyKind::Dyn(bid, r) => {
+                let old = cx.tys().dyn_bounds(bid).clone();
+                let Some(pr) = old.principal else { return t };
+                let args = self.normalize_args(cx, index, env, pr.value.args, depth + 1);
+                let binds: Vec<(DefId, GenericArg)> = cx.tys().bindings(pr.value.bindings).to_vec();
+                let binds: Vec<(DefId, GenericArg)> = binds
+                    .into_iter()
+                    .map(|(d, g)| match g {
+                        GenericArg::Ty(e) => (d, GenericArg::Ty(self.normalize_inner(cx, index, env, e, depth + 1))),
+                        other => (d, other),
+                    })
+                    .collect();
+                let bindings = cx.tys().intern_bindings(&binds);
+                let principal = Some(Binder { count: pr.count, value: TraitRef { args, bindings, ..pr.value } });
+                let bid = cx.tys().intern_dyn_bounds(DynBounds { principal, ..old });
+                cx.tys().intern(TyKind::Dyn(bid, r))
             }
             _ => t,
         }

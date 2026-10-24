@@ -167,6 +167,9 @@ impl Builder<'_, '_> {
                     free_node(self)
                 } else if r == Region::Static {
                     Node::Var(0)
+                } else if let Some(&n) = s.binder_of(j as usize).and_then(|k| ins.get(k)) {
+                    // A slot of an earlier slot's binder (`FnSig::binders`).
+                    n
                 } else if target {
                     Node::Ph(base + j)
                 } else {
@@ -177,6 +180,19 @@ impl Builder<'_, '_> {
         }
         let mut outs = Vec::new();
         let out_rs = self.sig_slot_regions(s.output);
+        // A written binder (`FnSig::binders`): each output slot names the
+        // input slot whose binder it is.
+        if s.binders != 0 {
+            for r in out_rs {
+                outs.push(if r == Region::Static {
+                    Node::Var(0)
+                } else {
+                    *s.binder_of(j as usize).and_then(|k| ins.get(k))?
+                });
+                j += 1;
+            }
+            return Some((ins, outs));
+        }
         // Where a substitution moved written own slots (`fn(&u8) -> (T,
         // &u8)`) their places are unknown: the one input's, as before.
         let substituted = s.out_substituted(out_rs.len()) && s.own_out == 0;
@@ -621,6 +637,8 @@ fn ptr_shape(p: &Program, tys: &impl TyIntern, ptr: Ty) -> Option<Vec<Shape>> {
                 Shape::Var
             } else if r == Region::Static {
                 Shape::Static
+            } else if let Some(&b) = s.binder_of(j as usize).and_then(|k| ins.get(k)) {
+                b
             } else {
                 Shape::Bound(j)
             });
@@ -635,6 +653,8 @@ fn ptr_shape(p: &Program, tys: &impl TyIntern, ptr: Ty) -> Option<Vec<Shape>> {
             Shape::Var
         } else if r == Region::Static {
             Shape::Static
+        } else if s.binders != 0 {
+            *s.binder_of(j as usize).and_then(|k| ins.get(k))?
         } else {
             match ins[..] {
                 [one] => one,

@@ -297,7 +297,16 @@ fn cfg_expr(trees: &[Tt], i: &mut usize, env: &CfgEnv, st: &impl CfgRead) -> Res
         }
         _ => {
             if tok_at(trees, *i).map(|t| t.tok) == Some(Tok::Eq) {
-                let value = match tok_at(trees, *i + 1) {
+                // An `expr` or `literal` fragment that matched one string
+                // literal is a value too, as in rustc (serde's
+                // `#[cfg(target_has_atomic = $size)]`).
+                let value_tok = match trees.get(*i + 1) {
+                    Some(Tt::Frag(FragKind::Expr | FragKind::Expr2021 | FragKind::Literal, inner, _)) if inner.len() == 1 => {
+                        tok_at(inner, 0)
+                    }
+                    _ => tok_at(trees, *i + 1),
+                };
+                let value = match value_tok {
                     Some(t) => st.string_text(t.tok),
                     None => None,
                 };

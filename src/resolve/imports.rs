@@ -2245,6 +2245,44 @@ impl ResolvedTables {
         }
     }
 
+    /// `path` with its prefix that ends in a std alias (`crate::lib::fmt`
+    /// for `pub use std::fmt;` in `lib`) replaced by the alias's
+    /// canonical std path, to read from the extern prelude
+    /// (`::std::fmt::Write`): a std alias binds no module to walk into.
+    /// Only the first `limit` segments may be the alias (a single
+    /// import's last segment is the imported name, which an alias copy
+    /// handles). Also says whether the alias came from a glob.
+    pub fn std_alias_walk(&self, from: ModuleId, path: &[Sym], limit: usize, leading_colon: bool, interner: &Interner) -> Option<(Vec<Sym>, bool)> {
+        // `use std::mem; use mem::swap;`: the first segment itself.
+        if !leading_colon
+            && limit > 0
+            && let Some(&first) = path.first()
+            && !matches!(interner.get(first), "crate" | "self" | "super" | "Self")
+            && !self.crate_magic.contains_key(&first)
+        {
+            let info = self.module_seg(from, first, Namespace::Type, interner);
+            if let SegBind::Std(apath) = info.bind {
+                let mut full = apath;
+                full.extend_from_slice(&path[1..]);
+                return Some((full, info.glob));
+            }
+        }
+        for j in 1..limit.min(path.len()) {
+            let PathRes::Done(Target::Module(m)) = self.resolve_module_path(from, &path[..j], leading_colon, interner) else {
+                return None;
+            };
+            let key = (m, ns_index(Namespace::Type) as u8, path[j]);
+            let Some((avis, apath)) = self.std_aliases.get(&key) else { continue };
+            if !self.visible(avis, self.std_alias_def_module(key), from, interner) {
+                return None;
+            }
+            let mut full = apath.clone();
+            full.extend_from_slice(&path[j + 1..]);
+            return Some((full, self.std_glob_aliases.contains_key(&key)));
+        }
+        None
+    }
+
     /// Resolves the module part of a `use` path (all of it for a glob,
     /// all but the last segment for a single import). Returns the module
     /// or extern it names.
@@ -2744,6 +2782,13 @@ pub fn std_import_namespaces(interner: &Interner, path: &[Sym]) -> Option<Vec<Na
         // A std platform module (W-SHIM): its items resolve through the
         // alias into the platform crate.
         None if strs.len() == 2 && strs[0] == "std" && STD_PLATFORM_MODULES.contains(&strs[1]) => vec![Namespace::Type],
+        // A std source module (`std::net`, W-STD-C): its items resolve
+        // through the alias into the spliced module, as the full path's do.
+        None if strs.len() >= 2
+            && crate::stdmods::STD_MODULES.iter().any(|r| r.paths.iter().any(|(k, m)| *k == strs[0] && *m == strs[1..].join("::"))) =>
+        {
+            vec![Namespace::Type]
+        }
         None => return None,
     };
     if std_is_module_path(&strs) && !out.contains(&Namespace::Type) {
@@ -2850,6 +2895,22 @@ fn record_std_alias(tables: &mut ResolvedTables, imp: &Import, path: &[Sym], nam
 }
 
 /// Tries one import against the current tables.
+/// True when a prefix of `mod_path` names a dependency of this crate by
+/// another name than the dependency's (`use util as u;` then `u::..`).
+/// A module keyword is no rename: `crate` inside the dependency names
+/// its own root.
+fn through_dep_alias(tables: &ResolvedTables, imp: &Import, mod_path: &[Sym], interner: &Interner) -> bool {
+    let root = tables.root_of(imp.module);
+    (1..=mod_path.len()).any(|j| {
+        let seg = interner.get(mod_path[j - 1]);
+        !matches!(seg, "crate" | "self" | "super")
+            && match tables.resolve_module_path(imp.module, &mod_path[..j], imp.leading_colon, interner) {
+                PathRes::Done(Target::Module(m)) => tables.externs.iter().any(|e| e.root_module == Some(m) && e.owner == root && e.name != seg),
+                _ => false,
+            }
+    })
+}
+
 fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> TryOut {
     // `use std::io::Write;`: an item of the shipped platform crate
     // (W-SHIM) imports from that crate's module tree.
@@ -2861,6 +2922,41 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
         let imp2 = Import { kind: ImportKind::Single { path: redirected, name: *name }, leading_colon: false, ..imp.clone() };
         return try_import(tables, &imp2, self_sym, interner, diags);
     }
+    let out = try_import_here(tables, imp, self_sym, interner, diags);
+    // `use crate::lib::fmt::Write;` with `pub use std::fmt;` in `lib`: the
+    // path walks through a std alias, which binds no module to walk into,
+    // so the import reads the alias's std path in its place.
+    if matches!(out, TryOut::Wait)
+        && let Some(imp2) = through_std_alias(tables, imp, interner)
+    {
+        return try_import(tables, &imp2, self_sym, interner, diags);
+    }
+    out
+}
+
+/// The import with the prefix of its path that ends in a std alias
+/// replaced by the alias's std path (`ResolvedTables::std_alias_walk`).
+/// A glob alias can still lose to a later explicit binding, so it counts
+/// only once the fixpoint stalls.
+fn through_std_alias(tables: &ResolvedTables, imp: &Import, interner: &Interner) -> Option<Import> {
+    let (path, limit) = match &imp.kind {
+        ImportKind::Single { path, .. } => (path, path.len().saturating_sub(1)),
+        ImportKind::Glob { path } | ImportKind::CheckPath { path } => (path, path.len()),
+        ImportKind::BadLeading { .. } => return None,
+    };
+    let (full, glob) = tables.std_alias_walk(imp.module, path, limit, imp.leading_colon, interner)?;
+    if glob && !tables.import_stall {
+        return None;
+    }
+    let kind = match &imp.kind {
+        ImportKind::Single { name, .. } => ImportKind::Single { path: full, name: *name },
+        ImportKind::Glob { .. } => ImportKind::Glob { path: full },
+        _ => ImportKind::CheckPath { path: full },
+    };
+    Some(Import { kind, leading_colon: true, ..imp.clone() })
+}
+
+fn try_import_here(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> TryOut {
     match &imp.kind {
         ImportKind::BadLeading { .. } => {
             diags.push(Diag::new(
@@ -2942,6 +3038,18 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 imp.span,
                                 "cannot glob-import a module into itself",
                                 "Remove the import: the module's own items are already in scope.",
+                            ));
+                            return TryOut::Done(false);
+                        }
+                        // `use util as u; use u::*;`: as for a single
+                        // import, the expander does not follow the rename,
+                        // so the glob's macros would not reach calls.
+                        if through_dep_alias(tables, imp, path, interner) && glob_names(tables, src, Namespace::Macro, None).next().is_some() {
+                            diags.push(Diag::new(
+                                "L0820",
+                                imp.span,
+                                "a glob import of macros through a renamed dependency crate is not supported yet",
+                                "Import by the dependency's own name (`use util::*;`).",
                             ));
                             return TryOut::Done(false);
                         }
@@ -3216,6 +3324,26 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 }
                 return TryOut::Done(inserted);
             }
+            // `pub use fig_kit as kit;`: the one segment names a dependency
+            // lust compiles from source, whose extern prelude entry is its
+            // root module (`extern_target`); the import binds that module,
+            // as `use crate as x;` binds this crate's
+            // (`crate::kit::table::Table`).
+            if path.len() == 1
+                && let PathRes::Done(target @ Target::Module(m)) =
+                    tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, imp.leading_colon, interner)
+                && tables.externs.iter().any(|e| e.root_module == Some(m) && e.owner == tables.root_of(imp.module))
+            {
+                let bind_name = import_bind_name(*name, target, interner);
+                let dup = explicit_exists(tables, imp, Namespace::Type, bind_name);
+                let out = tables.insert(imp.module, Namespace::Type, bind_name, Bind { target, vis: imp.vis.clone(), rank: 2, def_module: imp.module });
+                if dup && interner.get(*name) != "_" {
+                    diags.push(dup_diag(imp, *name, interner));
+                } else {
+                    report_dup(out, imp, *name, interner, diags);
+                }
+                return TryOut::Done(out == InsertOut::Changed);
+            }
             let modres = match tables.resolve_module_path(imp.module, mod_path, imp.leading_colon, interner) {
                 // `use std::marker::PhantomData;`: an item of a std
                 // source overlay module imports from it (W-STD-C).
@@ -3329,6 +3457,19 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             return TryOut::Done(record_std_alias(tables, imp, path, *name, interner, diags));
                         }
                         return TryOut::Wait;
+                    }
+                    // `use util as u; use u::matches;`: the expander reads
+                    // macro imports by path and does not follow a renamed
+                    // dependency, so the call would expand some other macro
+                    // of that name (a builtin `matches!`).
+                    if found.iter().any(|(ns, _)| *ns == Namespace::Macro) && through_dep_alias(tables, imp, mod_path, interner) {
+                        diags.push(Diag::new(
+                            "L0820",
+                            imp.span,
+                            format!("a macro imported through a renamed dependency crate is not supported yet: `{}`", interner.get(last)),
+                            "Import the macro by the dependency's own name (`use util::name;`).",
+                        ));
+                        return TryOut::Done(false);
                     }
                     // One re-export check per distinct target: a name in
                     // two namespaces usually names two items, a struct

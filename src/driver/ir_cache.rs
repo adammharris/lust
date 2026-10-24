@@ -463,10 +463,10 @@ enum TyTree {
     Array(u32, ConstKind),
     Tuple(Vec<u32>),
     Adt(DefId, Vec<ArgTree>),
-    FnPtr { count: u32, is_unsafe: bool, extern_c: bool, free_slots: u32, free_region: Region, own_out: u32, out_slots: u8, inputs: Vec<u32>, output: u32 },
+    FnPtr { count: u32, is_unsafe: bool, extern_c: bool, free_slots: u32, free_region: Region, own_out: u32, out_slots: u8, binders: u64, inputs: Vec<u32>, output: u32 },
     FnDef(DefId, Vec<ArgTree>),
     Closure(DefId, Vec<ArgTree>),
-    Dyn { region: Region, principal: Option<(u32, TraitRefTree)>, supertraits: Vec<(u32, TraitRefTree)>, auto: (bool, bool, bool) },
+    Dyn { region: Region, principal: Option<(u32, TraitRefTree)>, supertraits: Vec<(u32, TraitRefTree)>, auto: (bool, bool, bool, bool, bool) },
     Opaque(DefId, Vec<ArgTree>),
     Param(ParamId),
     Projection(AssocId, Vec<ArgTree>),
@@ -690,6 +690,7 @@ impl TreeBuilder<'_> {
                     free_region: sig.value.free_region,
                     own_out: sig.value.own_out,
                     out_slots: sig.value.out_slots,
+                    binders: sig.value.binders,
                     inputs,
                     output: self.ty(sig.value.output),
                 }
@@ -700,7 +701,7 @@ impl TreeBuilder<'_> {
                 let b = self.tys.dyn_bounds(bounds);
                 let principal = b.principal.as_ref().map(|pr| (pr.count, self.trait_ref(&pr.value)));
                 let supertraits = b.supertraits.iter().map(|st| (st.count, self.trait_ref(&st.value))).collect();
-                TyTree::Dyn { region: r, principal, supertraits, auto: (b.auto.send, b.auto.sync, b.auto.unpin) }
+                TyTree::Dyn { region: r, principal, supertraits, auto: (b.auto.send, b.auto.sync, b.auto.unpin, b.auto.unwind_safe, b.auto.ref_unwind_safe) }
             }
             TyKind::Opaque(def, a) => TyTree::Opaque(def, self.args(a)),
             TyKind::Param(i) => TyTree::Param(i),
@@ -788,14 +789,14 @@ impl TreeIntern<'_> {
                 let a = self.args(tys, a)?;
                 tys.intern(TyKind::Adt(*def, a))
             }
-            TyTree::FnPtr { count, is_unsafe, extern_c, free_slots, free_region, own_out, out_slots, inputs, output } => {
+            TyTree::FnPtr { count, is_unsafe, extern_c, free_slots, free_region, own_out, out_slots, binders, inputs, output } => {
                 let mut out = Vec::with_capacity(inputs.len());
                 for t in inputs {
                     out.push(self.ty(tys, *t)?);
                 }
                 let inputs = tys.intern_tys(&out);
                 let output = self.ty(tys, *output)?;
-                let sig = tys.intern_sig(Binder { count: *count, value: FnSig { inputs, output, is_unsafe: *is_unsafe, extern_c: *extern_c, free_slots: *free_slots, free_region: *free_region, own_out: *own_out, out_slots: *out_slots } });
+                let sig = tys.intern_sig(Binder { count: *count, value: FnSig { inputs, output, is_unsafe: *is_unsafe, extern_c: *extern_c, free_slots: *free_slots, free_region: *free_region, own_out: *own_out, out_slots: *out_slots, binders: *binders } });
                 tys.intern(TyKind::FnPtr(sig))
             }
             TyTree::FnDef(def, a) => {
@@ -818,7 +819,7 @@ impl TreeIntern<'_> {
                 let bounds = tys.intern_dyn_bounds(DynBounds {
                     principal,
                     supertraits: supers.into_boxed_slice(),
-                    auto: AutoTraits { send: auto.0, sync: auto.1, unpin: auto.2 },
+                    auto: AutoTraits { send: auto.0, sync: auto.1, unpin: auto.2, unwind_safe: auto.3, ref_unwind_safe: auto.4 },
                 });
                 tys.intern(TyKind::Dyn(bounds, *region))
             }

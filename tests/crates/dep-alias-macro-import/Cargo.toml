@@ -1,0 +1,9 @@
+[package]
+name = "scen"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+util = { path = "util", version = "0.1" }

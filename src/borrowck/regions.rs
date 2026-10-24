@@ -190,6 +190,9 @@ pub struct ImplHead {
     /// params (`impl<'a, T: Tr<'a>> Tr<'a> for Wrap<T>`), replayed
     /// through the parts of Self they name (`trait_lts_for`).
     pub where_lts: Vec<TraitLts>,
+    /// The impl's `'a: 'b` facts (`impl<'de: 'a, 'a> Deserialize<'de> for
+    /// &'a str`), by its universal index (`STATIC_FACT` for `'static`).
+    pub facts: Vec<(u32, u32)>,
 }
 
 /// One trait impl's header and where-clauses with regions kept, for any
@@ -256,6 +259,12 @@ pub struct RegionTables {
     /// regions kept, by def: each impl owes them by regions too
     /// (`check_impl_supers`).
     pub trait_preds: FxMap<DefId, Vec<Predicate>>,
+    /// The bounds of a trait's associated types on traits with lifetime
+    /// params (`type Deserializer: Deserializer<'de>`), by assoc def: the
+    /// bound trait and its lifetime args over the outer trait's lifetimes
+    /// (`Region::Param(i)`), so a projection tells its lifetimes as a
+    /// bounded type param does.
+    pub assoc_lts: FxMap<DefId, Vec<(DefId, Vec<Region>)>>,
     /// Declared outlives facts between an Adt's lifetime params
     /// (`struct H<'a, 'b: 'a>`), by def: `(x, y)` is `'x: 'y` by param
     /// index, `y == STATIC_FACT` is `'static`. Every use of the type must
@@ -2767,6 +2776,10 @@ pub(super) struct Builder<'b, 'p> {
     /// type flows out, so a late-bound place of the destination's dyn
     /// may not meet the callee's `T` (R11).
     inst_ret: bool,
+    /// The trait-lifetime bounds (`T: Tr<'a>`) of the callee whose
+    /// signature `inst` reads: a projection `<T as Tr>::X` may hold
+    /// those lifetimes (`Value = &'de str` in `V: Visitor<'de>`).
+    inst_trait_lts: Vec<TraitLts>,
     /// While `walk` pairs the trait args of two dyn types (R11): the
     /// variance of the dyn types' own position, and the vars of the other
     /// side that a late-bound (`DYN_LATE`) position met.
@@ -2833,6 +2846,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             dyn_coerce: false,
             inst_inv: (false, None),
             inst_ret: false,
+            inst_trait_lts: Vec::new(),
             seed_binds: Vec::new(),
             cap_var: FxMap::default(),
             borrowed_caps: Vec::new(),
@@ -4164,9 +4178,11 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// `'static`, and each elided output slot is the one input slot's
     /// (elision; L0202 otherwise). Slots in `free` (`.0`, W-BORROW3) are
     /// the pointer's free region, var `.1`, in the inputs and the output.
+    /// A written binder (`binders`' `FnSig::binders`) is one fresh region
+    /// for all its slots, and each output slot is its input slot's.
     /// False when the shapes do not pair or the output is not the one
     /// input's (the caller's rule then).
-    fn call_late_bound_free(&mut self, ins: &[Ty], out: Ty, free: Option<(u32, u32)>, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+    fn call_late_bound_free(&mut self, ins: &[Ty], out: Ty, free: Option<(u32, u32)>, binders: Option<FnSig>, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         if ins.len() != avs.len() {
             return false;
         }
@@ -4181,10 +4197,17 @@ impl<'b, 'p> Builder<'b, 'p> {
             let (at, av) = &avs[i];
             let mut pv: Vec<u32> = Vec::new();
             for r in self.sig_slot_regions(it) {
+                // A slot of an earlier slot's binder (`FnSig::binders`)
+                // takes that slot's var: one region per binder.
+                let k = j as usize;
+                let shared = binders.and_then(|b| b.binder_of(k)).and_then(|l| slots.iter().chain(&pv).nth(l).copied());
                 pv.push(match is_free(&mut j) {
                     Some(v) => v,
                     None if r == Region::Static => 0,
-                    None => self.fresh(),
+                    None => match shared {
+                        Some(v) => v,
+                        None => self.fresh(),
+                    },
                 });
             }
             if !av.is_empty() && !self.relate(*at, av, it, &pv, Variance::Co) {
@@ -4203,10 +4226,15 @@ impl<'b, 'p> Builder<'b, 'p> {
         let one = if let [one] = late[..] { Some(one) } else { None };
         let rv = outs
             .iter()
-            .map(|&r| match is_free(&mut j) {
-                Some(v) => Some(v),
-                None if r == Region::Static => Some(0),
-                None => one,
+            .map(|&r| {
+                let k = j as usize;
+                match is_free(&mut j) {
+                    Some(v) => Some(v),
+                    None if r == Region::Static => Some(0),
+                    // A written binder: the output slot's input slot.
+                    None if binders.is_some_and(|b| b.binders != 0) => binders.and_then(|b| b.binder_of(k)).and_then(|l| slots.get(l).copied()),
+                    None => one,
+                }
             })
             .collect::<Option<Vec<u32>>>();
         let Some(rv) = rv else { return false };
@@ -4658,7 +4686,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             let mut lv = Vec::new();
             self.local_vars(l, &mut lv);
             let free = if s.free_slots != 0 { lv.first().map(|&v| (s.free_slots, v)) } else { None };
-            if (s.free_slots == 0 || free.is_some()) && self.call_late_bound_free(&ins, s.output, free, &avs, dt, &dv) {
+            if (s.free_slots == 0 || free.is_some()) && self.call_late_bound_free(&ins, s.output, free, Some(s), &avs, dt, &dv) {
                 return;
             }
         }
@@ -4821,7 +4849,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         match callee {
             Some((f, Callee::Sig(sig))) => {
                 self.bound_linked.clear();
-                self.seed_univ = self.trait_lifetime_seeds(f, &avs);
+                self.seed_univ = self.trait_lifetime_seeds(f, &avs, dt);
                 let ok = self.call_sig(f, sig, &avs, dt, &dv);
                 self.seed_univ.clear();
                 // An `Item = T` bound (`I: Iterator<Item = T>`, `I:
@@ -5706,9 +5734,16 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// `it.flat_map(f)`, typed `Flatten<Map<I, F, B>, U>` (check/iter.rs):
     /// the arguments make the inner `Map` as `it.map(f)` does
     /// (`call_adapter`), and the front and back iterators `U` hold what
-    /// the map's parts hold. A `&mut` capture of `f` then stays apart from
-    /// the regions it points to (else a `RefMut` it borrows would stay
-    /// borrowed for the guard's whole life). False for another shape.
+    /// the map's output part `B` holds: `U` is `B::IntoIter`, made from a
+    /// `B` alone, and `B` holds what `f` returns for the items (a closure
+    /// ties it through `closure_reqs`, a fn item or `dyn Fn` through
+    /// `map_output_part`). So `U` holds no loan of the source iterator
+    /// the closure does not return (`ls.iter().flat_map(|l| l.names())`
+    /// over `&[&'static dyn L]` yields `'static` items). A fn pointer
+    /// leaves `B` untied, so there every part of the map reaches `U`. A
+    /// `&mut` capture of `f` then stays apart from the regions it points
+    /// to (else a `RefMut` it borrows would stay borrowed for the guard's
+    /// whole life). False for another shape.
     fn call_flat_map(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         use crate::ty::iter::IterKind as K;
         let Some((K::Flatten, a)) = crate::ty::iter::iter_parts(&self.body.tys, dt) else { return false };
@@ -5723,11 +5758,25 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let (mv, uv) = (dv[..nm].to_vec(), dv[nm..].to_vec());
         self.call_adapter(avs, m, &mv);
-        self.flow_all(&mv, &uv);
+        let src = self.map_output_vars(m, &mv).unwrap_or_else(|| mv.clone());
+        self.flow_all(&src, &uv);
         if has_interior(&self.body.tys, u) {
-            self.flow_all(&uv, &mv);
+            self.flow_all(&uv, &src);
         }
         true
+    }
+
+    /// The vars of `Map<I, F, B>`'s output part `B` (map vars `mv`) when
+    /// the map ties it to what `F` returns: any callable but a fn pointer
+    /// (`map_output_part`). None otherwise.
+    fn map_output_vars(&mut self, m: Ty, mv: &[u32]) -> Option<Vec<u32>> {
+        let (_, a) = crate::ty::iter::iter_parts(&self.body.tys, m)?;
+        let [i, f, b] = a[..] else { return None };
+        if matches!(self.body.tys.kind(f), TyKind::FnPtr(_)) {
+            return None;
+        }
+        let at = adt_regions(self.p, &self.body.tys, m) as usize + self.sc.slots(i) as usize + self.sc.slots(f) as usize;
+        mv.get(at..at + self.sc.slots(b) as usize).map(<[u32]>::to_vec)
     }
 
     /// A builtin that builds an iterator adapter (`map`, `filter`,
@@ -6543,7 +6592,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 if (s.free_slots != 0 && free.is_none()) || self.sc.slots(it) as usize != x.len() || self.sc.slots(out) as usize != item.len() {
                     return false;
                 }
-                self.call_late_bound_free(&ins, out, free, &[(it, x.to_vec())], out, item)
+                self.call_late_bound_free(&ins, out, free, Some(s), &[(it, x.to_vec())], out, item)
             }
             TyKind::FnDef(def, fargs) if self.body.tys.args(fargs).is_empty() => {
                 let Some(l) = self.p.local_def(def.hash) else { return false };
@@ -7772,6 +7821,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.bind_tys.insert(j, t);
         }
         let mut ok = true;
+        let saved_lts = std::mem::replace(&mut self.inst_trait_lts, sig.trait_bounds.clone());
         // A callee type that names type params (a template called in
         // check mode, a stub) has no slots where its params are: the
         // call's own types give them, so the params bind their slots.
@@ -7808,6 +7858,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             let mut pv = Vec::new();
             self.inst(sig.params[i], ERROR, &univ, &mut binds, &mut pv);
         }
+        self.inst_trait_lts = saved_lts;
         for &(a, b) in &sig.facts {
             let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
             self.edge(x, y);
@@ -7824,11 +7875,44 @@ impl<'b, 'p> Builder<'b, 'p> {
         // invariant), so its own (this body's bound on a type param, or the
         // selected impl's header) equal the call's `'a`; unknown ones are
         // `'static`, never free.
+        // A higher-ranked bound (`T: for<'de> Tr<'de>`, or one through a
+        // supertrait such as `T: DeserializeOwned`) needs the bound type's
+        // impl to hold for every lifetime (`hr_general`).
+        let mut hr: Vec<(u32, DefId)> =
+            sig.trait_bounds.iter().filter(|b| b.lifetimes.iter().any(|r| matches!(r, Region::Bound(_)))).map(|b| (b.param, b.trait_def)).collect();
+        for pr in &sig.bounds {
+            if let Predicate::Trait(b) = pr
+                && let Some(TyKind::Param(j)) = self.p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).map(|t| self.p.tys.kind(t))
+            {
+                for (&d, _) in self.p.gx.adt_lifetimes.iter().filter(|(d, l)| !l.is_empty() && **d != b.value.def && self.p.gx.index.trait_record(**d).is_some()) {
+                    if has_supertrait(self.p, b.value.def, d) && !hr.contains(&(j.0, d)) {
+                        hr.push((j.0, d));
+                    }
+                }
+            }
+        }
+        for (j, d) in hr {
+            if let Some(t) = self.bind_tys.get(&j).copied()
+                && !self.hr_general(d, t)
+            {
+                self.impl_not_general();
+            }
+        }
         for b in &sig.trait_bounds {
             let n = b.lifetimes.len();
             let want: Vec<u32> = b.lifetimes.iter().map(|&r| self.inst_region(r, &univ)).collect();
             let have = match (self.bind_tys.get(&b.param).copied(), binds.get(&b.param).cloned()) {
                 (Some(t), Some(vs)) => self.trait_lts_for(b.trait_def, t, &vs, n),
+                // A param the call's types do not name, fixed by a binding
+                // of another one (`T` in `I: Iterator<Item = T>`).
+                (None, _) => {
+                    let all: Vec<Predicate> = preds.iter().chain(&sig.bounds).copied().collect();
+                    let bound = self.bind_tys.clone();
+                    match self.impl_param_by_binding(&all, b.param, &bound) {
+                        Some(t) => self.trait_lts_for(b.trait_def, t, &[], n),
+                        None => None,
+                    }
+                }
                 _ => None,
             }
             .unwrap_or_else(|| vec![0; n]);
@@ -8031,7 +8115,7 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// those of the receiver's type (`trait_lts_for`), else `'static`. Never
     /// fresh: a fresh trait lifetime would let the callee take a borrow for
     /// less than the trait promises. Empty for any other callee.
-    fn trait_lifetime_seeds(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)]) -> Vec<u32> {
+    fn trait_lifetime_seeds(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty) -> Vec<u32> {
         let p = self.p;
         let trait_method = |g: LocalDefId| p.fn_defs.get(g.0 as usize).copied().filter(|d| p.regions.trait_methods.contains_key(d));
         let Some(m) = p
@@ -8056,6 +8140,21 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             let vars: Vec<u32> = rv.iter().skip(skip).copied().collect();
             if let Some(seeds) = self.trait_lts_for(trait_def, t, &vars, n) {
+                return seeds;
+            }
+        }
+        // An associated fn (`T::deserialize(d)`): Self is where the
+        // method's erased signature names `Param(0)` in an argument or the
+        // result (`-> Result<Self, D::Error>`). A body type param, or a
+        // Self type with no regions, tells its trait lifetimes as a
+        // receiver's does.
+        if !has_self && let Some(tm) = p.gx.trait_methods.get(&m) {
+            let pairs: Vec<(Ty, Ty)> = tm.params.iter().copied().zip(avs.iter().map(|(t, _)| *t)).chain([(tm.ret, dt)]).collect();
+            let found = pairs.into_iter().find_map(|(pat, actual)| self_in(&p.tys, &self.body.tys, pat, actual, 0));
+            if let Some(t) = found
+                && (matches!(self.body.tys.kind(t), TyKind::Param(_)) || self.sc.slots(t) == 0)
+                && let Some(seeds) = self.trait_lts_for(trait_def, t, &[], n)
+            {
                 return seeds;
             }
         }
@@ -8086,13 +8185,62 @@ impl<'b, 'p> Builder<'b, 'p> {
             let root = root_fn(p, self.body.fn_id);
             let sig = p.regions.own_body_sig(p, root)?;
             if let Some(b) = sig.trait_bounds.iter().find(|b| b.param == j.0 && b.trait_def == trait_def) {
-                return b.lifetimes.iter().map(|&r| if let Region::Param(k) = r { self.root_univ(k) } else { Some(0) }).collect();
+                // A higher-ranked lifetime (`T: for<'de> Deserialize<'de>`)
+                // is any region: a fresh one for this use.
+                return b
+                    .lifetimes
+                    .iter()
+                    .map(|&r| match r {
+                        Region::Param(k) => self.root_univ(k),
+                        Region::Bound(_) => Some(self.fresh()),
+                        _ => Some(0),
+                    })
+                    .collect();
             }
             let own_trait = p.fn_defs.get(root.0 as usize).and_then(|&d| p.gx.index.trait_of_method(d));
             if j.0 == 0 && own_trait == Some(trait_def) && sig.n_univ as usize >= n {
                 return (0..n as u32).map(|k| self.root_univ(k)).collect();
             }
+            // A bound whose trait has `trait_def` as a supertrait (`T:
+            // DeserializeOwned`): a supertrait naming a lifetime is
+            // higher-ranked (any other is L0203 at the trait), so its
+            // lifetimes are fresh for this use.
+            let bound_traits: Vec<DefId> = sig
+                .bounds
+                .iter()
+                .filter_map(|pr| match pr {
+                    Predicate::Trait(b) if p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| matches!(p.tys.kind(t), TyKind::Param(q) if q.0 == j.0)) => Some(b.value.def),
+                    _ => None,
+                })
+                .collect();
+            if bound_traits.into_iter().any(|d| d != trait_def && has_supertrait(p, d, trait_def)) {
+                return Some((0..n).map(|_| self.fresh()).collect());
+            }
             return None;
+        }
+        // A projection (`<T as IntoDeserializer<'de>>::Deserializer`) through
+        // its associated type's bound (`type Deserializer: Deserializer<'de>`),
+        // with the outer trait's lifetimes read off its Self type.
+        if let TyKind::Projection(assoc, pargs) = self.body.tys.kind(t) {
+            let lts = p.regions.assoc_lts.get(&assoc.0)?.iter().find(|(d, _)| *d == trait_def)?.1.clone();
+            let outer = p.gx.index.trait_of_assoc(assoc.0)?;
+            let on = p.gx.adt_lifetimes.get(&outer).map_or(0, |v| v.len());
+            let self_t = self.body.tys.args(pargs).first().and_then(|g| g.as_ty())?;
+            let outer_lts = if on == 0 {
+                Vec::new()
+            } else if self.sc.slots(self_t) == 0 {
+                self.trait_lts_at(outer, self_t, &[], on, depth + 1)?
+            } else {
+                return None;
+            };
+            return lts
+                .iter()
+                .map(|&r| match r {
+                    Region::Param(k) => outer_lts.get(k as usize).copied(),
+                    Region::Bound(_) => Some(self.fresh()),
+                    _ => Some(0),
+                })
+                .collect();
         }
         let mut found: Option<Vec<u32>> = None;
         for &id in p.gx.index.impls_of_trait(trait_def) {
@@ -8104,9 +8252,12 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             let head = p.regions.impl_heads.get(&rec.def)?;
             // Every where-clause on a lifetime trait must be one the head
-            // kept (on a type param), else nothing tells its lifetimes.
+            // kept (on a type param), else nothing tells its lifetimes;
+            // inside that impl, on its own Self type, the body assumes
+            // exactly those where-clauses (`First<I::Item>:
+            // IntoDeserializer<'de, E>`), so the header alone tells.
             let nested = rec.generics.predicates.iter().filter(|pr| self.lifetime_trait_pred(pr)).count();
-            if found.is_some() || nested != head.where_lts.len() {
+            if found.is_some() || (nested != head.where_lts.len() && !(pat == t && self.in_own_impl(rec.def))) {
                 return None;
             }
             let mut lts: FxMap<u32, u32> = FxMap::default();
@@ -8118,7 +8269,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let mut part_tys: FxMap<u32, Ty> = FxMap::default();
                 self.impl_param_tys(pat, t, &mut part_tys);
                 for w in head.where_lts.clone() {
-                    let pt = *part_tys.get(&w.param)?;
+                    let pt = match part_tys.get(&w.param) {
+                        Some(&t) => t,
+                        None => self.impl_param_by_binding(&rec.generics.predicates, w.param, &part_tys)?,
+                    };
                     let pv = parts.get(&w.param).cloned().unwrap_or_default();
                     let inner = self.trait_lts_at(w.trait_def, pt, &pv, w.lifetimes.len(), depth + 1)?;
                     for (r, v) in w.lifetimes.iter().zip(inner) {
@@ -8138,6 +8292,15 @@ impl<'b, 'p> Builder<'b, 'p> {
                     }
                 }
             }
+            // The impl's own outlives facts hold between the lifetimes it
+            // was matched with: `'de: 'a` ties a borrowed `&'a str` result
+            // to the deserializer's `'de`.
+            for &(a, b) in &head.facts {
+                let mut var = |this: &mut Self, k: u32| *lts.entry(k).or_insert_with(|| this.fresh());
+                let va = var(self, a);
+                let vb = if b == crate::check::generics::STATIC_FACT { 0 } else { var(self, b) };
+                self.edge(va, vb);
+            }
             let mut out = Vec::with_capacity(n);
             for &r in &head.trait_lifetimes {
                 let v = match r {
@@ -8152,6 +8315,88 @@ impl<'b, 'p> Builder<'b, 'p> {
             found = Some(out);
         }
         found.filter(|v| v.len() == n)
+    }
+
+    /// True when Self type `t` (erased) implements lifetime trait
+    /// `trait_def` for every choice of its lifetimes, as a higher-ranked
+    /// bound needs (`T: for<'de> Deserialize<'de>`, or `T:
+    /// DeserializeOwned`): a type param of this body bound that way, or a
+    /// type whose one matching impl takes each trait lifetime as a free
+    /// lifetime param of its own (in no Self region, outlives fact, or
+    /// lifetime-trait where-clause). `impl<'de: 'a, 'a> Deserialize<'de>
+    /// for &'a str` is not (rustc "implementation is not general enough").
+    fn hr_general(&mut self, trait_def: DefId, t: Ty) -> bool {
+        let p = self.p;
+        if let TyKind::Param(j) = self.body.tys.kind(t) {
+            let root = root_fn(p, self.body.fn_id);
+            let Some(sig) = p.regions.own_body_sig(p, root) else { return false };
+            if let Some(b) = sig.trait_bounds.iter().find(|b| b.param == j.0 && b.trait_def == trait_def) {
+                return b.lifetimes.iter().all(|r| matches!(r, Region::Bound(_)));
+            }
+            return sig.bounds.iter().any(|pr| match pr {
+                Predicate::Trait(b) => {
+                    b.value.def != trait_def
+                        && p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(|x| matches!(p.tys.kind(x), TyKind::Param(q) if q.0 == j.0))
+                        && has_supertrait(p, b.value.def, trait_def)
+                }
+                _ => false,
+            });
+        }
+        let vars = vec![0u32; self.sc.slots(t) as usize];
+        let mut hit: Option<bool> = None;
+        for &id in p.gx.index.impls_of_trait(trait_def) {
+            let rec = p.gx.index.get(id);
+            let Some(pat) = p.tys.args(rec.trait_ref.args).first().and_then(|g| g.as_ty()) else { continue };
+            if !self.match_impl_self(pat, t, &vars, &mut 0, &mut FxMap::default()) {
+                continue;
+            }
+            if hit.is_some() {
+                return false;
+            }
+            let Some(head) = p.regions.impl_heads.get(&rec.def) else { return false };
+            let mut in_self = Vec::new();
+            regions_of(&p.tys, head.self_ty, &mut in_self);
+            let tied = |k: u32| in_self.contains(&Region::Param(k)) || head.facts.iter().any(|&(a, b)| a == k || b == k);
+            let mut seen: Vec<u32> = Vec::new();
+            let mut general = head.trait_lifetimes.iter().all(|&r| match r {
+                Region::Param(k) if !tied(k) && !seen.contains(&k) => {
+                    seen.push(k);
+                    true
+                }
+                _ => false,
+            });
+            // A where-clause that names a trait lifetime (`impl<'de, T>
+            // Deserialize<'de> for Vec<T> where T: Deserialize<'de>`) holds
+            // for every one of them when the part it bounds does.
+            if general {
+                let mut part_tys: FxMap<u32, Ty> = FxMap::default();
+                self.impl_param_tys(pat, t, &mut part_tys);
+                for w in &head.where_lts {
+                    if !w.lifetimes.iter().any(|r| matches!(r, Region::Param(k) if seen.contains(k))) {
+                        continue;
+                    }
+                    general = w.lifetimes.iter().all(|r| matches!(r, Region::Param(_)))
+                        && part_tys.get(&w.param).is_some_and(|&pt| self.hr_general(w.trait_def, pt));
+                    if !general {
+                        break;
+                    }
+                }
+            }
+            hit = Some(general);
+        }
+        hit.unwrap_or(false)
+    }
+
+    /// L0735 (rustc "implementation is not general enough"): the type a
+    /// call binds implements a lifetime trait for some lifetimes only, and
+    /// the callee's bound is higher-ranked.
+    fn impl_not_general(&mut self) {
+        self.errs.push(Diag::new(
+            "L0735",
+            self.span,
+            "this type is not general enough for the callee's higher-ranked bound: its impl holds for some lifetimes only",
+            "Use a type that owns its data (`String` for `&str`), or bound the callee by one lifetime (`T: Deserialize<'de>`).",
+        ));
     }
 
     /// The erased part of `actual` each type param of an impl's Self
@@ -8180,6 +8425,48 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             _ => {}
         }
+    }
+
+    /// A param of an impl or callee that its matched types do not name
+    /// (`known`: param to this body's type), read through an
+    /// associated-type binding of its where clauses (`T` in `I:
+    /// Iterator<Item = T>`): when `I` matched a type param of this body
+    /// whose own bound binds the same item (`I: Iterator<Item = U>`), `T`
+    /// is that binding. None otherwise (no normalization here).
+    fn impl_param_by_binding(&self, preds: &[Predicate], k: u32, known: &FxMap<u32, Ty>) -> Option<Ty> {
+        let p = self.p;
+        let root = root_fn(p, self.body.fn_id);
+        let sig = p.regions.own_body_sig(p, root)?;
+        for pr in preds {
+            let Predicate::Trait(b) = pr else { continue };
+            let Some(&(assoc, _)) = p.tys.bindings(b.value.bindings).iter().find(|(_, g)| matches!(g.as_ty().map(|t| p.tys.kind(t)), Some(TyKind::Param(q)) if q.0 == k)) else {
+                continue;
+            };
+            let Some(TyKind::Param(m)) = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).map(|t| p.tys.kind(t)) else { continue };
+            let Some(&actual) = known.get(&m.0) else { continue };
+            let TyKind::Param(j) = self.body.tys.kind(actual) else { continue };
+            for bp in &sig.bounds {
+                let Predicate::Trait(b2) = bp else { continue };
+                if b2.value.def != b.value.def
+                    || !p.tys.args(b2.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| matches!(p.tys.kind(t), TyKind::Param(q) if q.0 == j.0))
+                {
+                    continue;
+                }
+                if let Some(t) = p.tys.bindings(b2.value.bindings).iter().find(|(d, _)| *d == assoc).and_then(|(_, g)| g.as_ty()) {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    }
+
+    /// True when this body is a method of impl `impl_def` (its template's
+    /// parent), so the impl's params are this body's.
+    fn in_own_impl(&self, impl_def: DefId) -> bool {
+        let p = self.p;
+        let root = root_fn(p, self.body.fn_id);
+        let src = p.gx.instances.get(&root).and_then(|i| i.template_local).unwrap_or(root);
+        p.fn_defs.get(src.0 as usize).and_then(|&d| p.defs.get(d)).and_then(|d| d.parent) == Some(impl_def)
     }
 
     /// True for a predicate on a trait with lifetime params.
@@ -9379,9 +9666,12 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let (xs, ys) = (tys.tys_of(a).to_vec(), tys.tys_of(b).to_vec());
                 xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.match_impl_self(x, y, vars, at, out))
             }
-            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
-                self.match_impl_self(a, b, vars, at, out)
+            // `impl Tr for V<[T; 0]>` is not the impl for `V<[T; 1]>`.
+            (TyKind::Array(a, pn), TyKind::Array(b, an)) => {
+                let differ = matches!((tys.const_kind(pn), tys.const_kind(an)), (crate::ty::ConstKind::Int(x), crate::ty::ConstKind::Int(y)) if x != y);
+                !differ && self.match_impl_self(a, b, vars, at, out)
             }
+            (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => self.match_impl_self(a, b, vars, at, out),
             _ => {
                 *at += self.sc.slots(actual) as usize;
                 pat == actual
@@ -9551,13 +9841,28 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 let mut src = Vec::new();
                 for g in tys.args(pa).to_vec() {
-                    match g.as_ty().map(|t| tys.kind(t)) {
-                        Some(TyKind::Param(j)) => match binds.get(&j.0) {
-                            Some(v) => src.extend_from_slice(v),
-                            None => return false,
+                    match g {
+                        GenericArg::Ty(t) => match tys.kind(t) {
+                            TyKind::Param(j) => match binds.get(&j.0) {
+                                Some(v) => src.extend_from_slice(v),
+                                None => return false,
+                            },
+                            _ => return false,
                         },
-                        Some(_) => return false,
-                        None => {}
+                        GenericArg::Lifetime(r) if r != Region::Erased => src.push(self.inst_region(r, univ)),
+                        _ => {}
+                    }
+                }
+                // A trait with lifetime params (`<V as Visitor<'de>>::Value`
+                // with `Value = &'de str`): the binding may hold the trait's
+                // lifetimes, which the callee's bound on the Self param
+                // writes (projections keep no lifetime args).
+                if let Some(TyKind::Param(j)) = tys.args(pa).first().and_then(|g| g.as_ty()).map(|t| tys.kind(t))
+                    && let Some(td) = self.p.gx.index.trait_of_assoc(a.0)
+                {
+                    let lts: Vec<Region> = self.inst_trait_lts.iter().filter(|b| b.param == j.0 && b.trait_def == td).flat_map(|b| b.lifetimes.iter().copied()).collect();
+                    for r in lts {
+                        src.push(self.inst_region(r, univ));
                     }
                 }
                 // With no param regions bound (`S` with `Out = &'static
@@ -10621,3 +10926,54 @@ mod tests {
     }
 }
 
+
+/// The erased type a trait method signature's `Self` (`Param(0)` in
+/// `pat`, global store) stands for in `actual` (a body type), walking
+/// the constructors both share. None when `pat` holds no `Self` there.
+fn self_in(gt: &impl TyIntern, bt: &impl TyIntern, pat: Ty, actual: Ty, depth: u32) -> Option<Ty> {
+    if depth > 16 || !gt.flags(pat).contains_param() {
+        return None;
+    }
+    match (gt.kind(pat), bt.kind(actual)) {
+        (TyKind::Param(ParamId(0)), _) => Some(actual),
+        (TyKind::Ref(_, _, a), TyKind::Ref(_, _, b))
+        | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b))
+        | (TyKind::Slice(a), TyKind::Slice(b))
+        | (TyKind::Array(a, _), TyKind::Array(b, _)) => self_in(gt, bt, a, b, depth + 1),
+        (TyKind::Tuple(xs), TyKind::Tuple(ys)) => {
+            let (xs, ys) = (gt.tys_of(xs).to_vec(), bt.tys_of(ys).to_vec());
+            xs.into_iter().zip(ys).find_map(|(x, y)| self_in(gt, bt, x, y, depth + 1))
+        }
+        (TyKind::Adt(dx, xa), TyKind::Adt(dy, ya)) if dx == dy => {
+            let xs: Vec<Ty> = gt.args(xa).iter().filter_map(|g| g.as_ty()).collect();
+            let ys: Vec<Ty> = bt.args(ya).iter().filter_map(|g| g.as_ty()).collect();
+            xs.into_iter().zip(ys).find_map(|(x, y)| self_in(gt, bt, x, y, depth + 1))
+        }
+        _ => None,
+    }
+}
+
+/// True when trait `sub` has `sup` among its supertraits, transitively
+/// (predicates on `Self` in the trait records).
+fn has_supertrait(p: &Program, sub: DefId, sup: DefId) -> bool {
+    let mut work = vec![sub];
+    let mut seen: Vec<DefId> = Vec::new();
+    while let Some(d) = work.pop() {
+        if seen.contains(&d) {
+            continue;
+        }
+        seen.push(d);
+        let Some(rec) = p.gx.index.trait_record(d) else { continue };
+        for pr in &rec.generics.predicates {
+            if let Predicate::Trait(b) = pr
+                && p.tys.args(b.value.args).first().and_then(|g| g.as_ty()).is_some_and(|t| matches!(p.tys.kind(t), TyKind::Param(ParamId(0))))
+            {
+                if b.value.def == sup {
+                    return true;
+                }
+                work.push(b.value.def);
+            }
+        }
+    }
+    false
+}

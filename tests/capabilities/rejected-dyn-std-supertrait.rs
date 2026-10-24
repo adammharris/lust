@@ -1,4 +1,4 @@
-// capability: rejected: `dyn` for traits with associated types or std supertraits other than `Debug` and `Display`
+// capability: rejected: `dyn` for traits with std supertraits other than `Debug` and `Display`
 // expect: L0702
 
 trait T: PartialEq<u32> {
