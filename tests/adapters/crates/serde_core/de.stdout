@@ -1,0 +1,78 @@
+bool: true
+bool from str: error: invalid type: string "t", expected a boolean
+u8: 255
+u8 big: error: invalid value: integer `256`, expected u8
+i8 low: error: invalid value: integer `-129`, expected i8
+u32 neg: error: invalid value: integer `-1`, expected u32
+i64: -7
+u64 from i64: 7
+i128: -5
+u16 from i128: error: invalid type: integer `70000` as i128, expected u16
+bool from i128: error: invalid type: integer `5` as i128, expected a boolean
+nonzero 0: error: invalid value: integer `0`, expected a nonzero u8
+nonzero 9: 9
+f32 from int: 3.0
+f64: -2.5
+u8 from float: error: invalid type: floating point `1.5`, expected u8
+u8 from whole float: error: invalid type: floating point `2.0`, expected u8
+u8 from inf: error: invalid type: floating point `inf`, expected u8
+char: 'x'
+char long: error: invalid value: string "xy", expected a character
+string: "hello"
+borrowed str: "borrowed"
+borrowed bytes: [97, 98]
+string from int: error: invalid type: integer `1`, expected a string
+none: None
+some: Some(4)
+unit: ()
+unit from seq: error: invalid type: sequence, expected unit
+vec: [1, 2]
+vec bad: error: invalid type: string "2", expected u16
+deque: [-1]
+tuple: (1, "s")
+tuple short: error: invalid length 1, expected a tuple of size 2
+array: [1, 2, 3]
+array short: error: invalid length 1, expected an array of length 3
+array empty: []
+btreemap: {"a": 1, "b": 2}
+hashmap: {"k": 1}
+map from seq: error: invalid type: sequence, expected a map
+box: 8
+result ok: Ok(1)
+result err: Err("bad")
+result unknown: error: unknown variant `Maybe`, expected `Ok` or `Err`
+ignored: IgnoredAny
+val: List([Int(1), Text("t"), Nothing, List([])])
+val big: error: invalid value: integer `18446744073709551615`, expected a val
+val bool: error: invalid type: boolean `false`, expected a val
+Ok(["o"])
+Ok("text")
+Err("invalid type: string \"9\", expected u8")
+Ok(5)
+Ok([1, 2])
+invalid length 3, expected two
+unknown field `z`, expected `x` or `y`
+unknown variant `C`, expected `A`
+unknown variant `C`, there are no variants
+missing field `q`
+duplicate field `q`
+boolean `true`
+integer `1`
+integer `-1`
+floating point `1.0`
+floating point `10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0`
+floating point `NaN`
+character `c`
+string "s"
+byte array
+unit value
+Option value
+newtype struct
+sequence
+map
+enum
+unit variant
+newtype variant
+tuple variant
+struct variant
+other

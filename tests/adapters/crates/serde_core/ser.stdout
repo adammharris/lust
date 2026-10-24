@@ -1,0 +1,62 @@
+true
+-5i8
+300i16
+-70000i32
+1099511627776i64
+-1267650600228229401496703205376i128
+255u8
+65535u16
+4000000000u32
+18446744073709551615u64
+340282366920938463463374607431768211455u128
+1.5f32
+-0.0f64
+NaNf64
+'x'
+"quote\"d"
+"owned"
+Some(3u8)
+None
+()
+tuple1(1u8)
+tuple3(1u8, "two", 3.0f64)
+seqSome(3)[1u16, 2u16, 3u16]
+tuple0()
+tuple3(1i32, 2i32, 3i32)
+seqSome(2)[4u8, 5u8]
+seqSome(2)[9u8, 8u8]
+seqSome(3)[1u8, 2u8, 3u8]
+seqSome(1)[5u8]
+mapSome(2){"a" => 1u8, "b" => 2u8}
+mapSome(1){1u8 => seqSome(1)['a']}
+42u32
+6u8
+"cell"
+1u8
+Duration/2 {secs: 3u64, nanos: 500u32}
+SystemTime/2 {secs_since_epoch: 7u64, nanos_since_epoch: 9u32}
+OsString::Unix#0(seqSome(2)[111u8, 115u8])
+OsString::Unix#0(seqSome(8)[111u8, 119u8, 110u8, 101u8, 100u8, 32u8, 111u8, 115u8])
+"rel/p"
+Bound::Included#1(3u8)
+Bound::Unbounded#0
+9u8
+true
+'r'
+"/tmp/x"
+"192.168.0.1"
+"::1"
+"10.0.0.1:80"
+Result::Ok#0(1u8)
+Result::Err#1("bad")
+4u8
+PhantomData
+Point/2 {x: 1i32, y: -2i32}
+tuple4(Shape::Dot#0, Shape::Circle#1(3u8), Shape::Line#2/2(-1i8, 1i8), Shape::Rect#3/2 {w: 2u16, h: 3u16})
+"<12>"
+seqSome(2)[Some(Point/2 {x: 0i32, y: 0i32}), None]
+error: cannot serialize Fails
+error: cannot serialize Fails
+seqSome(2)[10u8, 20u8]
+mapSome(1){"k" => 1u8}
+true
