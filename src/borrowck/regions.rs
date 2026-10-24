@@ -8356,19 +8356,32 @@ impl<'b, 'p> Builder<'b, 'p> {
             let Some(head) = p.regions.impl_heads.get(&rec.def) else { return false };
             let mut in_self = Vec::new();
             regions_of(&p.tys, head.self_ty, &mut in_self);
-            let tied = |k: u32| {
-                in_self.contains(&Region::Param(k))
-                    || head.facts.iter().any(|&(a, b)| a == k || b == k)
-                    || head.where_lts.iter().any(|w| w.lifetimes.contains(&Region::Param(k)))
-            };
+            let tied = |k: u32| in_self.contains(&Region::Param(k)) || head.facts.iter().any(|&(a, b)| a == k || b == k);
             let mut seen: Vec<u32> = Vec::new();
-            let general = head.trait_lifetimes.iter().all(|&r| match r {
+            let mut general = head.trait_lifetimes.iter().all(|&r| match r {
                 Region::Param(k) if !tied(k) && !seen.contains(&k) => {
                     seen.push(k);
                     true
                 }
                 _ => false,
             });
+            // A where-clause that names a trait lifetime (`impl<'de, T>
+            // Deserialize<'de> for Vec<T> where T: Deserialize<'de>`) holds
+            // for every one of them when the part it bounds does.
+            if general {
+                let mut part_tys: FxMap<u32, Ty> = FxMap::default();
+                self.impl_param_tys(pat, t, &mut part_tys);
+                for w in &head.where_lts {
+                    if !w.lifetimes.iter().any(|r| matches!(r, Region::Param(k) if seen.contains(k))) {
+                        continue;
+                    }
+                    general = w.lifetimes.iter().all(|r| matches!(r, Region::Param(_)))
+                        && part_tys.get(&w.param).is_some_and(|&pt| self.hr_general(w.trait_def, pt));
+                    if !general {
+                        break;
+                    }
+                }
+            }
             hit = Some(general);
         }
         hit.unwrap_or(false)
@@ -9653,9 +9666,12 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let (xs, ys) = (tys.tys_of(a).to_vec(), tys.tys_of(b).to_vec());
                 xs.len() == ys.len() && xs.into_iter().zip(ys).all(|(x, y)| self.match_impl_self(x, y, vars, at, out))
             }
-            (TyKind::Array(a, _), TyKind::Array(b, _)) | (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => {
-                self.match_impl_self(a, b, vars, at, out)
+            // `impl Tr for V<[T; 0]>` is not the impl for `V<[T; 1]>`.
+            (TyKind::Array(a, pn), TyKind::Array(b, an)) => {
+                let differ = matches!((tys.const_kind(pn), tys.const_kind(an)), (crate::ty::ConstKind::Int(x), crate::ty::ConstKind::Int(y)) if x != y);
+                !differ && self.match_impl_self(a, b, vars, at, out)
             }
+            (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::RawPtr(_, a), TyKind::RawPtr(_, b)) => self.match_impl_self(a, b, vars, at, out),
             _ => {
                 *at += self.sc.slots(actual) as usize;
                 pat == actual
